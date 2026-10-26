@@ -549,6 +549,15 @@ def test_memory_view_reads_persistent_rows():
         assert "FACT-" in memory["permanent"]
 
 
+def test_the_hosts_real_facts_win_over_the_published_template(tmp_path, monkeypatch):
+    real = tmp_path / "PERMANENT_FACTS.md"
+    real.write_text("FACT-REAL: only on the host\n")
+    monkeypatch.setattr(main, "_HOST_FACTS", real)
+    assert main._permanent_facts() == "FACT-REAL: only on the host\n"
+    monkeypatch.setattr(main, "_HOST_FACTS", tmp_path / "missing" / "PERMANENT_FACTS.md")   # empty mount
+    assert "FACT-" in main._permanent_facts() and "FACT-REAL" not in main._permanent_facts()
+
+
 def test_assigning_an_owner_makes_a_ready_task_dispatchable():
     from app import schemas
     engine = create_engine("sqlite://")

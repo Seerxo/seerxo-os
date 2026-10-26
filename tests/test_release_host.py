@@ -1250,3 +1250,94 @@ def test_the_driver_is_handed_exactly_the_staged_directory_the_ledger_marks_pend
     # #192 F4: the driver holds a gateway release to the running images; it reads who signed from this same write.
     assert ledger["pending_approver"] == "gateway"
     assert "pending_approver" not in json.loads(hw.cfg.ledger.read_text())
+
+
+def _public_copy(hw, tmp_path):
+    """The new repository: a fresh history whose first commit has exactly the running release's tree."""
+    work, origin = tmp_path / "public-work", tmp_path / "public.git"
+    sh(tmp_path, "git", "init", "-q", "-b", "main", str(work))
+    for k, v in (("user.email", "n@o"), ("user.name", "n")):
+        sh(work, "git", "config", k, v)
+    archive = sh(hw.work, "git", "archive", "--format=tar", "-o", str(tmp_path / "base.tar"), hw.base)
+    assert archive == ""
+    sh(work, "tar", "-xf", str(tmp_path / "base.tar"))
+    sh(work, "git", "add", "-A")
+    sh(work, "git", "commit", "-qm", "Initial public release")
+    sh(tmp_path, "git", "clone", "-q", "--bare", str(work), str(origin))
+    sh(work, "git", "remote", "add", "origin", str(origin))
+    return work, origin, sh(work, "git", "rev-parse", "HEAD")
+
+
+def _rebase_setup(hw, tmp_path, *, base_files=None):
+    from app import release_gateway_service as svc
+    from tests.test_release_gateway import HOST
+    work, origin, base = _public_copy(hw, tmp_path)
+    if base_files:                                    # a base that is NOT the running tree
+        for path, text in base_files.items():
+            (work / path).write_text(text)
+        sh(work, "git", "commit", "-qam", "drift")
+        sh(work, "git", "push", "-q", "origin", "main")
+        base = sh(work, "git", "rev-parse", "HEAD")
+    policy = json.loads(hw.cfg.policy.read_bytes()) | {"version": 2, "repository": "seerxo/seerxo-os"}
+    praw = rg.canonical(policy)
+    (tmp_path / "policy-v2.json").write_bytes(praw)
+    (tmp_path / "policy-v2.sig").write_text(rg.sign(praw, hw.keys["founder"][0], rg.NS_POLICY))
+    sh(tmp_path, "git", "clone", "-q", str(origin), str(tmp_path / "host-clone-new"))
+    new = host.Config({**{k: str(v) if isinstance(v, Path) else v for k, v in vars(hw.hcfg).items()},
+                       "inboxes": [str(p) for p in hw.hcfg.inboxes], "repository": "seerxo/seerxo-os",
+                       "clone": str(tmp_path / "host-clone-new"), "fetch_url": str(origin),
+                       "policy": str(tmp_path / "policy-v2.json"), "policy_sig": str(tmp_path / "policy-v2.sig")})
+    ledger = json.loads(hw.hcfg.ledger.read_text())
+    st = {"kind": "rebase", "host_id": HOST, "repository": "seerxo/seerxo-os", "branch": "main",
+          "nonce": "ee" * 16, "old_repository": "seerxo/os", "old_last_sha": hw.base,
+          "old_last_sequence": ledger["last_sequence"],
+          "history_sha256": hashlib.sha256(rg.history_path(hw.hcfg.ledger).read_bytes()
+                                           if rg.history_path(hw.hcfg.ledger).exists() else b"").hexdigest(),
+          "base_sha": base, "base_tree": sh(work, "git", "rev-parse", f"{base}^{{tree}}"),
+          "policy_sha256": hashlib.sha256(praw).hexdigest(), "images": images(hw.base), "configs": configs(),
+          "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
+    raw = rg.canonical(st)
+    (tmp_path / "rebase.json").write_bytes(raw)
+    (tmp_path / "rebase.sig").write_text(rg.sign(raw, hw.keys["founder"][0], rg.NS_REBASE))
+    gateway = svc.Config({**{k: str(v) if isinstance(v, Path) else v for k, v in vars(hw.cfg).items()
+                             if k not in ("checks_command",)}, "checks_command": ["true"],
+                          "repository": "seerxo/seerxo-os", "clone": str(tmp_path / "host-clone-new"),
+                          "fetch_url": str(origin), "policy": str(tmp_path / "policy-v2.json"),
+                          "policy_sig": str(tmp_path / "policy-v2.sig")})
+    return work, base, new, gateway, HOST
+
+
+def test_the_host_rebases_onto_a_fresh_repository_and_then_releases_from_it(hw, tmp_path):
+    work, base, new, gateway, host_id = _rebase_setup(hw, tmp_path)
+    before = hw.hcfg.ledger.read_text()
+    out = host.rebase_statement(new, hw.hcfg, tmp_path / "rebase.json", tmp_path / "rebase.sig", now=NOW,
+                                observe=hw.prod.observe, machine_id=host_id)
+    assert out == {"outcome": "REBASE_DONE", "last_sha": hw.base, "chain_base": base}
+    assert hw.runs == [] and hw.prod.observe() == Production(hw.base).observe()       # nothing deployed
+    assert json.loads(hw.hcfg.ledger.with_name("ledger.json.pre-rebase-6").read_text()) == json.loads(before)
+
+    (work / "docs").mkdir(exist_ok=True)
+    (work / "docs/HANDOFF.md").write_text("from the public repository\n")
+    sh(work, "git", "add", "-A")
+    sh(work, "git", "commit", "-qm", "first public change")
+    sh(work, "git", "push", "-q", "origin", "main")
+    sha = sh(work, "git", "rev-parse", "HEAD")
+    hw.cfg = gateway                                  # the gateway service now follows the new repository too
+    tick = hw.tick()
+    assert tick["outcome"] == "SIGNED", tick
+    drafted = json.loads((gateway.outbox / f"{tick['detail']}.json").read_text())
+    assert drafted["parent_sha"] == base and drafted["repository"] == "seerxo/seerxo-os"
+    hw.hcfg = new
+    assert step(hw) == {"outcome": "APPLIED", "sha": sha, "sequence": 7, "approver": "gateway"}
+    ledger = json.loads(new.ledger.read_text())
+    assert ledger["last_sha"] == sha and "chain_base" not in ledger and ledger["min_policy_version"] == 2
+    assert [e["event"] for e in rg.read_history(new.ledger)][-2:] == ["rebase", "applied"]
+
+
+def test_the_host_refuses_a_rebase_onto_a_base_that_is_not_the_running_tree(hw, tmp_path):
+    _, _, new, _, host_id = _rebase_setup(hw, tmp_path, base_files={"docs/PERMANENT_FACTS.md": "public\n"})
+    before = hw.hcfg.ledger.read_text()
+    with pytest.raises(rg.Refused, match="tree is not exactly"):
+        host.rebase_statement(new, hw.hcfg, tmp_path / "rebase.json", tmp_path / "rebase.sig", now=NOW,
+                              observe=hw.prod.observe, machine_id=host_id)
+    assert hw.hcfg.ledger.read_text() == before

@@ -255,7 +255,17 @@ def desk_metric_series(source: str, subject: str, metric: str, window: str = "",
     return metrics_store.series(db, source=source, subject=subject, metric=metric, window=window, days=days)
 
 
+# The company's real facts live on the host (mounted read-only, docker-compose.yml) and never in the published source;
+# the repository's docs/PERMANENT_FACTS.md is only the template shown when the host has none.
+_HOST_FACTS = Path("/run/company-facts/PERMANENT_FACTS.md")
 _PERMANENT_FACTS = Path(__file__).resolve().parent.parent / "docs" / "PERMANENT_FACTS.md"
+
+
+def _permanent_facts() -> str | None:
+    for path in (_HOST_FACTS, _PERMANENT_FACTS):
+        if path.is_file():
+            return path.read_text()
+    return None
 
 
 @app.get("/desk/memory")
@@ -265,7 +275,7 @@ def founder_desk_memory(db: Session = Depends(get_db)) -> dict:
         "decisions": list_decisions(db),
         "learnings": list_learnings(db),
         "notes": list_notes(db=db, limit=200),
-        "permanent": _PERMANENT_FACTS.read_text() if _PERMANENT_FACTS.exists() else None,
+        "permanent": _permanent_facts(),
     }
 
 

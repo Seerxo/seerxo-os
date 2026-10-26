@@ -180,6 +180,26 @@ the re-baselining recovery above.
 An applied reconcile retains the policy version verified before `pending`, in both ledger and history; a missing
 pending policy version refuses instead of allowing an older policy to be replayed after an interrupted release.
 
+**Rebase onto another repository (`seerxo-ledger-rebase`, founder only).** Moves the release chain to a repository
+with a different history (for example a fresh public copy) without deploying anything. The founder first points the
+host config at the new repository and a new policy that names it, then runs `release_host rebase <statement> <sig>
+<old config>`. The statement `{kind: rebase, host_id, repository, branch, old_repository, old_last_sha,
+old_last_sequence, history_sha256, base_sha, base_tree, policy_sha256, images, configs, nonce, issued_at,
+expires_at}` is checked against:
+
+- the intact, settled ledger (no `pending`): its applied release and sequence, the exact history file and the
+  recorded image and configuration identity, which must also be what runs now;
+- the new policy, whose version must be **above** every policy applied so far;
+- the host's own git evidence: `base_sha` is on the new repository's branch, and its tree equals both `base_tree`
+  and the tree of the running release in the old clone. The first release from the new repository is therefore
+  reviewed against exactly what production runs.
+
+The effect is append-only. A `ledger.json.pre-rebase-<sequence>` copy is kept, a `rebase` event is appended,
+`last_sha`, the sequence floor and `seen` stay, the policy floor rises, and `chain_base = base_sha` becomes the
+parent the next manifest must name. The next applied release replaces `chain_base`; a failed or abandoned reconcile
+keeps it. Going back before the first new release is a second rebase with a still newer policy. Recovery of a lost
+ledger does not restore `chain_base`: after a recovery the founder repeats the rebase.
+
 **Identity report: the gateway reads, never repairs.** Each `release_host` step (and each bootstrap/recovery) writes
 `identity_report` (`{checked_at, ok, problem, last_sha, pending}`) atomically, root-owned, mode 0640 with the directory's group. The gateway
 service only reads it and prepares no candidate unless it is fresh (at most 15 min old, at most 1 min in the
