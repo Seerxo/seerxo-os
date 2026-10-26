@@ -44,7 +44,8 @@ NS_REVIEW = "seerxo-review"                       # an enrolled reviewer key, he
 NS_BOOTSTRAP = "seerxo-bootstrap"                 # founder only: the first trusted production baseline
 NS_RECOVERY = "seerxo-ledger-recovery"            # founder only: rebuild a lost ledger from its history
 NS_RECONCILE = "seerxo-ledger-reconcile"          # founder only: close a `pending` release (applied/failed/abandoned)
-NS_REVIEW_REQUEST = "seerxo-review-request"       # the gateway key: only the gateway may ask for a release review
+NS_REBASE = "seerxo-ledger-rebase"                 # founder only: move the release chain to another repository
+NS_REVIEW_REQUEST = "seerxo-review-request"      # the gateway key: only the gateway may ask for a release review
 MANIFEST_VERSION = 1
 CLOCK_SKEW_S = 300
 MAX_LIFETIME_S = 24 * 3600
@@ -605,6 +606,12 @@ def _check_rollback(m: dict, host_facts: dict, state: dict, history) -> None:
                   "release's recorded images; use a founder-signed forward revert")
 
 
+def chain_parent(state: dict) -> str | None:
+    """The commit the next release must continue from: the running release, or after a `rebase` the base commit in
+    the new repository whose tree is exactly the running release's tree. Identity checks always use `last_sha`."""
+    return state.get("chain_base") or state.get("last_sha")
+
+
 def verify_release(manifest_bytes: bytes, signature: str, *, policy: dict, founder_key: str, host_facts: dict,
                    state: dict, now: datetime, history=None) -> dict:
     """The production host's decision. `host_facts` are computed by the host from its own fetch of the commit:
@@ -632,7 +639,7 @@ def verify_release(manifest_bytes: bytes, signature: str, *, policy: dict, found
         raise Refused("replay or reorder: sequence is not above the last applied release")
     if not state.get("last_sha"):
         raise Refused("host is not bootstrapped: a founder-signed bootstrap must establish the production baseline")
-    if m["parent_sha"] != state["last_sha"]:
+    if m["parent_sha"] != chain_parent(state):
         raise Refused("manifest does not continue from the release currently applied")
     elif host_facts.get("ancestor_of_parent") is not True:
         raise Refused("commit does not descend from the release currently applied")
@@ -1029,6 +1036,69 @@ def reconcile(ledger: Path, statement: bytes, signature: str, *, founder_key: st
         new = {"last_sequence": sequence, "last_sha": st["release_sha"], "images": st["images"],
                "configs": st["configs"], "min_policy_version": min_policy,
                "seen": [*state.get("seen", []), pending, digest][-1000:]}
+        if st["outcome"] != "applied" and state.get("chain_base"):
+            new["chain_base"] = state["chain_base"]      # nothing ran: the next release still continues the rebase
+        _write_atomic(ledger, new)
+        return new
+
+
+REBASE_FIELDS = {"kind", "host_id", "repository", "branch", "old_repository", "old_last_sha", "old_last_sequence",
+                 "history_sha256", "base_sha", "base_tree", "policy_sha256", "images", "configs", "nonce",
+                 "issued_at", "expires_at"}
+
+
+def rebase(ledger: Path, statement: bytes, signature: str, *, founder_key: str, policy_bytes: bytes,
+           policy_sig: str, host_id: str, observe, provenance, now: datetime) -> dict:
+    """Move the release chain to another repository without deploying anything (namespace seerxo-ledger-rebase).
+    The new policy names the new repository and must be newer than every policy applied so far. The statement is
+    bound to the intact, settled ledger and its exact history, to what production runs now, and to `base_sha`: a
+    commit on the new repository's branch whose tree is byte-identical to the running release's tree, so the first
+    release from the new repository is reviewed against exactly what production runs. `provenance(base_sha,
+    old_sha)` is the host's own git evidence: {"old_repository", "base_on_branch", "base_tree", "old_tree"}.
+    Append-only: the ledger keeps `last_sha` (what runs), the sequence floor and `seen`; it gains `chain_base`, which
+    the next applied release replaces. A pre-rebase copy of the ledger is kept beside it."""
+    with _locked(ledger):
+        state = read_ledger(ledger)
+        if not state.get("last_sha"):
+            raise Refused("host is not bootstrapped: there is no release chain to rebase")
+        if state.get("pending"):
+            raise Refused("a release is pending: the founder must reconcile it before a rebase")
+        policy = load_policy(policy_bytes, policy_sig, founder_key,
+                             min_version=state.get("min_policy_version", 1) + 1)
+        st = _statement(statement, signature, founder_key, NS_REBASE, REBASE_FIELDS, "rebase", host_id, policy, now)
+        if st["policy_sha256"] != hashlib.sha256(policy_bytes).hexdigest():
+            raise Refused("rebase statement names a different policy")
+        if not _int(st["old_last_sequence"]) \
+                or (st["old_last_sha"], st["old_last_sequence"]) != (state["last_sha"], state.get("last_sequence", 0)):
+            raise Refused("rebase statement was made for another applied release")
+        history = history_path(ledger)
+        if st["history_sha256"] != hashlib.sha256(history.read_bytes() if history.exists() else b"").hexdigest():
+            raise Refused("rebase statement was made for a different release history")
+        if not all(isinstance(st[k], str) and SHA.fullmatch(st[k]) for k in ("base_sha", "base_tree")):
+            raise Refused("rebase statement must name a 40-hex base commit and tree")
+        digest = hashlib.sha256(statement).hexdigest()
+        if digest in state.get("seen", []):
+            raise Refused("replay: this rebase statement was already used")
+        problem = identity_problem(observe(), state["last_sha"], st["images"], st["configs"])
+        if problem or (st["images"], st["configs"]) != (state.get("images"), state.get("configs")):
+            raise Refused(f"production does not match the rebase statement: {problem or 'recorded identity differs'}")
+        facts = provenance(st["base_sha"], state["last_sha"])
+        if facts.get("old_repository") != st["old_repository"]:
+            raise Refused("rebase statement names another old repository")
+        if facts.get("base_on_branch") is not True:
+            raise Refused(f"base commit is not on {st['branch']} of {st['repository']}")
+        if not (facts.get("base_tree") == st["base_tree"] == facts.get("old_tree")):
+            raise Refused("base commit's tree is not exactly the running release's tree")
+        copy = ledger.with_name(f"{ledger.name}.pre-rebase-{state.get('last_sequence', 0)}")
+        if not copy.exists():
+            _write_atomic(copy, state)
+        _append_history(ledger, {"event": "rebase", "digest": digest, "sha": state["last_sha"],
+                                 "sequence": state.get("last_sequence", 0), "old_repository": st["old_repository"],
+                                 "repository": st["repository"], "branch": st["branch"], "base_sha": st["base_sha"],
+                                 "base_tree": st["base_tree"], "policy_version": policy["version"],
+                                 "at": now.isoformat()})
+        new = {**state, "chain_base": st["base_sha"], "min_policy_version": policy["version"],
+               "seen": [*state.get("seen", []), digest][-1000:]}
         _write_atomic(ledger, new)
         return new
 

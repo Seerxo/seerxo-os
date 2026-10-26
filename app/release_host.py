@@ -170,7 +170,7 @@ def host_facts(cfg: Config, manifest: dict, ledger: dict) -> dict:
                                 f"refs/remotes/origin/{cfg.branch}"], capture_output=True).returncode == 0
     if not on_branch:
         raise rg.Refused(f"commit {sha} is not on {cfg.branch} (another repository or branch, or unknown)")
-    last = ledger.get("last_sha")
+    last = rg.chain_parent(ledger)
     descends = bool(last) and subprocess.run(["git", "-C", str(cfg.clone), "merge-base", "--is-ancestor", last, sha],
                                              capture_output=True).returncode == 0
     rg.release_archive(cfg.clone, sha)                 # shipped bytes == hashed bytes, refused BEFORE pending
@@ -470,12 +470,56 @@ def founder_statement(cfg: Config, kind: str, statement: Path, signature: Path, 
     return {"outcome": kind.upper() + "_DONE", "last_sha": state["last_sha"]}
 
 
+def rebase_provenance(cfg: Config, old: Config):
+    """The host's own git evidence for a rebase: the new clone (this config, freshly fetched) holds the base commit on
+    its branch; the old clone (the previous config) holds the running release. Trees are compared, never trusted."""
+    def facts(base_sha: str, old_sha: str) -> dict:
+        try:
+            _git(cfg, "fetch", "--no-tags", "--quiet", cfg.fetch_url,
+                 f"+refs/heads/{cfg.branch}:refs/remotes/origin/{cfg.branch}")
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RetryLater(f"fetch failed: {type(error).__name__}") from None
+
+        def tree(c: Config, sha: str) -> str | None:
+            try:
+                return _git(c, "rev-parse", "--verify", "--quiet", f"{sha}^{{tree}}").strip() or None
+            except subprocess.CalledProcessError:
+                return None
+        on_branch = subprocess.run(["git", "-C", str(cfg.clone), "merge-base", "--is-ancestor", base_sha,
+                                    f"refs/remotes/origin/{cfg.branch}"], capture_output=True).returncode == 0
+        return {"old_repository": old.repository, "base_on_branch": on_branch, "base_tree": tree(cfg, base_sha),
+                "old_tree": tree(old, old_sha)}
+    return facts
+
+
+def rebase_statement(cfg: Config, old: Config, statement: Path, signature: Path, *, now=None,
+                     observe=observe_production, machine_id=None) -> dict:
+    """`rebase STATEMENT SIG OLD_CONFIG`: run after this config (and its new policy) names the new repository; the
+    old config still names the old clone. Never run by a timer. Nothing is deployed."""
+    problem = untrusted_layout(cfg)
+    if problem:
+        raise rg.Refused(problem)
+    if old.ledger != cfg.ledger:
+        raise rg.Refused("the old and new host configs must name the same ledger")
+    now = now or datetime.now(timezone.utc)
+    state = rg.rebase(cfg.ledger, statement.read_bytes(), signature.read_text(),
+                      founder_key=cfg.founder_key.read_text().strip(), policy_bytes=cfg.policy.read_bytes(),
+                      policy_sig=cfg.policy_sig.read_text(), host_id=host_id() if machine_id is None else machine_id,
+                      observe=observe, provenance=rebase_provenance(cfg, old), now=now)
+    write_identity_report(cfg, now, observe())
+    return {"outcome": "REBASE_DONE", "last_sha": state["last_sha"], "chain_base": state["chain_base"]}
+
+
 def main() -> int:
     path = Path(os.environ.get("RELEASE_HOST_CONFIG", "/etc/release-host/config.json"))
     try:
         cfg = Config(json.loads(path.read_text()))
         if sys.argv[1:] == ["observe"]:                # read-only: what a founder statement must name
             print(json.dumps(observe_production(), sort_keys=True))
+            return 0
+        if len(sys.argv) == 5 and sys.argv[1] == "rebase":
+            old = Config(json.loads(Path(sys.argv[4]).read_text()))
+            print(json.dumps(rebase_statement(cfg, old, Path(sys.argv[2]), Path(sys.argv[3])), sort_keys=True))
             return 0
         if len(sys.argv) == 4 and sys.argv[1] in ("bootstrap", "recover", "reconcile"):
             out = founder_statement(cfg, sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]))

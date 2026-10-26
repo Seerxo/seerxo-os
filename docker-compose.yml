@@ -95,6 +95,8 @@ services:
       # Host-side backup.sh writes dumps here; the API uploads them to R2 with boto3,
       # so the host needs no AWS tooling of its own.
       - ${BACKUP_LOCAL_DIR:-/opt/company-os/backups}:/backups
+      # The company's real permanent facts stay on the host; the image only carries the public template.
+      - /opt/company-os/facts:/run/company-facts:ro
     networks:
       - default
       # Joined so youtube-auto can POST to http://company-api:8000/webhooks/youtube-auto

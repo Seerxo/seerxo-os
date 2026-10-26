@@ -175,10 +175,10 @@ def _tick(cfg: Config, *, now, clock, checks, review, fetch) -> dict:
 
     if ledger.get("pending"):
         return record("WAITING", reason="host has an unreconciled pending release")
-    parent = ledger.get("last_sha")
-    if not parent:
+    running, parent = ledger.get("last_sha"), rg.chain_parent(ledger)   # differ only right after a rebase
+    if not running:
         return record("WAITING", reason="host is not bootstrapped: the founder must sign the production baseline")
-    identity = production_identity(cfg, parent, now)
+    identity = production_identity(cfg, running, now)
     if identity:
         return record("WAITING", reason=identity)
     if fetch:
