@@ -1,0 +1,193 @@
+{
+ "now": "2026-10-09T12:00:00+00:00",
+ "generated_by": "app/reconciler_heartbeat.py:view (real backend), regenerate with the snippet in reconciler.contract.test.ts",
+ "cases": {
+  "NO_EVIDENCE": {
+   "view": {
+    "last_attempt_at": null,
+    "last_completed_at": null,
+    "outcome": "NO_EVIDENCE",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "UNAVAILABLE",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "UNKNOWN"
+  },
+  "STARTED": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:58:00+00:00",
+    "last_completed_at": "2026-10-09T11:48:00+00:00",
+    "outcome": "STARTED",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "VERIFIED",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "STARTED"
+  },
+  "UNFINISHED": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:46:00+00:00",
+    "last_completed_at": "2026-10-09T11:36:00+00:00",
+    "outcome": "UNFINISHED",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "VERIFIED",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "UNFINISHED"
+  },
+  "RAISED_after_completion": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:57:00+00:00",
+    "last_completed_at": "2026-10-09T11:47:00+00:00",
+    "outcome": "RAISED",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "VERIFIED",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": 0,
+    "goals_total": null,
+    "error": "OperationalError"
+   },
+   "expected_label": "FAILED"
+  },
+  "per_goal_FAILED": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:57:00+00:00",
+    "last_completed_at": "2026-10-09T11:57:00+00:00",
+    "outcome": "COMPLETED",
+    "duration_ms": null,
+    "tasks_created": 1,
+    "evidence_source": "watchdog",
+    "freshness": "VERIFIED",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "FAILED",
+    "goal_errors": 2,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "FAILED"
+  },
+  "COMPLETED_unknown_tasks_0": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:57:00+00:00",
+    "last_completed_at": "2026-10-09T11:57:00+00:00",
+    "outcome": "COMPLETED",
+    "duration_ms": null,
+    "tasks_created": 0,
+    "evidence_source": "watchdog",
+    "freshness": "VERIFIED",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": 0,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "COMPLETED"
+  },
+  "COMPLETED_goals_OK": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:57:00+00:00",
+    "last_completed_at": "2026-10-09T11:57:00+00:00",
+    "outcome": "COMPLETED",
+    "duration_ms": null,
+    "tasks_created": 0,
+    "evidence_source": "watchdog",
+    "freshness": "VERIFIED",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "OK",
+    "goal_errors": 0,
+    "goals_total": 2,
+    "error": null
+   },
+   "expected_label": "COMPLETED"
+  },
+  "STALE": {
+   "view": {
+    "last_attempt_at": "2026-10-09T11:15:00+00:00",
+    "last_completed_at": "2026-10-09T11:15:00+00:00",
+    "outcome": "COMPLETED",
+    "duration_ms": null,
+    "tasks_created": 0,
+    "evidence_source": "watchdog",
+    "freshness": "STALE",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "STALE"
+  },
+  "MALFORMED_bad_time": {
+   "view": {
+    "last_attempt_at": null,
+    "last_completed_at": null,
+    "outcome": "MALFORMED",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "UNAVAILABLE",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "UNKNOWN"
+  },
+  "MALFORMED_future": {
+   "view": {
+    "last_attempt_at": null,
+    "last_completed_at": null,
+    "outcome": "MALFORMED",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "UNAVAILABLE",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "UNKNOWN"
+  },
+  "MALFORMED_completed_without_time": {
+   "view": {
+    "last_attempt_at": null,
+    "last_completed_at": null,
+    "outcome": "MALFORMED",
+    "duration_ms": null,
+    "tasks_created": null,
+    "evidence_source": "watchdog",
+    "freshness": "UNAVAILABLE",
+    "expected_cadence_s": 600,
+    "per_goal_outcome": "unknown",
+    "goal_errors": null,
+    "goals_total": null,
+    "error": null
+   },
+   "expected_label": "UNKNOWN"
+  }
+ }
+}

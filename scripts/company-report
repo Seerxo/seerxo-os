@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Bring a herdr control-center run back into Company OS (docs/AGENT_EXECUTION.md §4.2).
+#
+# Runs on the LAPTOP, where the control center keeps its state. It reads the run's own
+# state.json and posts it through unchanged — Company OS interprets the verdict rather
+# than trusting a summary written about it.
+#
+#   company-report TASK-0006                    # show what would be reported
+#   company-report TASK-0006 --send             # record it
+#   company-report TASK-0006 --send --learning "migrations run before restart"
+set -uo pipefail
+
+SERVER=${COMPANY_SERVER:-company-os-host}
+STATE_ROOT=${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/project-control-center}
+
+KEY=${1:-}
+if [ -z "$KEY" ]; then
+  echo "usage: company-report <TASK-KEY> [--send] [--learning <text>]..." >&2
+  exit 2
+fi
+shift
+
+SEND=0
+LEARNINGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --send) SEND=1 ;;
+    --learning) LEARNINGS+=("${2:?--learning needs text}"); shift ;;
+    *) echo "company-report: unknown option '$1'" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+STATE_FILE="$STATE_ROOT/tasks/$KEY/state.json"
+if [ ! -f "$STATE_FILE" ]; then
+  echo "company-report: no herdr run found for $KEY" >&2
+  echo "  looked in: $STATE_FILE" >&2
+  echo "  start one with: company-dispatch $KEY --run" >&2
+  exit 1
+fi
+
+# Changed files come from git, not from the agent's account of itself.
+CHECKOUT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("checkout") or "")' "$STATE_FILE")
+SOURCE_COMMIT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source_commit") or "")' "$STATE_FILE")
+CHANGED=""
+if [ -n "$CHECKOUT" ] && [ -d "$CHECKOUT" ] && [ -n "$SOURCE_COMMIT" ]; then
+  CHANGED=$( { git -C "$CHECKOUT" diff --name-only "$SOURCE_COMMIT" -- . 2>/dev/null
+               git -C "$CHECKOUT" ls-files --others --exclude-standard 2>/dev/null; } | sort -u )
+fi
+
+PAYLOAD=$(STATE_FILE="$STATE_FILE" CHANGED="$CHANGED" \
+          LEARNINGS_JOINED="$(printf '%s\0' "${LEARNINGS[@]+"${LEARNINGS[@]}"}")" python3 -c '
+import json, os
+state = json.load(open(os.environ["STATE_FILE"]))
+changed = [f for f in os.environ["CHANGED"].splitlines() if f.strip()]
+raw = os.environ["LEARNINGS_JOINED"]
+learnings = [l for l in raw.split("\0") if l.strip()]
+print(json.dumps({"herdr_state": state, "changed_files": changed,
+                  "learnings": learnings, "reported_by": "company-report"}))')
+
+printf '%s' "$PAYLOAD" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+s = p["herdr_state"]
+print(f"{s.get(\"id\", \"?\")}  state={s.get(\"state\")}  workflow={(s.get(\"workflow\") or {}).get(\"name\")}")
+print(f"  goal      {s.get(\"goal\", \"\")[:90]}")
+print(f"  branch    {s.get(\"branch\")}")
+print(f"  checks    {(s.get(\"checks\") or {}).get(\"status\", \"(none)\")}")
+print(f"  review    {(s.get(\"review\") or {}).get(\"verdict\", \"(none)\")}")
+print(f"  changed   {len(p[\"changed_files\"])} file(s)")
+print(f"  learnings {len(p[\"learnings\"])}")
+'
+
+if [ "$SEND" -ne 1 ]; then
+  echo
+  echo "(dry run — add --send to record it in Company OS)"
+  exit 0
+fi
+
+echo
+if ! printf '%s' "$PAYLOAD" \
+  | ssh "$SERVER" "sudo -n docker exec -i company-api curl -fsS -X POST \
+      http://localhost:8000/tasks/$KEY/run-report \
+      -H 'content-type: application/json' --data-binary @-" \
+  | python3 -m json.tool; then
+  echo "company-report: report not accepted; REVIEW requires a verified founder Access session" >&2
+  exit 1
+fi

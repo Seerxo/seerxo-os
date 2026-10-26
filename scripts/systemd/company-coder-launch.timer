@@ -1,0 +1,15 @@
+# Stage C (docs/CODER_RUNTIME.md D1): poll for worker requests. A path unit with a glob was tried
+# first and missed job directories created after it started (verified on <production-host>
+# 2026-10-07), so requests would have waited forever. An idle run is a directory listing.
+# The service is a oneshot, so runs never overlap and one container runs at a time.
+[Unit]
+Description=Company OS coder launcher poll
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+Unit=company-coder-launch.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# companyctl — founder and operator entry point (§133-§137).
+#
+# The API is internal only (§109), so every call is routed through the container rather
+# than over a published port. Run this on <production-host>, or remotely:
+#
+#   ssh <production-host> sudo companyctl brief
+set -uo pipefail
+
+API_CONTAINER=${API_CONTAINER:-company-api}
+BASE=http://localhost:8000
+REPO_DOCS=${REPO_DOCS:-/opt/company-os/docs}
+
+api() {  # api <method> <path> [json-body]
+  local method=$1 path=$2 body=${3:-}
+  if [ -n "$body" ]; then
+    printf '%s' "$body" | docker exec -i "$API_CONTAINER" \
+      curl -sS -X "$method" "$BASE$path" -H 'content-type: application/json' --data-binary @-
+  else
+    docker exec "$API_CONTAINER" curl -sS -X "$method" "$BASE$path"
+  fi
+}
+
+pretty() { python3 -m json.tool 2>/dev/null || cat; }
+
+require_up() {
+  if ! docker exec "$API_CONTAINER" curl -sf "$BASE/health" >/dev/null 2>&1; then
+    echo "companyctl: company-api is not answering /health." >&2
+    echo "  docker ps --filter name=company-api" >&2
+    # The API cannot report that the API is down, so fall back to the host notifier.
+    command -v company-notify >/dev/null 2>&1 && \
+      company-notify "Company OS API unreachable" "companyctl could not reach /health on $API_CONTAINER" || true
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+companyctl <command>
+
+  status              company state snapshot (JSON)
+  boot                same as status; the call an agent makes first
+  brief               founder daily brief (text)
+  desk                brief + latest activity
+  health              API + database liveness
+
+  tasks [STATUS]      list tasks, optionally filtered
+  context KEY         minimal context packet for an assigned task
+  dispatch KEY        show the herdr plan for a task (run company-dispatch on the laptop)
+  task-status KEY STATUS [RESULT]
+                      move a task; REVIEW and DONE require a verified founder, unavailable to this local command
+  incidents           open incidents
+  resolve KEY CAUSE RESOLUTION [LEARNING]
+                      close an incident (root cause and resolution are required)
+  approvals           pending approvals
+  approve KEY [note]  grant an approval
+  reject  KEY [note]  reject an approval
+  agents              registered agents and heartbeats
+  registry            the agent roster from git, with validation
+  registry-sync       reconcile registry.yaml into the agents table
+  services            service registry
+  decisions           decision log
+  learnings           learning memory
+  events [N]          recent events (default 20)
+  backups             backup runs with integrity/restore status
+  metrics             counters
+
+  backup [target...]  run a backup now
+  restore-test        run a restore verification now
+  snapshot            write docs/CURRENT_STATE.md and docs/PHASE_STATUS.md
+  phase N STATUS EVIDENCE
+                      move build phase N (NOT_STARTED|IN_PROGRESS|COMPLETE|BLOCKED) with evidence
+
+  run                 deterministic work-check; returns only READY/QUEUED work
+
+  worker status       unattended worker heartbeat, provider cooldowns (no model call)
+  worker health       provider health: AVAILABLE / AUTH_REQUIRED / METERED_BLOCKED ...
+  worker once         one worker tick now (a model runs only if opted-in work exists)
+  worker selftest     create today's harmless self-test task, then one tick
+
+  stage-c preflight [--json]
+                      every Stage C prerequisite as PASS/FAIL/UNKNOWN; zero model calls; exit 1
+                      unless READY (host facts + worker view; run as root on the host)
+  stage-c status      read-only pilot/deploy interlock state; never prints credentials
+  stage-c identify-pr PR            classify a PR from durable Stage C publication evidence
+  stage-c merge-authorize PR SHA   prove exact Stage C review/CI before the founder merge command
+  stage-c merge-complete PR SHA ID verify and audit the GitHub merge commit and founder actor
+  stage-c authorize   refused here: root on the host is not the verified founder. The one-task, one-shot,
+                      deployed-SHA-bound permission is issued by POST /stage-c/authorization (Cloudflare Access).
+  stage-c revoke      remove the authorization (root on the host, recorded as operator:host-root)
+USAGE
+}
+
+cmd=${1:-brief}
+shift || true
+
+case "$cmd" in
+  health)      api GET /health | pretty ;;
+  status|boot) require_up; api POST /company/boot | pretty ;;
+  brief)       require_up; api GET /company/brief ;;
+  desk)
+    require_up
+    api GET /company/brief
+    echo
+    echo "RECENT ACTIVITY"
+    # Plain .format, not f-strings: backslash-escaped quotes inside a single-quoted
+    # shell string do not survive into Python.
+    api GET '/events?limit=10' | python3 -c '
+import json, sys
+for e in json.load(sys.stdin):
+    flag = "sent" if e["notified"] else "    "
+    print("  {} {} [{:<8}] {}".format(e["occurred_at"][:19], flag, e["severity"], e["event_type"]))' 
+    echo
+    echo "LATEST AUDIT TRAIL"
+    api GET '/audit?limit=8' | python3 -c '
+import json, sys
+for a in json.load(sys.stdin):
+    print("  {} {:<12} {:<18} {}".format(a["occurred_at"][:19], a["actor"], a["action"],
+                                         a["entity_key"] or ""))' 
+    ;;
+  tasks)       require_up; [ $# -gt 0 ] && api GET "/tasks?status=$1" | pretty || api GET /tasks | pretty ;;
+  context)     require_up; api GET "/tasks/${1:?task key required}/context" | pretty ;;
+  dispatch)    require_up; api GET "/tasks/${1:?task key required}/dispatch" | pretty ;;
+  task-status)
+    require_up
+    ST="${2:?status required}" RES="${3:-}" python3 -c 'import json, os
+print(json.dumps({"status": os.environ["ST"], "result": os.environ["RES"] or None,
+                  "evidence": os.environ["RES"] or None, "actor": "founder"}))' \
+    | docker exec -i "$API_CONTAINER" curl -sS -X POST "$BASE/tasks/${1:?task key required}/status" \
+        -H 'content-type: application/json' --data-binary @- | pretty ;;
+  incidents)   require_up; api GET /incidents | pretty ;;
+  resolve)
+    require_up
+    CAUSE="${2:?root cause required}" RES="${3:?resolution required}" LEARN="${4:-}" \
+      python3 -c 'import json, os
+print(json.dumps({"root_cause": os.environ["CAUSE"], "resolution": os.environ["RES"],
+                  "learning": os.environ["LEARN"] or None, "resolved_by": "founder"}))' \
+    | docker exec -i "$API_CONTAINER" curl -sS -X POST "$BASE/incidents/${1:?incident key required}/resolve" \
+        -H 'content-type: application/json' --data-binary @- | pretty ;;
+  approvals)   require_up; api GET /approvals | pretty ;;
+  approve)     require_up; api POST "/approvals/${1:?approval key required}" \
+                 "{\"granted\":true,\"decided_by\":\"founder\",\"notes\":\"${2:-}\"}" | pretty ;;
+  reject)      require_up; api POST "/approvals/${1:?approval key required}" \
+                 "{\"granted\":false,\"decided_by\":\"founder\",\"notes\":\"${2:-}\"}" | pretty ;;
+  agents)      require_up; api GET /agents | pretty ;;
+  registry)
+    require_up
+    api GET /registry | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("{} agents defined, {} enabled, ${:.2f}/day budgeted".format(
+    d["defined"], len(d["enabled"]), d["daily_budget_usd"]))
+print()
+for a in d["agents"]:
+    mark = "ON " if a["enabled"] else "   "
+    print("  {} {:<12} {:<34} {:<9} L{} ${:.2f}".format(
+        mark, a["key"], a["role"][:34], a["model_class"], a["autonomy_level"], a["daily_usd"]))
+    if not a["enabled"]:
+        why = a["blocked_by"] and ("blocked by " + a["blocked_by"]) or a["enable_when"]
+        print("      {}".format(why or "no condition recorded"))
+if d["problems"]:
+    print()
+    print("PROBLEMS")
+    for p in d["problems"]:
+        print("  -", p)
+' ;;
+  registry-sync) require_up; api POST /registry/sync | pretty ;;
+  services)    require_up; api GET /services | pretty ;;
+  decisions)   require_up; api GET /decisions | pretty ;;
+  learnings)   require_up; api GET /learnings | pretty ;;
+  events)      require_up; api GET "/events?limit=${1:-20}" | pretty ;;
+  backups)     require_up; api GET /backups | pretty ;;
+  metrics)     require_up; api GET /metrics | pretty ;;
+
+  backup)      exec /opt/company-os/scripts/backup.sh "$@" ;;
+  restore-test) exec /opt/company-os/scripts/restore-test.sh ;;
+
+  snapshot)
+    require_up
+    mkdir -p "$REPO_DOCS"
+    GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    API_SHA=$(docker exec "$API_CONTAINER" printenv COMPANY_OS_GIT_SHA 2>/dev/null || true)
+    WORKER_SHA=$(docker exec "${WORKER_CONTAINER:-company-worker}" printenv COMPANY_OS_GIT_SHA 2>/dev/null || true)
+    DB_REVISION=$(docker exec company-postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select version_num from alembic_version"' 2>/dev/null || true)
+    snapshot_meta() {
+      echo "> Generated at UTC: \`$GENERATED_AT\`"
+      echo "> **STALE AFTER: 24 hours. Live state is required beyond this point.**"
+      if [[ "$API_SHA" =~ ^[0-9a-f]{40}$ && "$WORKER_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "> Deployed API SHA: \`$API_SHA\`; worker SHA: \`$WORKER_SHA\`."
+      else
+        echo "> Live API/worker provenance was unavailable when generated."
+      fi
+      [[ -n "$DB_REVISION" ]] && echo "> Database revision: \`$DB_REVISION\`."
+    }
+    # Generated, never hand-edited: §165 says the database wins, and a second
+    # hand-maintained truth is how documentation goes stale.
+    {
+      echo "# CURRENT STATE"
+      echo
+      echo "> **Generated by \`companyctl snapshot\`. Do not edit by hand.**"
+      echo "> The Company OS database is the source of truth (§165). This file exists so the"
+      echo "> state is still readable when the API is unreachable."
+      snapshot_meta
+      echo
+      echo '```'
+      api GET /company/brief
+      echo '```'
+      echo
+      echo "## Raw state"
+      echo
+      echo '```json'
+      api POST /company/boot | pretty
+      echo '```'
+    } > "$REPO_DOCS/CURRENT_STATE.md"
+
+    {
+      echo "# PHASE STATUS"
+      echo
+      echo "> **Generated by \`companyctl snapshot\`. Do not edit by hand.**"
+      snapshot_meta
+      echo
+      echo "| Phase | Name | Status | Deliverables |"
+      echo "|---|---|---|---|"
+      api GET /phases | python3 -c '
+import json, sys
+for p in json.load(sys.stdin):
+    print("| {} | {} | {} | {} |".format(p["number"], p["name"], p["status"],
+                                         (p["deliverables"] or "").replace("|", "/")))' 
+    } > "$REPO_DOCS/PHASE_STATUS.md"
+    echo "wrote $REPO_DOCS/CURRENT_STATE.md and $REPO_DOCS/PHASE_STATUS.md"
+    ;;
+
+  run)
+    require_up
+    api POST /dispatch/run | pretty
+    ;;
+
+  worker)
+    WORKER_CONTAINER=${WORKER_CONTAINER:-company-worker}
+    case "${1:-status}" in
+      status)   docker exec "$WORKER_CONTAINER" python -c 'import json; from app.db import SessionLocal; from app import models; db = SessionLocal(); row = db.get(models.ControlState, "worker"); print(json.dumps(row.value if row else {"heartbeat_at": None}, indent=2))' ;;
+      health)   docker exec "$WORKER_CONTAINER" python -m app.worker --health | pretty ;;
+      once)     docker exec "$WORKER_CONTAINER" python -m app.worker --once ;;
+      selftest) docker exec "$WORKER_CONTAINER" python -m app.worker --once --selftest ;;
+      *) echo "companyctl worker: status|health|once|selftest" >&2; exit 2 ;;
+    esac
+    ;;
+
+  stage-c)
+    case "${1:-}" in
+      preflight)
+        shift
+        here=$(dirname "$(readlink -f "$0")")
+        python3 "$here/stage-c-host-facts.py" \
+          | docker exec -i "${WORKER_CONTAINER:-company-worker}" python -m app.stage_c_preflight "$@" ;;
+      status)
+        WORKER_CONTAINER=${WORKER_CONTAINER:-company-worker}
+        api_sha=$(docker exec "$API_CONTAINER" printenv COMPANY_OS_GIT_SHA 2>/dev/null || true)
+        worker_sha=$(docker exec "$WORKER_CONTAINER" printenv COMPANY_OS_GIT_SHA 2>/dev/null || true)
+        code_write=$(docker exec "$WORKER_CONTAINER" printenv ENABLE_AUTONOMOUS_CODE_WRITE 2>/dev/null || true)
+        overrides=""
+        for c in "$API_CONTAINER" "$WORKER_CONTAINER"; do
+          files=$(docker inspect "$c" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
+          for f in ${files//,/ }; do
+            [ "$(basename "$f")" = docker-compose.yml ] || [ -z "$f" ] || [ "$f" = "<no value>" ] || overrides="$overrides $c:$f"
+          done
+        done
+        docker exec -e "API_SHA=$api_sha" -e "WORKER_SHA=$worker_sha" -e "CODE_WRITE=$code_write" \
+          -e "COMPOSE_OVERRIDES=$overrides" "$WORKER_CONTAINER" python -c '
+import json, os
+from datetime import datetime, timezone
+from app import control, enums, models
+from app.db import SessionLocal
+
+def sha(v):
+    return v if len(v) == 40 and all(c in "0123456789abcdef" for c in v) else None
+
+def age(value):
+    try:
+        at = datetime.fromisoformat(value["checked_at"].replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            return None
+        return int((datetime.now(timezone.utc) - at).total_seconds())
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+with SessionLocal() as db:
+    acceptance = db.get(models.ControlState, "stage-c-host-acceptance")
+    runtime = db.get(models.ControlState, "stage-c-runtime-readiness")
+    av = acceptance.value if acceptance and isinstance(acceptance.value, dict) else {}
+    rv = runtime.value if runtime and isinstance(runtime.value, dict) else {}
+    auth = db.get(models.ControlState, control.PILOT_AUTHORIZATION)
+    au = auth.value if auth and isinstance(auth.value, dict) else {}
+    active = []
+    for task in db.query(models.Task):
+        improvement = (task.context or {}).get("improvement")
+        if isinstance(improvement, dict) and improvement.get("stage") and task.status in enums.OPEN_TASK_STATES:
+            active.append(task.key)
+    started = [run.id for run in db.query(models.AgentRun).filter_by(status=enums.AgentRunStatus.STARTED)
+               if isinstance(run.tool_calls, dict) and run.tool_calls.get("stage_c") is True]
+    print(json.dumps({
+        "api_sha": sha(os.environ.get("API_SHA", "")),
+        "worker_sha": sha(os.environ.get("WORKER_SHA", "")),
+        "code_write_flag": os.environ.get("CODE_WRITE", "").lower() == "true",
+        "acceptance_source_sha": sha(av.get("source_sha", "")),
+        "runtime_readiness": {"ready": rv.get("ready") is True, "age_s": age(rv)},
+        "compose_overrides": sorted(os.environ.get("COMPOSE_OVERRIDES", "").split()),
+        "active_task_keys": sorted(active), "started_run_ids": sorted(started),
+        "agents_paused": control.agents_paused(db),
+        "authorization": {"task_key": au.get("task_key"), "source_sha": sha(au.get("source_sha", "")),
+                          "expires_at": au.get("expires_at"), "consumed": au.get("consumed_at") is not None},
+    }, sort_keys=True, indent=2))
+' | pretty ;;
+      identify-pr|merge-authorize|merge-complete)
+        action=$1; number=${2:?PR number required}
+        [[ "$number" =~ ^[1-9][0-9]*$ ]] || {
+          echo "companyctl stage-c $action: invalid PR number" >&2; exit 2; }
+        WORKER_CONTAINER=${WORKER_CONTAINER:-company-worker}
+        if [ "$action" = identify-pr ]; then
+          docker exec "$WORKER_CONTAINER" python -m app.stage_c_merge_gate identify --pr "$number"
+          exit $?
+        fi
+        head=${3:?head SHA required}
+        [[ "$head" =~ ^[a-f0-9]{40}$ ]] || {
+          echo "companyctl stage-c $action: invalid PR number or head SHA" >&2; exit 2; }
+        if [ "$action" = merge-complete ]; then
+          authorization_id=${4:?authorization ID required}
+          [[ "$authorization_id" =~ ^[1-9][0-9]*$ ]] || { echo "invalid authorization ID" >&2; exit 2; }
+          docker exec "$WORKER_CONTAINER" python -m app.stage_c_merge_gate complete \
+            --pr "$number" --head "$head" --authorization-id "$authorization_id"
+        else
+          docker exec "$WORKER_CONTAINER" python -m app.stage_c_merge_gate authorize \
+            --pr "$number" --head "$head"
+        fi ;;
+      authorize)
+        # A Stage C authorization is the verified founder's. Root on the host is an operator, not proof of the
+        # founder, so this command no longer issues one: POST /stage-c/authorization behind Cloudflare Access.
+        echo "companyctl stage-c authorize: refused. A pilot authorization needs a verified founder identity (Cloudflare Access)." >&2
+        echo "Issue it with POST /stage-c/authorization {\"task_key\":\"$2\",\"minutes\":${3:-30}} from the Founder Desk session; see docs/APPROVAL_IDENTITY.md." >&2
+        exit 1 ;;
+      revoke)
+        [ "$(id -u)" = 0 ] || { echo "companyctl stage-c $1: revoking needs root on the host (sudo)" >&2; exit 1; }
+        WORKER_CONTAINER=${WORKER_CONTAINER:-company-worker}
+        action=$1
+        task=${2:-}
+        [ "$action" = revoke ] || [ -n "$task" ] || { echo "usage: companyctl stage-c authorize TASK-XXXX [MINUTES]" >&2; exit 2; }
+        worker_sha=$(docker exec "$WORKER_CONTAINER" printenv COMPANY_OS_GIT_SHA 2>/dev/null || true)
+        docker exec -e "ACTION=$action" -e "TASK=$task" -e "SHA=$worker_sha" -e "MINUTES=${3:-30}" "$WORKER_CONTAINER" python -c '
+import json, os
+from datetime import timedelta
+from app import control
+from app.db import SessionLocal
+
+with SessionLocal() as db:
+    if os.environ["ACTION"] == "revoke":
+        print(json.dumps({"revoked": control.revoke_pilot_authorization(db, actor="operator:host-root", reason="companyctl stage-c revoke")}))
+    else:
+        value = control.authorize_pilot(db, os.environ["TASK"], os.environ["SHA"],
+                                        ttl=timedelta(minutes=int(os.environ["MINUTES"])))
+        print(json.dumps({k: value[k] for k in ("task_key", "source_sha", "expires_at")}, indent=2))
+' ;;
+      *) echo "companyctl stage-c: preflight [--json] | status | merge-authorize PR SHA | merge-complete PR SHA ID | authorize | revoke" >&2; exit 2 ;;
+    esac
+    ;;
+
+  phase)
+    require_up
+    n=${1:?phase number required}; st=${2:?status required}; ev=${3:?evidence required}
+    api POST "/phases/$n" "$(python3 -c 'import json,sys; print(json.dumps({"status": sys.argv[1], "evidence": sys.argv[2], "actor": "founder"}))' "$st" "$ev")" | pretty
+    ;;
+
+  -h|--help|help) usage ;;
+  *) echo "companyctl: unknown command '$cmd'" >&2; echo >&2; usage >&2; exit 2 ;;
+esac

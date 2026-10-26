@@ -1,0 +1,51 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Company OS scheduled work.
+#
+# Times below are LOCAL (Europe/Berlin / CEST), because cron uses the host timezone —
+# an earlier version of this comment claimed UTC, which was wrong.
+#
+#   backup        03:30 CEST = 01:30 UTC
+#   restore test  04:30 CEST = 02:30 UTC (Sundays)
+#   youtube-auto  02:00 Istanbul = 01:00 CEST  -> 2.5h clear of the backup, no contention
+
+# Daily backup: all targets. 'renders' self-skips on daily class.
+30 3 * * *   root  /opt/company-os/scripts/backup.sh >> /opt/company-os/backups/cron.log 2>&1
+
+# Weekly restore verification (§76 — an untested backup is a belief, not a backup).
+30 4 * * 0   root  /opt/company-os/scripts/restore-test.sh >> /opt/company-os/backups/cron.log 2>&1
+
+# Daily fallback snapshot. It is deterministic, reads live PostgreSQL through the API and
+# declares itself stale after 24 hours; deploys also regenerate it after release verification.
+5 5 * * *    root  /opt/company-os/scripts/companyctl snapshot >> /opt/company-os/backups/snapshot.log 2>&1
+
+# Deterministic watchdog every 10 minutes. No model calls: it is SQL and arithmetic.
+# Exit 1 means findings were recorded (normal); any other code means the watchdog itself
+# could not run, and the script then alerts over Telegram directly.
+*/10 * * * * root  /opt/company-os/scripts/watchdog.sh >> /opt/company-os/backups/watchdog.log 2>&1
+
+# Seerxo revenue from Polar, hourly at :17 (read-only token, scope metrics:read). Exit 2 =
+# POLAR_METRICS_TOKEN not set yet: nothing recorded, the Desk keeps "no verified source".
+17 * * * *   root  docker exec company-api python -m app.polar_metrics >> /opt/company-os/backups/polar-metrics.log 2>&1
+
+# Seerxo activation funnel (aggregate counts from seerxo-backend /internal/funnel), hourly at :27.
+# Exit 2 = SEERXO_FUNNEL_TOKEN not set yet: nothing recorded.
+27 * * * *   root  docker exec company-api python -m app.seerxo_funnel >> /opt/company-os/backups/seerxo-funnel.log 2>&1
+
+# CI runner usage from GitHub Actions job times (app/ci_usage.py), hourly at :37. Estimates only
+# (BILLING_UNVERIFIED); the watchdog turns them into budget findings. Exit 2 = CI_USAGE_GITHUB_TOKEN not set.
+37 * * * *   root  docker exec company-api python -m app.ci_usage >> /opt/company-os/backups/ci-usage.log 2>&1
+
+# B5 interim detective control (app/main_guard.py): every commit on Seerxo/os main must be a founder-merged PR.
+# Detects only; production is protected by the release gateway. Exit 1 = alert recorded, 2 = no GH_TOKEN (DEGRADED).
+*/15 * * * * root  docker exec company-worker python -m app.main_guard >> /opt/company-os/backups/main-guard.log 2>&1
+
+# Weekly notebook review (§53A): deduplicate, promote what recurred, archive what did
+# not. Promotion creates a CANDIDATE learning — the supervisor and, for high impact, the
+# founder still decide. Nothing is deleted and the constitution is never touched.
+0 5 * * 1    root  printf '{"apply":true,"actor":"weekly-compaction"}' | docker exec -i company-api curl -sS -X POST http://localhost:8000/notes/compact -H 'content-type: application/json' --data-binary @- >> /opt/company-os/backups/compaction.log 2>&1
+
+# Installed with:
+#   sudo install -m 644 /opt/company-os/scripts/company-os.cron /etc/cron.d/company-os
+# Keep this file and /etc/cron.d/company-os identical; the schedule is part of the
+# system (§0, §66) and must not live only on the host.

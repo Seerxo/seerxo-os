@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""company-coder-launch: run one Stage C container per request (docs/CODER_RUNTIME.md D1).
+
+Runs as root on the host from a systemd path unit; the worker never gets the Docker socket.
+The worker writes /srv/company-coder/jobs/<KEY>/{request.json,prompt.txt,workspace|checks}.
+A request picks one of two fixed profiles (code, checks). Code runs Claude only. It can never
+add a mount, an env var, a flag or an image: every argv element below is built here.
+
+The jobs directory is worker-controlled, so root never opens, writes or mounts a path in it.
+Every file operation there runs as the worker uid. The inputs are first copied into a
+root-owned staging directory, which the worker cannot reach, and checked there (no symlinks,
+real directories), and only that copy is mounted. Results go back the same way.
+
+Config (root-only): /etc/company-coder/launcher.json, exactly these keys and, apart from the image IDs,
+exactly these values (load_config refuses anything else; verify_network checks the network is internal):
+  {"coder_image": "sha256:…", "checks_images": {"sez-company": "sha256:…"},
+   "checks_commands": {"sez-company": ["python", "-m", "pytest", "-q"]},
+   "network": "company-coder-net", "proxy": "http://company-egress:8888"}
+Claude token (root-only, 0600): /etc/company-coder/claude.env, exactly one line
+  CLAUDE_CODE_OAUTH_TOKEN=…   (a `claude setup-token` token used by nothing else)
+"""
+import json
+from contextlib import ExitStack, contextmanager
+import fcntl
+import os
+import re
+import select
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+JOBS = Path(os.environ.get("CODER_JOBS", "/srv/company-coder/jobs"))
+STAGING = Path(os.environ.get("CODER_STAGING", "/var/lib/company-coder/run"))
+CONFIG = Path(os.environ.get("CODER_CONFIG", "/etc/company-coder/launcher.json"))
+CLAUDE_ENV = Path(os.environ.get("CODER_CLAUDE_ENV", "/etc/company-coder/claude.env"))
+WORKER_UID = 10001
+KEY = re.compile(r"TASK-\d{4,}")
+IMAGE = re.compile(r"sha256:[a-f0-9]{64}")
+LIMITS = {"code": 1200, "checks": 1200}          # wall clock ceilings, seconds (checks: full suite measured 493 s at --cpus=1)
+START_TIMEOUT = 30
+PAUSE_FENCE = Path("/etc/company-coder/pause.lock")
+_FENCE_UID = 0
+SOURCE = {"code": "workspace", "checks": "checks"}
+PROVIDERS = ("claude",)
+MAX_PROMPT = 64 * 1024
+START_WRAPPER = ('touch /run/company-coder/started; n=0; '
+                 'while [ ! -f /run/company-coder/allowed ]; do n=$((n+1)); '
+                 '[ "$n" -lt 600 ] || exit 124; sleep 0.05; done; exec "$@"')
+METERED = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY",
+           "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+
+
+class Refused(ValueError):
+    pass
+
+
+# A root-owned fence serializes the permission handoff with the founder pause commit.
+# The DB lock alone is insufficient: a helper crash must not let a concurrent pause pass the handoff.
+# No control credentials leave company-api and no repository code runs as host root.
+PAUSE_QUERY = '''
+import os, sys
+from sqlalchemy import select, text
+from app import control
+from app.db import SessionLocal
+from app.models import ControlState
+if os.environ.get("CODER_PAUSE_FENCE_ENABLED") != "true":
+    sys.exit(2)
+fd = control.open_coder_pause_fence()
+try:
+    st = os.fstat(fd)
+    if (st.st_dev, st.st_ino) != (int(sys.argv[1]), int(sys.argv[2])):
+        sys.exit(2)
+finally:
+    os.close(fd)
+with SessionLocal() as db:
+    if db.get_bind().dialect.name != "postgresql":
+        sys.exit(2)
+    db.execute(text("SET LOCAL lock_timeout = '5s'"))
+    db.execute(text("SET LOCAL statement_timeout = '5s'"))
+    db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
+    def unpaused():
+        row = db.execute(select(ControlState).where(ControlState.key == "agents_paused")
+                         .with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+        return row is not None and isinstance(row.value, dict) and row.value.get("paused") is False
+    if not unpaused():
+        sys.exit(2)
+    print("READY", flush=True)
+    if sys.stdin.readline() != "START\\n" or not unpaused():
+        sys.exit(2)
+    print("ALLOW", flush=True)
+    sys.stdin.readline()
+'''
+
+
+@contextmanager
+def pause_guard():
+    """Serialize admission with founder pause; unknown state refuses before untrusted code runs."""
+    fd = os.open(PAUSE_FENCE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != _FENCE_UID or st.st_mode & 0o222 or st.st_nlink != 1:
+            raise Refused("founder pause fence is invalid")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Refused("founder pause fence remained busy")
+                time.sleep(0.05)
+        with pause_authority(st.st_dev, st.st_ino) as authorize:
+            yield authorize
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def pause_authority(device: int, inode: int):
+    proc = subprocess.Popen(["docker", "exec", "-i", "--user=10001:10001", "company-api",
+                             "python", "-u", "-c", PAUSE_QUERY, str(device), str(inode)],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        def receive(expected):
+            deadline, data = time.monotonic() + 10, b""
+            while len(data) < len(expected):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
+                    raise Refused("founder pause authority is unavailable")
+                chunk = os.read(proc.stdout.fileno(), 1)
+                if not chunk:
+                    raise Refused("founder pause is active or its authority is unavailable")
+                data += chunk
+            if data != expected:
+                raise Refused("founder pause authority returned an invalid decision")
+
+        receive(b"READY\n")
+
+        def authorize():
+            if proc.poll() is not None:
+                raise Refused("founder pause authority was lost")
+            proc.stdin.write(b"START\n")
+            proc.stdin.flush()
+            receive(b"ALLOW\n")
+
+        yield authorize
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        proc.stdout.close()
+
+
+def as_worker(*cmd: str, timeout: int = 120) -> None:
+    """File operations in the worker-controlled tree run with the worker's rights only."""
+    subprocess.run(cmd, check=True, capture_output=True, timeout=timeout, user=WORKER_UID, group=WORKER_UID)
+
+
+def read_regular(path: Path, limit: int) -> bytes:
+    """Read a file we staged; refuse symlinks (O_NOFOLLOW) and anything but a small regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            raise Refused(f"{path.name}: not a regular file under {limit} bytes")
+        return os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+
+
+# The isolation the coder relies on is these exact values, not whatever the config file says: the network is
+# the internal compose network (no route out) and the proxy is the allowlisting egress container.
+CODER_NETWORK = "company-coder-net"
+CODER_PROXY = "http://company-egress:8888"
+CHECKS_COMMAND = ["python", "-m", "pytest", "-q"]
+CONFIG_KEYS = {"coder_image", "checks_images", "checks_commands", "network", "proxy"}
+
+
+def load_config() -> dict:
+    """launcher.json is root-only, but a wrong value silently removes the sandbox (a routable network, a
+    different proxy, a shell as the checks command), so anything outside the fixed contract is refused."""
+    try:
+        cfg = json.loads(read_regular(CONFIG, 64 * 1024))
+    except ValueError:
+        raise Refused("launcher config is not valid JSON") from None
+    if not isinstance(cfg, dict) or set(cfg) != CONFIG_KEYS:
+        raise Refused(f"launcher config must have exactly {sorted(CONFIG_KEYS)}")
+    if not isinstance(cfg["checks_images"], dict) or not isinstance(cfg["checks_commands"], dict):
+        raise Refused("checks_images and checks_commands must be objects")
+    images = [cfg["coder_image"], *cfg["checks_images"].values()]
+    if not all(isinstance(i, str) and IMAGE.fullmatch(i) for i in images):
+        raise Refused("config images must be immutable local image IDs")
+    if cfg["network"] != CODER_NETWORK or cfg["proxy"] != CODER_PROXY:
+        raise Refused(f"coder network and proxy must be {CODER_NETWORK} and {CODER_PROXY}")
+    if set(cfg["checks_commands"]) != set(cfg["checks_images"]) or any(
+            c != CHECKS_COMMAND for c in cfg["checks_commands"].values()):
+        raise Refused(f"every checks repository needs an image and exactly the command {CHECKS_COMMAND}")
+    return cfg
+
+
+def verify_network(cfg: dict, run=subprocess.run) -> None:
+    """The coder network must really be internal on this host, at launch time; unknown is refused."""
+    try:
+        out = run(["docker", "network", "inspect", "--format", "{{json .}}", cfg["network"]],
+                  check=True, capture_output=True, text=True, timeout=30).stdout
+        info = json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise Refused(f"cannot verify that {cfg['network']} exists and is internal") from None
+    if not isinstance(info, dict) or info.get("Internal") is not True:
+        raise Refused(f"{cfg['network']} is not an internal network: the coder could reach the internet")
+
+
+def parse_request(raw: bytes, cfg: dict) -> dict:
+    req = json.loads(raw)
+    if not isinstance(req, dict) or set(req) - {"kind", "provider", "repo", "timeout_s"}:
+        raise Refused("request has unknown fields")
+    kind, repo, t = req.get("kind"), req.get("repo"), req.get("timeout_s")
+    if kind not in LIMITS:
+        raise Refused(f"kind must be one of {sorted(LIMITS)}")
+    if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= LIMITS[kind]:
+        raise Refused(f"timeout_s must be 1..{LIMITS[kind]}")
+    if kind == "code" and req.get("provider") not in PROVIDERS:
+        raise Refused("Stage C coding is Claude-only; Codex is reviewer-only")
+    if kind == "checks" and (repo not in cfg["checks_images"] or repo not in cfg["checks_commands"]):
+        raise Refused("unknown repository for checks")
+    return req
+
+
+def claude_env_file() -> str:
+    lines = [l for l in read_regular(CLAUDE_ENV, 4096).decode().splitlines() if l.strip()]
+    if len(lines) != 1 or not lines[0].startswith("CLAUDE_CODE_OAUTH_TOKEN="):
+        names = [l.split("=", 1)[0] for l in lines]
+        if any(n in METERED for n in names):
+            raise Refused("metered credential in the coder env file (§26A)")
+        raise Refused("claude env file must hold exactly CLAUDE_CODE_OAUTH_TOKEN")
+    return str(CLAUDE_ENV)
+
+
+def docker_argv(req: dict, cfg: dict, mount: Path, name: str) -> list[str]:
+    """The only two container profiles. Nothing from the request reaches argv except the
+    choice of profile and provider, both validated against fixed lists."""
+    if req["kind"] == "code" and req.get("provider") != "claude":
+        raise Refused("Stage C coding is Claude-only; Codex is reviewer-only")
+    # --init: a reaper as PID 1. Without it the checks' pytest was PID 1, never reaped orphaned git/sh children, and
+    # the zombies filled --pids-limit (L2 pilot TASK-0070, 2026-10-19).
+    argv = ["docker", "run", "--name", name, "--rm", "-i", "--init", "--pull=never", "--read-only",
+            f"--user={WORKER_UID}:{WORKER_UID}", "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true", "--pids-limit=256", "--memory=2g",
+            "--cpus=1", "--ipc=private", "--tmpfs=/tmp:size=256m,mode=1777",
+            "--workdir=/workspace", "--mount", f"type=bind,source={mount},target=/workspace"]
+    if req["kind"] == "checks":
+        # TMPDIR on the writable bind mount: /tmp is a noexec tmpfs and tests run helper scripts from
+        # pytest's temp dir. The checks copy is discarded, never imported back.
+        # Start acknowledgement: the same ack mount and sh wrapper the coder uses. Only the touch is added;
+        # the checks command itself is unchanged and still the last arguments.
+        return [*argv, "--network=none", "--env=HOME=/tmp", "--env=TMPDIR=/workspace",
+                "--env=PYTHONDONTWRITEBYTECODE=1", "--mount",
+                f"type=bind,source={mount.parent / 'ack'},target=/run/company-coder",
+                cfg["checks_images"][req["repo"]], "sh", "-c", START_WRAPPER,
+                "company-coder", *cfg["checks_commands"][req["repo"]]]
+    proxy = cfg["proxy"]
+    argv += [f"--network={cfg['network']}", f"--tmpfs=/home/coder:size=64m,uid={WORKER_UID},"
+             f"gid={WORKER_UID},mode=0700", "--env=HOME=/home/coder", f"--env=HTTPS_PROXY={proxy}",
+             f"--env=HTTP_PROXY={proxy}", "--env=NO_PROXY=", "--env=no_proxy=", "--mount",
+             f"type=bind,source={mount.parent / 'ack'},target=/run/company-coder"]
+    wrapper = ["sh", "-c", START_WRAPPER, "company-coder"]
+    return [*argv, f"--env-file={claude_env_file()}", "--env=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+            cfg["coder_image"], *wrapper, "claude", "-p", "--tools", "Read,Edit,Write,Glob,Grep",
+            "--permission-mode", "acceptEdits", "--max-turns", "30", "--no-session-persistence",
+            "--output-format", "json"]
+
+
+def stage(job: Path, staged: Path, source: str) -> None:
+    """Copy the job's inputs into `staged` as the worker; then verify the copy as root."""
+    for name in ("prompt.txt", source):
+        if os.path.lexists(job / name):
+            as_worker("cp", "-R", "-P", str(job / name), str(staged / name))
+    st = os.lstat(staged / source)  # the copy is ours: lstat is not racing the worker
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused(f"{source} must be a real directory")
+
+
+def run_container(argv: list[str], prompt: bytes, timeout_s: int, name: str,
+                  on_started=None, started_file: Path | None = None) -> dict:
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if started_file is None:
+        try:
+            if on_started:
+                on_started()
+            stdout, _stderr = proc.communicate(prompt, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+            return {"exit": None, "timed_out": True, "summary": f"timed out after {timeout_s}s"}
+        except Exception:
+            proc.kill()
+            proc.communicate()
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+            raise
+    else:
+        streams, errors = {}, {}
+
+        def communicate():
+            try:
+                streams["output"] = proc.communicate(prompt, timeout=timeout_s)
+            except BaseException as error:
+                errors["error"] = error
+
+        reader = threading.Thread(target=communicate, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + START_TIMEOUT
+        while not started_file.is_file() and reader.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if started_file.is_file():
+            try:
+                if on_started:
+                    on_started()
+            except Exception:
+                proc.kill()
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=5)
+                reader.join(timeout=5)
+                raise
+        elif reader.is_alive():
+            proc.kill()
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=5)
+            reader.join(timeout=5)
+            return {"exit": None, "timed_out": True, "summary": "coder container did not start"}
+        reader.join(timeout=timeout_s + 1)
+        if reader.is_alive():
+            proc.kill()
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+            reader.join(timeout=30)
+            return {"exit": None, "timed_out": True, "summary": f"timed out after {timeout_s}s"}
+        if errors:
+            error = errors["error"]
+            if isinstance(error, subprocess.TimeoutExpired):
+                proc.kill()
+                proc.communicate()
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+                return {"exit": None, "timed_out": True, "summary": f"timed out after {timeout_s}s"}
+            raise error
+        stdout, _stderr = streams["output"]
+    # Model or test output is untrusted and may be large: only the last line, bounded.
+    tail = stdout.decode(errors="replace").strip().splitlines()[-1:] or [""]
+    return {"exit": proc.returncode, "timed_out": False, "summary": tail[0][:300]}
+
+
+def launch_lock(job: Path, timeout_s: int = 10) -> int:
+    jobs_fd = os.open(JOBS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        job_fd = os.open(job.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=jobs_fd)
+    finally:
+        os.close(jobs_fd)
+    try:
+        fd = os.open("launch.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=job_fd)
+    finally:
+        os.close(job_fd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise Refused("launch lock is not a regular file")
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("coder launch lock remained busy")
+                time.sleep(0.05)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def handle(key: str, cfg: dict, runner=run_container) -> dict:
+    if not KEY.fullmatch(key):
+        raise Refused(f"invalid task key {key!r}")
+    job = JOBS / key
+    # Claim first, as the worker, so the path unit does not trigger again for this request.
+    as_worker("mv", "-f", str(job / "request.json"), str(job / "request.claimed.json"))
+    staged = Path(tempfile.mkdtemp(prefix=f"{key}-", dir=STAGING))
+    # mkdtemp is root-only 0700; every copy below runs as the worker uid, so hand it over first.
+    shutil.chown(staged, WORKER_UID, WORKER_UID)
+    launch_fd, launch_started = None, False
+
+    def release_launch_lock():
+        nonlocal launch_fd
+        if launch_fd is not None:
+            fcntl.flock(launch_fd, fcntl.LOCK_UN)
+            os.close(launch_fd)
+            launch_fd = None
+
+    try:
+        try:
+            as_worker("cp", "-P", str(job / "request.claimed.json"), str(staged / "request.json"))
+            req = parse_request(read_regular(staged / "request.json", 4096), cfg)
+            source = SOURCE[req["kind"]]
+            stage(job, staged, source)
+            # Every kind gets the start acknowledgement: run_container waits for it, so a checks container
+            # that never signals would be killed as "did not start" even though it ran.
+            as_worker("mkdir", str(staged / "ack"))
+            prompt = b""
+            if req["kind"] == "code":
+                prompt = read_regular(staged / "prompt.txt", MAX_PROMPT)
+                if not prompt.strip():
+                    raise Refused("empty prompt")
+            name = f"company-coder-{key.lower()}-{uuid.uuid4().hex[:8]}"
+            as_worker("touch", str(job / "launch.lock"))
+            launch_fd = launch_lock(job)
+            if os.path.lexists(job / "cancel.json"):
+                raise Refused("request cancelled before coder start")
+            argv = docker_argv(req, cfg, staged / source, name)
+            with ExitStack() as pause:
+                authorize = pause.enter_context(pause_guard())
+                def started():
+                    nonlocal launch_fd, launch_started
+                    authorize()
+                    if os.path.lexists(job / "cancel.json"):
+                        raise Refused("request cancelled before coder start")
+                    as_worker("mkdir", "-p", str(job / "done"), timeout=5)
+                    # A crash after the grant must remain a possible model start to the worker.
+                    as_worker("touch", str(job / "done" / "started.json"), timeout=5)
+                    permission_fd = os.open(staged / "ack" / "allowed",
+                                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+                    launch_started = True
+                    os.close(permission_fd)
+                    pause.close()
+                    release_launch_lock()
+                if runner is run_container:
+                    result = runner(argv, prompt, req["timeout_s"], name, on_started=started,
+                                    started_file=staged / "ack" / "started")
+                else:
+                    started()  # deterministic test runners represent a process that has started
+                    result = runner(argv, prompt, req["timeout_s"], name)
+            result["kind"] = req["kind"]
+        except (Refused, ValueError, OSError, KeyError, subprocess.SubprocessError) as e:
+            result = {"exit": None, "timed_out": False, "refused": f"{type(e).__name__}: {e}"[:300]}
+        release_launch_lock()
+        # Hand back: the (possibly edited) directory and result.json, copied as the worker.
+        result_path = staged / "result.json"
+        if os.path.lexists(result_path):
+            os.unlink(result_path)
+        fd = os.open(result_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w") as f:
+            json.dump(result, f)
+        out = job / "done"
+        # Never erase the durable admission marker while publishing a completed result.
+        if not launch_started:
+            as_worker("rm", "-rf", str(out))
+        as_worker("mkdir", "-p", str(out))
+        if launch_started:
+            as_worker("touch", str(out / "started.json"))
+        # Only the coder's edits come back; checks report through result.json alone.
+        if os.path.isdir(staged / "workspace") and not os.path.islink(staged / "workspace"):
+            as_worker("cp", "-R", "-P", str(staged / "workspace"), str(out / "workspace"))
+        as_worker("cp", "-P", str(result_path), str(out / "result.json"))
+        return result
+    finally:
+        release_launch_lock()
+        shutil.rmtree(staged, ignore_errors=True)
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("company-coder-launch: run as root from its systemd unit", file=sys.stderr)
+        return 2
+    # 0711: the worker uid can enter its own random-named staging dir but not list others.
+    # The worker container never sees this path at all.
+    STAGING.mkdir(parents=True, exist_ok=True)
+    STAGING.chmod(0o711)
+    try:
+        cfg = load_config()
+        verify_network(cfg)
+    except Refused as e:  # no container starts on an unverified sandbox; queued requests wait and time out
+        print(f"company-coder-launch: refused: {e}", file=sys.stderr)
+        return 3
+    # One container at a time (D6); the unit is oneshot, so systemd also serialises runs.
+    for request in sorted(JOBS.glob("*/request.json")):
+        key = request.parent.name
+        try:
+            result = handle(key, cfg)
+            print(f"{key}: {json.dumps({k: result.get(k) for k in ('kind', 'exit', 'timed_out', 'refused')})}")
+        except Exception as e:  # one bad job must not stop the others
+            print(f"{key}: launcher error {type(e).__name__}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

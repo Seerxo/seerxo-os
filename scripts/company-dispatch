@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Hand a Company OS task to herdr's control center (docs/AGENT_EXECUTION.md §4.1).
+#
+# Runs on the LAPTOP, because that is where hctl and the model CLIs are authenticated.
+# Company OS runs on the server, so the plan is fetched over ssh. The mapping rules live
+# server-side in app/dispatch.py; this script only resolves the local checkout and runs
+# the command.
+#
+#   company-dispatch TASK-0006             # show the plan and the command (default)
+#   company-dispatch TASK-0006 --run       # actually start it
+#   company-dispatch TASK-0006 --repo ~/x  # override checkout resolution
+set -uo pipefail
+
+SERVER=${COMPANY_SERVER:-company-os-host}
+PROJECTS_ROOT=${COMPANY_PROJECTS_ROOT:-$HOME/Desktop/projects}
+
+KEY=${1:-}
+if [ -z "$KEY" ]; then
+  echo "usage: company-dispatch <TASK-KEY> [--run] [--repo <path>]" >&2
+  exit 2
+fi
+shift
+
+RUN=0 REPO_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) RUN=1 ;;
+    --repo) REPO_OVERRIDE=${2:?--repo needs a path}; shift ;;
+    *) echo "company-dispatch: unknown option '$1'" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+command -v hctl >/dev/null 2>&1 || {
+  echo "company-dispatch: hctl not found on PATH — the control center runs on the laptop" >&2
+  exit 1
+}
+
+PLAN=$(ssh "$SERVER" "sudo -n docker exec company-api curl -sS -f http://localhost:8000/tasks/$KEY/dispatch" 2>/dev/null)
+if [ -z "$PLAN" ]; then
+  # A 409 means the task exists but is not dispatchable, which is a different problem
+  # from the server being unreachable; ask again without -f to show the reason.
+  DETAIL=$(ssh "$SERVER" "sudo -n docker exec company-api curl -sS http://localhost:8000/tasks/$KEY/dispatch" 2>/dev/null)
+  echo "company-dispatch: no plan for $KEY" >&2
+  [ -n "$DETAIL" ] && echo "$DETAIL" >&2
+  exit 1
+fi
+
+# --- resolve the local checkout ---------------------------------------------------
+resolve_repo() {
+  [ -n "$REPO_OVERRIDE" ] && { printf '%s' "$REPO_OVERRIDE"; return 0; }
+  local repo name hit
+  repo=$(printf '%s' "$PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("repository") or "")')
+  [ -z "$repo" ] && return 1
+  name=${repo##*/}
+  name=${name%.git}
+  # Projects are consolidated as ~/Desktop/projects/<group>/<name> (docs/MOVE_LOG.md).
+  hit=$(/usr/bin/find "$PROJECTS_ROOT" -maxdepth 2 -type d -name "$name" 2>/dev/null | head -2)
+  [ -z "$hit" ] && return 1
+  [ "$(printf '%s\n' "$hit" | wc -l | tr -d ' ')" -gt 1 ] && {
+    echo "company-dispatch: '$name' matches more than one checkout; pass --repo" >&2
+    printf '%s\n' "$hit" >&2
+    return 2
+  }
+  printf '%s' "$hit"
+}
+
+REPO_PATH=$(resolve_repo); rc=$?
+if [ $rc -eq 2 ]; then exit 2; fi
+
+ARGV_FILE=$(mktemp)
+trap 'rm -f "$ARGV_FILE"' EXIT
+
+PLAN="$PLAN" REPO_PATH="${REPO_PATH:-}" ARGV_OUT="$ARGV_FILE" python3 - <<'PY'
+import json, os, shlex, sys
+
+plan = json.loads(os.environ["PLAN"])
+repo = os.environ.get("REPO_PATH") or ""
+
+print(f"{plan['task']}  {plan['priority']}  risk={plan['risk_level']}")
+print(f"  {plan['title']}")
+print()
+print(f"  workflow   {plan['workflow']}")
+print(f"  acceptance {plan['acceptance'][:100]}{'...' if len(plan['acceptance']) > 100 else ''}")
+print(f"  repository {plan['repository'] or '(none recorded)'}")
+print(f"  checkout   {repo or 'NOT RESOLVED — pass --repo'}")
+print(f"  auto       {plan['auto']}" + (f"  (blocked by {plan['auto_blocked_by']})" if not plan["auto"] else ""))
+for n in plan["notes"]:
+    print(f"  note       {n}")
+print()
+
+if not repo:
+    print("Cannot build a command without a checkout path.", file=sys.stderr)
+    sys.exit(3)
+
+argv = ["hctl", "task", "start", plan["hctl_id"], repo, plan["title"],
+        f"--acceptance={plan['acceptance']}",
+        f"--acceptance=Load task context: {plan['context_command']}",
+        f"--workflow={plan['workflow']}"]
+if plan.get("scope"):
+    argv.append(f"--scope={plan['scope']}")
+if plan["auto"]:
+    argv.append("--auto")
+
+print(" ".join(shlex.quote(a) for a in argv))
+with open(os.environ["ARGV_OUT"], "w") as fh:
+    fh.write("\0".join(argv))
+PY
+rc=$?
+[ $rc -ne 0 ] && exit $rc
+
+if [ "$RUN" -eq 1 ]; then
+  echo
+  echo "starting..."
+  # Read back the exact argv the planner built, so the executed command cannot drift
+  # from the one that was printed. `mapfile -d` needs bash 4; macOS ships 3.2, so this
+  # uses a NUL-delimited read loop instead — portable and equivalent.
+  ARGV=()
+  while IFS= read -r -d '' arg; do ARGV+=("$arg"); done < "$ARGV_FILE"
+  [ ${#ARGV[@]} -eq 0 ] && { echo "company-dispatch: empty command" >&2; exit 1; }
+  exec "${ARGV[@]}"
+fi
+echo
+echo "(dry run — add --run to start it)"

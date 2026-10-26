@@ -1,0 +1,11 @@
+# Runs scripts/company-coder-launch once over all pending requests. Root, because it starts
+# containers; everything it does in the worker-controlled jobs tree runs as uid 10001.
+[Unit]
+Description=Company OS coder launcher (one fixed-profile container per request)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/company-os/scripts/company-coder-launch
+TimeoutStartSec=3600

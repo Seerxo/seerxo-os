@@ -1,0 +1,25 @@
+# Repository identity and write scope for Stage C. A profile never enables the global writer.
+version: 1
+projects:
+  company-os:
+    business_unit: null
+    repositories:
+      seerxo/os:
+        target_branch: main
+        write_authorized: true
+        allowed_paths:
+          - app/goals.py
+          - app/metrics_store.py
+          - app/packaging.py
+          - tests/test_goals.py
+          - tests/test_metrics.py
+          - tests/test_packaging.py
+        execution_profile: sez-company
+  youtube-auto:
+    business_unit: youtube
+    repositories:
+      semihbugrasezer/youtube-auto:
+        target_branch: server-master
+        write_authorized: false
+        allowed_paths: []
+        execution_profile: null

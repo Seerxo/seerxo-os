@@ -1,0 +1,43 @@
+# Configuration and credentials: never commit real values (use .env.example placeholders)
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.age
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.kdbx
+.netrc
+.npmrc
+.pypirc
+
+# Database dumps, backups and local data
+*.dump
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+backups/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+desk/dist/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

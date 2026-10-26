@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# merge-pr <number> — the merge gate (§78). The repository is private without GitHub Pro, so
+# branch protection is unavailable (and buying it is new spend, §26A); merge through this
+# instead of the web button.
+#
+# Merges only when the `ci` workflow ran on the PR's current head commit and every check on
+# that commit passed. Pending, failed, cancelled or missing CI refuses. The merge is pinned to
+# the head that was checked, so a push during the wait cannot be merged untested.
+# For sez-company the trusted base branch's agents/repository_guardian.yaml decides: every
+# required CircleCI status and every listed Actions workflow's latest pull_request run on the
+# exact head (Sengi frontend) must be success.
+#
+# After a successful merge, the temporary head branch is deleted (see cleanup_branch). Cleanup
+# never fails the merge: the merge is already done, so problems are reported as warnings.
+# Set MERGE_PR_DELETE_BRANCH=0 to keep the branch.
+set -euo pipefail
+
+pr=${1:?usage: merge-pr <pr-number>}
+REQUIRED=${REQUIRED_CHECK:-test}   # the ci workflow's job name
+
+# Branches that must never be deleted by automation (docs/GIT_WORKFLOW.md, Branch retention).
+is_protected_branch() {
+  case "$1" in
+    main|master|develop|release/*|hotfix/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Deletes the remote head branch of a merged PR, only when it is still the commit that was merged.
+# Idempotent: an already-deleted branch is success. Each refusal prints its reason and returns 0.
+cleanup_branch() {
+  local pr=$1 merged_head=$2 branch repo head_repo remote_sha wt
+  branch=$(gh pr view "$pr" --json headRefName -q .headRefName)
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+  head_repo=$(gh pr view "$pr" --json headRepositoryOwner,headRepository -q '.headRepositoryOwner.login + "/" + .headRepository.name') || {
+    echo "merge-pr: keeping branch, PR head repository unavailable"; return 0; }
+  if [ "$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]; then
+    echo "merge-pr: keeping fork branch $head_repo:$branch"; return 0
+  fi
+
+  if is_protected_branch "$branch"; then
+    echo "merge-pr: keeping protected branch $branch"; return 0
+  fi
+  # A local worktree with this branch checked out is active work; keep the branch.
+  wt=$(git worktree list --porcelain 2>/dev/null | grep -x "branch refs/heads/$branch" || true)
+  if [ -n "$wt" ]; then
+    echo "merge-pr: keeping $branch, it is checked out in a local worktree"; return 0
+  fi
+  if ! remote_sha=$(gh api "repos/$repo/git/ref/heads/$branch" --jq .object.sha 2>/dev/null); then
+    echo "merge-pr: $branch already gone on origin"; return 0
+  fi
+  if [ "$remote_sha" != "$merged_head" ]; then
+    echo "merge-pr: keeping $branch, its tip $remote_sha moved after merge (merged $merged_head)"; return 0
+  fi
+  if gh api -X DELETE "repos/$repo/git/refs/heads/$branch" >/dev/null 2>&1; then
+    echo "merge-pr: deleted merged branch $branch at $merged_head"
+  elif gh api "repos/$repo/git/ref/heads/$branch" >/dev/null 2>&1; then
+    echo "merge-pr: WARNING could not delete $branch; delete it manually" >&2
+  else
+    echo "merge-pr: $branch already gone on origin"
+  fi
+  return 0
+}
+
+head=$(gh pr view "$pr" --json headRefOid -q .headRefOid)
+echo "merge-pr: #$pr head $head; waiting for checks"
+# --watch returns once nothing is pending; its exit code is ignored, the JSON below decides.
+gh pr checks "$pr" --watch --interval 15 >/dev/null 2>&1 || true
+
+[ "$(gh pr view "$pr" --json headRefOid -q .headRefOid)" = "$head" ] || {
+  echo "merge-pr: head moved during the wait; run again to check the new commit" >&2; exit 1; }
+
+repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+repo=$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')
+if [ "$repo" = "seerxo/os" ]; then
+  # Read the CI policy from the trusted PR base, never from the candidate branch being merged.
+  base=$(gh pr view "$pr" --json baseRefName -q .baseRefName)
+  policy_b64=$(gh api "repos/$repo/contents/agents/repository_guardian.yaml?ref=$base" --jq .content) || {
+    echo "merge-pr: trusted base-branch CI policy unavailable; refusing merge" >&2; exit 1; }
+  policy=$(printf '%s' "$policy_b64" | python3 -c 'import base64,sys; print(base64.b64decode("".join(sys.stdin.read().split()), validate=True).decode())') || {
+    echo "merge-pr: trusted base-branch CI policy is malformed; refusing merge" >&2; exit 1; }
+  policy_json=$(python3 -c '
+import json, re, sys
+repository, base = sys.argv[1:]
+text = sys.stdin.read()
+branches = re.search(r"(?ms)^branches:\s*\n((?:^[ \t]+[^\n]*\n?)+)", text)
+publisher = re.search(r"(?m)^status_publisher:[ \t]*\n[ \t]+login:[ \t]*\"([^\"\n]+)\"[ \t]*\n[ \t]+id:[ \t]*([0-9]+)[ \t]*$", text)
+statuses = re.search(r"(?ms)^required_statuses:\s*\n((?:^[ \t]+[^\n]*\n?)+)", text)
+no_statuses = re.search(r"(?m)^required_statuses:[ \t]*\[\][ \t]*$", text)
+# `workflows: []` (CircleCI only) or a block list of Actions workflow paths; absent refuses.
+no_workflows = re.search(r"(?m)^workflows:[ \t]*\[\][ \t]*$", text)
+workflow_block = re.search(r"(?ms)^workflows:[ \t]*\n((?:^[ \t]+[^\n]*\n?)+)", text)
+if not branches or not publisher or bool(statuses) == bool(no_statuses) or bool(no_workflows) == bool(workflow_block):
+    raise SystemExit("merge-pr: trusted base-branch CI policy is incomplete")
+workflows = []
+for line in (workflow_block[1].splitlines() if workflow_block else []):
+    match = re.fullmatch(r"[ \t]*-[ \t]*\"(\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)\"[ \t]*", line)
+    if not match:
+        raise SystemExit("merge-pr: trusted required-workflow policy is malformed")
+    workflows.append(match[1])
+if len(workflows) != len(set(workflows)):
+    raise SystemExit("merge-pr: trusted required-workflow policy is malformed")
+branch_values = re.findall(r"(?m)^[ \t]{2}" + re.escape(repository) + r":[ \t]*([A-Za-z0-9._/-]+)[ \t]*$", branches[1])
+contexts = []
+for line in (statuses[1].splitlines() if statuses else []):
+    match = re.fullmatch(r"[ \t]*-[ \t]*\"([^\"\n]+)\"[ \t]*", line)
+    if not match:
+        raise SystemExit("merge-pr: trusted required-status policy is malformed")
+    contexts.append(match[1])
+# At least one CI source: an empty status list is accepted only with required Actions workflows.
+if (branch_values != [base] or (not contexts and not workflows) or len(contexts) != len(set(contexts))
+        or any(len(context) > 255 for context in contexts)):
+    raise SystemExit("merge-pr: trusted CI policy does not authorize this base branch")
+# Optional publish fork (B5): Stage C PR heads may come from exactly this one fork, never any other.
+forks = re.search(r"(?ms)^publish_forks:[ \t]*\n((?:^[ \t]+[^\n]*\n?)+)", text)
+fork_headers = re.findall(r"(?m)^(?:publish_forks|\"publish_forks\"|\x27publish_forks\x27)[ \t]*:.*$", text)
+fork_mapping = {}
+if fork_headers:
+    if len(fork_headers) != 1 or fork_headers[0].rstrip() != "publish_forks:" or not forks:
+        raise SystemExit("merge-pr: trusted publish fork policy is malformed")
+    allowed = set(re.findall(r"(?m)^[ \t]{2}([a-z0-9_.-]+/[a-z0-9_.-]+):", branches[1]))
+    for line in forks[1].splitlines():
+        line = line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"[ \t]{2}([a-z0-9_.-]+/[a-z0-9_.-]+):[ \t]*([a-z0-9_.-]+/[a-z0-9_.-]+)[ \t]*", line)
+        if not match or match[1] not in allowed or match[1] in fork_mapping or match[1] == match[2]:
+            raise SystemExit("merge-pr: trusted publish fork policy is malformed")
+        fork_mapping[match[1]] = match[2]
+    if not fork_mapping:
+        raise SystemExit("merge-pr: trusted publish fork policy is malformed")
+fork_values = [fork_mapping[repository]] if repository in fork_mapping else []
+print(json.dumps({"branch": base, "publisher": {"login": publisher[1], "id": int(publisher[2])},
+                  "contexts": contexts, "workflows": workflows, "heads": [repository, *fork_values]}))
+' "$repo" "$base" <<<"$policy") || { echo "merge-pr: invalid trusted base-branch CI policy; refusing merge" >&2; exit 1; }
+  # The PR head must be this repository or its one trusted publish fork; only runs from that head count.
+  head_repo=$(gh pr view "$pr" --json headRepositoryOwner,headRepository -q '.headRepositoryOwner.login + "/" + .headRepository.name') || {
+    echo "merge-pr: PR head repository unavailable; refusing merge" >&2; exit 1; }
+  head_repo=$(printf '%s' "$head_repo" | tr '[:upper:]' '[:lower:]')
+  head_branch=$(gh pr view "$pr" --json headRefName -q .headRefName) || {
+    echo "merge-pr: PR head branch unavailable; refusing merge" >&2; exit 1; }
+  [ -n "$head_branch" ] || { echo "merge-pr: empty PR head branch; refusing merge" >&2; exit 1; }
+  printf '%s' "$policy_json" | python3 -c 'import json,sys; sys.exit(sys.argv[1] not in json.load(sys.stdin)["heads"])' "$head_repo" || {
+    echo "merge-pr: PR head repository $head_repo is not trusted; refusing merge" >&2; exit 1; }
+  if [ "$(printf '%s' "$policy_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["contexts"]))')" != 0 ]; then
+    statuses=$(gh api "repos/$repo/commits/$head/statuses?per_page=100" --jq '[.[] | {id, context, state, creator: {id: .creator.id, login: .creator.login}}]') || {
+      echo "merge-pr: exact-head commit statuses unavailable; refusing merge" >&2; exit 1; }
+    printf '%s\n' "$statuses" | python3 -c '
+import json, sys
+policy = json.loads(sys.argv[1])
+raw = json.load(sys.stdin)
+required = policy["contexts"]
+publisher = policy["publisher"]
+if not isinstance(raw, list) or len(raw) >= 100:
+    raise SystemExit("merge-pr: exact-head status list is incomplete")
+latest = {}
+for item in raw:
+    creator = item.get("creator") if isinstance(item, dict) else None
+    if (not isinstance(item, dict) or type(item.get("id")) is not int
+            or not isinstance(item.get("context"), str) or not isinstance(item.get("state"), str)
+            or not isinstance(creator, dict)):
+        raise SystemExit("merge-pr: malformed exact-head commit status")
+    context = item["context"]
+    if context not in required:
+        continue
+    if creator.get("id") != publisher["id"] or creator.get("login") != publisher["login"]:
+        raise SystemExit("merge-pr: required status has an untrusted publisher: " + context)
+    if item["state"] not in {"success", "pending", "failure", "error"}:
+        raise SystemExit("merge-pr: required status has an unknown state: " + context)
+    if context not in latest or item["id"] > latest[context]["id"]:
+        latest[context] = item
+missing = sorted(set(required) - set(latest))
+if missing:
+    raise SystemExit("merge-pr: missing required status: " + ", ".join(missing))
+bad = [context + "=" + latest[context]["state"] for context in required
+       if latest[context]["state"] != "success"]
+if bad:
+    raise SystemExit("merge-pr: refused, exact-head CI is not green: " + ", ".join(bad))
+' "$policy_json" || exit 1
+  fi
+  if [ "$(printf '%s' "$policy_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["workflows"]))')" != 0 ]; then
+    runs=$(gh api "repos/$repo/actions/runs?head_sha=$head&event=pull_request&per_page=100" --jq '{total_count, workflow_runs: [.workflow_runs[] | {id, path, head_sha, head_branch, event, status, conclusion, run_number, run_attempt, run_repo: .repository.full_name, head_repo: .head_repository.full_name}]}') || {
+      echo "merge-pr: exact-head workflow runs unavailable; refusing merge" >&2; exit 1; }
+    printf '%s\n' "$runs" | python3 -c '
+import json, sys
+policy, head_repo, head, repository, head_branch = json.loads(sys.argv[1]), *sys.argv[2:]
+raw = json.load(sys.stdin)
+rows = raw.get("workflow_runs") if isinstance(raw, dict) else None
+if not isinstance(rows, list) or type(raw.get("total_count")) is not int:
+    raise SystemExit("merge-pr: malformed exact-head workflow runs")
+if raw["total_count"] != len(rows) or len(rows) >= 100:
+    raise SystemExit("merge-pr: exact-head workflow run list is incomplete")
+latest = {}
+for run in rows:
+    if (not isinstance(run, dict) or type(run.get("id")) is not int or type(run.get("run_number")) is not int
+            or type(run.get("run_attempt")) is not int
+            or not all(isinstance(run.get(k), str) for k in ("path", "head_sha", "event", "status"))):
+        raise SystemExit("merge-pr: malformed exact-head workflow run")
+    # A query filter is not proof of run identity; the same SHA can belong to another branch or fork.
+    if (run["path"] not in policy["workflows"] or run["head_sha"] != head or run["event"] != "pull_request"
+            or not isinstance(run.get("run_repo"), str) or run["run_repo"].lower() != repository
+            or run.get("head_branch") != head_branch
+            or not isinstance(run.get("head_repo"), str) or run["head_repo"].lower() != head_repo):
+        continue
+    order = (run["run_number"], run["run_attempt"])
+    if run["path"] not in latest or order > (latest[run["path"]]["run_number"], latest[run["path"]]["run_attempt"]):
+        latest[run["path"]] = run
+missing = sorted(set(policy["workflows"]) - set(latest))
+if missing:
+    raise SystemExit("merge-pr: missing required workflow run on the exact head: " + ", ".join(missing))
+bad = ["%s=%s/%s" % (path, latest[path]["status"], latest[path].get("conclusion")) for path in policy["workflows"]
+       if latest[path]["status"] != "completed" or latest[path].get("conclusion") != "success"]
+if bad:
+    raise SystemExit("merge-pr: refused, exact-head workflow is not green: " + ", ".join(bad))
+' "$policy_json" "$head_repo" "$head" "$repo" "$head_branch" || exit 1
+  fi
+else
+  checks=$(gh pr checks "$pr" --json name,state)
+  echo "$checks" | python3 -c '
+import json, sys
+checks, required = json.load(sys.stdin), sys.argv[1]
+bad = ["%s=%s" % (c["name"], c["state"]) for c in checks if c["state"] not in ("SUCCESS", "SKIPPED", "NEUTRAL")]
+if not any(c["name"] == required and c["state"] == "SUCCESS" for c in checks):
+    bad.append(required + "=missing or not SUCCESS")
+if bad:
+    sys.exit("merge-pr: refused, CI is not green: " + ", ".join(bad))
+' "$REQUIRED"
+fi
+
+# Stage C task PRs also need the durable task/review/audit record from the control plane.
+# Other repositories and ordinary branches keep the existing founder-invoked CI gate.
+stage_c_task=""
+branch=$(gh pr view "$pr" --json headRefName -q .headRefName)
+if [ "$repo" = "seerxo/os" ]; then
+  identity=$(ssh "${COMPANY_SERVER:-company-os-host}" sudo companyctl stage-c identify-pr "$pr") || {
+    echo "merge-pr: control-plane PR classification unavailable; refusing merge" >&2; exit 1; }
+  stage_c_task=$(printf '%s' "$identity" | python3 -c '
+import json, re, sys
+value = json.load(sys.stdin)
+if type(value.get("pr_number")) is not int or value["pr_number"] != int(sys.argv[1]) \
+        or type(value.get("stage_c")) is not bool:
+    raise SystemExit("merge-pr: invalid Stage C PR classification")
+if value["stage_c"]:
+    task = value.get("task_key", "")
+    if not re.fullmatch(r"TASK-[0-9]{1,6}", task):
+        raise SystemExit("merge-pr: invalid Stage C task identity")
+    print(task)
+' "$pr")
+  if [ -z "$stage_c_task" ] && [[ "$branch" == task/* ]]; then
+    echo "merge-pr: task-prefixed branch has no durable Stage C publication; refusing merge" >&2; exit 1
+  fi
+  # B5: only Stage C publishes from the agent's fork. A fork-head PR without a durable Stage C publication
+  # record must never take the generic path (it would skip merge-authorize and the independent review).
+  pr_head_repo=$(gh pr view "$pr" --json headRepositoryOwner,headRepository -q '.headRepositoryOwner.login + "/" + .headRepository.name') || {
+    echo "merge-pr: PR head repository unavailable; refusing merge" >&2; exit 1; }
+  pr_head_repo=$(printf '%s' "$pr_head_repo" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$stage_c_task" ] && [ "$pr_head_repo" != "$repo" ]; then
+    echo "merge-pr: PR from $pr_head_repo has no durable Stage C publication; refusing merge" >&2; exit 1
+  fi
+  if [ -z "$stage_c_task" ]; then
+    # PR_OPEN commits after GitHub creates the PR. The Stage C commit subject lets us
+    # fail closed if someone merges in that short window or after a branch rename.
+    commit_message=$(gh api "repos/$repo/commits/$head" --jq .commit.message) || {
+      echo "merge-pr: could not verify commit task identity; refusing merge" >&2; exit 1; }
+    commit_subject=${commit_message%%$'\n'*}
+    if [[ "$commit_subject" == TASK-* ]]; then
+      if [[ ! "$commit_subject" =~ ^(TASK-[0-9]{1,6}):[[:space:]] ]]; then
+        echo "merge-pr: malformed Stage C commit identity; refusing merge" >&2; exit 1
+      fi
+      echo "merge-pr: Stage C task commit has no durable publication record; refusing merge" >&2
+      exit 1
+    fi
+  fi
+fi
+if [ -n "$stage_c_task" ]; then
+  actor=$(gh api user -q .login)
+  [ "$actor" = "semihbugrasezer" ] || {
+    echo "merge-pr: Stage C merge is founder-only; GitHub actor is $actor" >&2; exit 1; }
+  receipt=$(ssh "${COMPANY_SERVER:-company-os-host}" sudo companyctl stage-c merge-authorize "$pr" "$head") || {
+    echo "merge-pr: Stage C task $stage_c_task failed control-plane merge authorization" >&2; exit 1; }
+  authorization_id=$(printf '%s' "$receipt" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+identity = (value.get("pr_number"), value.get("head_sha"))
+authorization_id, pr_number = value.get("authorization_id"), value.get("pr_number")
+if type(authorization_id) is not int or authorization_id <= 0 or type(pr_number) is not int \
+        or pr_number != int(sys.argv[1]) or identity[1] != sys.argv[2]:
+    raise SystemExit("merge-pr: invalid Stage C authorization receipt")
+print(authorization_id)
+' "$pr" "$head")
+fi
+
+# A failed call is not proof of failure: a timeout or a racing merge can complete on the server.
+# The PR state decides, on success and on error alike.
+merge_rc=0
+# Secondary safeguard only: an interactive terminal and the exact head typed by a person. This is NOT proof of
+# founder authorization (an agent with a terminal can satisfy both); the real boundary is credential isolation.
+if [ ! -t 0 ]; then
+  echo "merge-pr: refusing: an interactive terminal is required to confirm the head SHA" >&2; exit 1
+fi
+printf 'merge-pr: type the exact head SHA %s to merge #%s: ' "$head" "$pr" >&2
+typed=""
+IFS= read -r typed || true
+if [ "$typed" != "$head" ]; then
+  echo "merge-pr: typed SHA does not match the checked head; refusing merge" >&2; exit 1
+fi
+merge_out=$(gh pr merge "$pr" --merge --match-head-commit "$head" 2>&1) || merge_rc=$?
+[ -n "$merge_out" ] && echo "$merge_out"
+
+state=$(gh pr view "$pr" --json state -q .state)
+if [ "$state" != "MERGED" ]; then
+  echo "merge-pr: #$pr is $state after the merge call (rc=$merge_rc); not merged" >&2; exit 1
+fi
+if [ -n "$stage_c_task" ]; then
+  receipt=$(ssh "${COMPANY_SERVER:-company-os-host}" sudo companyctl stage-c merge-complete \
+    "$pr" "$head" "$authorization_id") || {
+    echo "merge-pr: GitHub state alone is not Stage C merge evidence; audit verification failed" >&2; exit 1; }
+  merge_commit=$(printf '%s' "$receipt" | python3 -c '
+import json, re, sys
+value = json.load(sys.stdin)
+if value.get("completed") is not True or value.get("head_sha") != sys.argv[1] \
+        or value.get("authorization_id") != int(sys.argv[2]) \
+        or not re.fullmatch(r"[0-9a-f]{40}", value.get("merge_commit", "")) \
+        or value.get("merged_by") != "semihbugrasezer":
+    raise SystemExit("merge-pr: invalid Stage C merge receipt")
+print(value["merge_commit"])
+' "$head" "$authorization_id")
+  if [ "$merge_rc" -ne 0 ]; then
+    echo "merge-pr: GitHub confirmed authorized founder merge after command error at $merge_commit"
+  else
+    echo "merge-pr: #$pr merge verified by the control plane at $merge_commit"
+  fi
+  if [ "${MERGE_PR_DELETE_BRANCH:-1}" != "0" ]; then
+    cleanup_branch "$pr" "$head" || echo "merge-pr: WARNING branch cleanup failed; the merge is complete" >&2
+  fi
+  exit 0
+fi
+if [ "$merge_rc" -ne 0 ] || echo "$merge_out" | grep -q "already merged"; then
+  echo "merge-pr: #$pr was already merged outside this gate; checks were not re-verified here"
+else
+  echo "merge-pr: #$pr merged at $head"
+fi
+
+if [ "${MERGE_PR_DELETE_BRANCH:-1}" != "0" ]; then
+  cleanup_branch "$pr" "$head" || echo "merge-pr: WARNING branch cleanup failed; the merge is complete" >&2
+fi

@@ -1,0 +1,40 @@
+# Company cost policy (founder decision, 2026-10-01). Policy is
+# NO NEW UNAPPROVED SPEND: approved costs continue; no agent creates, raises or
+# repurposes a cost. Read by the Desk and checked by tests; agents never edit it.
+classes:
+  APPROVED_FIXED_COST: existing recurring cost the founder approved
+  PREPAID_CREDIT: credit already bought, usable only inside its scope
+  SUBSCRIPTION_INCLUDED: usage covered by a subscription; no metered billing
+  PREPAID_OR_SUNK_COST: paid for the current term; renewal is a new decision
+  NEW_SPEND_REQUIRES_APPROVAL: any new charge, through the approval queue
+  FORBIDDEN_AUTONOMOUS_SPEND: never done by an agent, approval or not
+
+items:
+  vps_host:
+    class: APPROVED_FIXED_COST
+    purpose: company infrastructure (production host)
+    note: no new server, plan upgrade, storage or IP without approval
+  seerxo_openai:
+    class: PREPAID_CREDIT
+    scope: seerxo_product_only
+    allow_agent_usage: false
+    allow_new_topup: false
+    note: lives in the Seerxo runtime only; never a Company OS agent budget or fallback
+  claude_code:
+    class: SUBSCRIPTION_INCLUDED
+    allow_metered_api: false
+    note: worker uses the subscription login only
+  codex:
+    class: SUBSCRIPTION_INCLUDED
+    allow_metered_api: false
+    note: worker uses the ChatGPT login only
+  domains:
+    class: PREPAID_OR_SUNK_COST
+    renewal_requires_founder_approval: true
+    note: renewal, new domain or premium DNS is a new charge
+  new_services:
+    class: NEW_SPEND_REQUIRES_APPROVAL
+    note: SaaS, API, server, plan upgrade
+  credit_purchase:
+    class: FORBIDDEN_AUTONOMOUS_SPEND
+    note: buying or topping up API credit, upgrading a subscription

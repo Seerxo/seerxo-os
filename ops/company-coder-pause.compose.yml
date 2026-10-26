@@ -1,0 +1,13 @@
+# Attended installation only: keep Stage C OFF and stop/drain the old launcher timer first.
+# Provision /etc/company-coder/pause.lock as a root-owned regular 0444 file; never replace its inode live.
+services:
+  company-api:
+    environment:
+      CODER_PAUSE_FENCE_ENABLED: "true"
+    volumes:
+      - type: bind
+        source: /etc/company-coder/pause.lock
+        target: /run/company-coder-pause.lock
+        read_only: true
+        bind:
+          create_host_path: false

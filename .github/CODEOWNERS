@@ -1,0 +1,18 @@
+# Changes to these paths need review from the maintainer, because they define what code can reach
+# credentials, merges or production. Enforced only when branch protection requires code owner review.
+/.github/                    @semihbugrasezer
+/agents/                     @semihbugrasezer
+/app/release_gateway.py      @semihbugrasezer
+/app/release_gateway_service.py @semihbugrasezer
+/app/release_host.py         @semihbugrasezer
+/app/review_signer.py        @semihbugrasezer
+/app/api_auth.py             @semihbugrasezer
+/app/approval_identity.py    @semihbugrasezer
+/app/stage_c_credential_boundary.py @semihbugrasezer
+/scripts/deploy-company-os.sh @semihbugrasezer
+/scripts/merge-pr            @semihbugrasezer
+/tests/test_trust_boundary.py @semihbugrasezer
+/Dockerfile                  @semihbugrasezer
+/docker-compose.yml          @semihbugrasezer
+/requirements.txt            @semihbugrasezer
+/desk/package-lock.json      @semihbugrasezer

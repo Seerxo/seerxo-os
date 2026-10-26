@@ -1,0 +1,91 @@
+# Python 3.12 + PostgreSQL 18 backend tests on a GitHub-hosted runner (ubuntu-24.04). This is the mandatory backend
+# validation on Seerxo/os: it reports the check run "python-tests" on the exact PR head and the exact main
+# commit. Secrets: none. Disposable PostgreSQL service only; tests refuse the production database name.
+name: python-tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new PR push supersedes the old run; each main commit keeps its own run (deploy evidence, never cancelled).
+  group: python-tests-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: company_external_release_test
+          POSTGRES_USER: release_test
+          POSTGRES_PASSWORD: disposable-ci-only
+        ports: ["127.0.0.1::5432"]
+        options: >-
+          --cpus=1 --memory=1g --pids-limit=128
+          --tmpfs /var/lib/postgresql
+          --health-cmd "pg_isready -U release_test -d company_external_release_test"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Install Python dependencies
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/venv/bin/pip" install -r requirements.txt
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Wait for test PostgreSQL
+        env:
+          EXTERNAL_RELEASE_TEST_DATABASE_URL: postgresql+psycopg://release_test:disposable-ci-only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/company_external_release_test
+        run: |
+          echo "EXTERNAL_RELEASE_TEST_DATABASE_URL=$EXTERNAL_RELEASE_TEST_DATABASE_URL" >> "$GITHUB_ENV"
+          for _attempt in $(seq 1 60); do
+            if python -c "import os, psycopg; psycopg.connect(os.environ['EXTERNAL_RELEASE_TEST_DATABASE_URL'].replace('postgresql+psycopg://', 'postgresql://', 1), connect_timeout=2).close()" 2>/dev/null; then
+              echo "Test PostgreSQL is ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "Test PostgreSQL did not become ready" >&2; exit 1
+      - name: Compile Python
+        run: python -m compileall -q app migrations scripts
+      - name: Verify single Alembic migration head
+        run: test "$(alembic heads | wc -l)" -eq 1
+      - name: Python tests and golden evaluations
+        run: |
+          umask 022
+          # Keep pytest temporary repos and archives in RAM (fast, removed after the step).
+          TMPDIR="$(mktemp -d /dev/shm/ci-XXXXXX)"; export TMPDIR; trap 'rm -rf "$TMPDIR"' EXIT
+          python -m pytest -q -n 4 --dist loadgroup --durations=15 \
+            --ignore=tests/test_external_release_postgres.py \
+            --ignore=tests/test_open_work_postgres.py \
+            --ignore=tests/test_deploy_interlock.py \
+            --ignore=tests/test_stage_c_merge_gate_postgres.py \
+            --ignore=tests/test_stage_c_crash_recovery_postgres.py \
+            --ignore=tests/test_worker_crash_recovery_postgres.py
+      - name: Required PostgreSQL, concurrency, Stage C and crash-recovery tests
+        run: |
+          umask 022
+          # Keep pytest temporary repos and archives in RAM (fast, removed after the step).
+          TMPDIR="$(mktemp -d /dev/shm/ci-XXXXXX)"; export TMPDIR; trap 'rm -rf "$TMPDIR"' EXIT
+          python -u -m pytest -vv -o faulthandler_timeout=60 --durations=20 \
+            tests/test_external_release_postgres.py \
+            tests/test_open_work_postgres.py \
+            tests/test_deploy_interlock.py \
+            tests/test_stage_c_merge_gate_postgres.py
+          # The crash-recovery suites give every test its own PostgreSQL schema, so they run in parallel.
+          python -u -m pytest -vv -n 4 -o faulthandler_timeout=60 --durations=20 \
+            tests/test_stage_c_crash_recovery_postgres.py \
+            tests/test_worker_crash_recovery_postgres.py

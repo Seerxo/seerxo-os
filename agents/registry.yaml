@@ -1,0 +1,169 @@
+# COMPANY AGENT REGISTRY
+#
+# Stable job descriptions live here; mutable runtime state lives in PostgreSQL.
+# Foundation deliberately contains four agents only (§105). The watchdog is a
+# deterministic service in app/watchdog.py, not a pretend agent.
+
+version: 3
+updated: 2026-09-30
+
+defaults:
+  enabled: true
+  autonomy_level: 2
+  model_class: STANDARD
+  prompt_version: v1
+  required_secrets: []
+  projects: []
+  schedule: null
+  # Unattended worker provider order (zero-cost access only; see app/providers.py).
+  providers: [codex, claude]
+  allowed_tools: [company_api]
+  forbidden_tools: [constitution_write, destructive_production, secret_readback]
+  budget:
+    daily_usd: 0.00
+    existing_access_only: true
+    max_concurrent_tasks: 1
+    max_runs_per_day: 10
+    max_turns_per_run: 6     # subscription quota, not dollars: bound each run
+  context_policy:
+    include: [task, project_state, related_decisions, related_learnings, agent_notes,
+              recent_runs_same_project, required_files, required_tool_state]
+    exclude: [whole_repository, unrelated_business_units, full_event_history]
+    max_files: 25
+  memory_policy:
+    writes: [agent_notes, agent_runs]
+    reads: [agent_notes_own, learnings, decisions, permanent_facts]
+    retention: {notes_days: 30, promote_after_references: 2}
+  approval_policy:
+    auto: [read_logs, read_metrics, run_tests, create_internal_task, write_note]
+    require_approval: [production_deploy, schema_migration, dns_change, secret_change,
+                       spend_money, publish_externally, bulk_email]
+    forbidden: [delete_repository, drop_database, docker_system_prune, send_money,
+                disable_backups, rewrite_constitution]
+  success_policy:
+    verifier: supervisor
+    evidence_required: [command_output, verification_result]
+
+agents:
+  ceo:
+    name: CEO / Chief of Staff Agent
+    role: Coordination and prioritisation
+    team: leadership
+    reports_to: founder
+    description: >
+      Reads actual company state, identifies the highest-value work, assigns tasks and
+      prepares the founder brief. It coordinates; it does not execute worker tasks.
+    model_class: REASONING
+    autonomy_level: 1
+    capabilities: [prioritise, assign_tasks, prepare_founder_brief, request_approval]
+    owns: [priority, task_assignment, founder_brief]
+    allowed_tools: [company_api, companyctl]
+    forbidden_tools: [production_shell, repository_write, external_publish]
+    required_secrets: []
+    business_units: [seerxo, youtube, cryonel, labubu]
+    projects: []
+    skills: [company-state]
+    triggers:
+      - {type: manual}
+      - {type: event, event_type: COMPANY_BRIEF_REQUESTED}
+    schedule: null
+    work_check: assigned_ready_tasks_or_brief_request
+    execution: company_os
+    budget: {daily_usd: 0.00, existing_access_only: true, max_concurrent_tasks: 1,
+             max_runs_per_day: 4}
+    notes: >
+      Not on a timer. The Seerxo revenue baseline (TASK-0005) now arrives from Polar; the
+      CEO runs unattended only on goal planning tasks the business reconciler opens, and only
+      while the founder sets RECONCILER_AUTONOMOUS_PLANNING=true. Manual requests still work.
+
+  developer:
+    name: Developer Agent
+    role: Software and infrastructure
+    team: development
+    reports_to: ceo
+    description: >
+      Reproduces defects, implements the smallest correct fix, tests it and prepares
+      deployments. It consumes assigned tasks; it does not set company priority.
+    model_class: REASONING
+    capabilities: [read_code, reproduce, implement, run_tests, inspect_infrastructure]
+    owns: [repositories, deployments, technical_incidents, dependencies]
+    allowed_tools: [company_api, companyctl, bash_local, git, hctl, docker_readonly,
+                    postgres_readonly, ssh_host_readonly]
+    forbidden_tools: [production_write_without_approval, dns_write, billing_write]
+    required_secrets: []
+    business_units: [seerxo, youtube, cryonel, labubu]
+    projects: []
+    skills: [company-state, git, server-health, postgres-backup]
+    triggers:
+      - {type: event, event_type: DEPLOYMENT_FAILED}
+      - {type: event, event_type: YOUTUBE_PIPELINE_STOPPED}
+      - {type: dependency, on: task_ready, filter: "assigned_agent = developer"}
+      - {type: manual}
+    schedule: null
+    work_check: assigned_ready_tasks
+    execution: herdr
+    providers: [codex, claude]
+    herdr:
+      workflow_by_risk: {LOW: quick, MEDIUM: standard, HIGH: high-risk, CRITICAL: high-risk}
+    budget: {daily_usd: 0.00, existing_access_only: true, max_concurrent_tasks: 1,
+             max_runs_per_day: 20}
+
+  supervisor:
+    name: Supervisor Agent
+    role: Quality control and completion gate
+    team: leadership
+    reports_to: ceo
+    description: >
+      Checks success criteria, evidence, tests, expected state, side effects, risk and
+      policy. Only an approved verdict may advance work toward DONE.
+    model_class: REASONING
+    autonomy_level: 1
+    capabilities: [verify_evidence, inspect_diff, inspect_test_results, issue_verdict]
+    owns: [verification, task_completion_gate]
+    allowed_tools: [company_api, companyctl, artifact_read, git_readonly, test_readonly]
+    forbidden_tools: [modify_worker_output, approve_own_work, production_write]
+    required_secrets: []
+    business_units: [seerxo, youtube, cryonel, labubu]
+    projects: []
+    skills: [company-state, git, server-health, postgres-backup]
+    triggers:
+      - {type: event, event_type: TASK_COMPLETED}
+      - {type: event, event_type: BACKUP_FAILED}
+      - {type: event, event_type: RESTORE_VERIFICATION_FAILED}
+      - {type: manual}
+    schedule: null
+    work_check: pending_reviews_or_alerts
+    execution: herdr
+    approval_policy:
+      forbidden: [modify_own_verdict, approve_own_work]
+    budget: {daily_usd: 0.00, existing_access_only: true, max_concurrent_tasks: 2,
+             max_runs_per_day: 30}
+
+  research:
+    name: Research Agent
+    role: Market, competitor and platform research
+    team: growth
+    reports_to: ceo
+    description: >
+      Produces sourced research with question, method, evidence, findings, uncertainty
+      and recommendation. It has no production shell or repository write access.
+    model_class: STANDARD
+    autonomy_level: 1
+    capabilities: [market_research, competitor_research, platform_research, source_review]
+    owns: [market_research, competitor_research, platform_research]
+    allowed_tools: [company_api, companyctl, browser, web_search]
+    forbidden_tools: [production_shell, repository_write, external_publish]
+    required_secrets: []
+    business_units: [seerxo, youtube, product-factory, pinterest]
+    projects: []
+    skills: [company-state, market-research]
+    triggers:
+      - {type: dependency, on: task_ready, filter: "assigned_agent = research"}
+      - {type: manual}
+    schedule: null
+    work_check: assigned_ready_tasks
+    execution: herdr
+    herdr:
+      workflow: research
+    budget: {daily_usd: 0.00, existing_access_only: true, max_concurrent_tasks: 1,
+             max_runs_per_day: 10}

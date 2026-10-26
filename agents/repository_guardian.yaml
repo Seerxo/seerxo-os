@@ -1,0 +1,29 @@
+# C1 control-plane observer only. Activation requires founder approval.
+enabled: false
+repositories:
+  - seerxo/os
+# The branch each repository's business actually runs on: Guardian observes it and Stage C opens
+# PRs against it. Required per repository; GitHub's default branch is never assumed
+# (youtube-auto's server builds from server-master, not main).
+branches:
+  seerxo/os: main
+# Actions workflows that must succeed on a PR head (latest pull_request run) or main commit (latest push
+# run on main): Stage C, merge-pr, post-merge verification, Guardian and the deploy ci-gate. Founder Desk
+# frontend tests and the Python/PostgreSQL suites (python-tests, Blacksmith) are both required here; a
+# missing, pending, failed, cancelled, skipped or other-commit run refuses (fail closed).
+workflows:
+  - ".github/workflows/frontend.yml"
+  - ".github/workflows/python-tests.yml"
+# Commit statuses from a trusted publisher, required in addition to the workflows above. None since the
+# transfer to Seerxo/os: CircleCI does not report on this repository. An empty list is accepted only while
+# the workflow list above is non-empty; with neither, every merge and deploy is refused.
+status_publisher:
+  login: "circleci-app[bot]"
+  id: 127350680
+required_statuses: []
+# B5: Stage C pushes task branches to this fork and opens PRs from it, so the agent account needs only Read on
+# the repository. PR heads from any other repository are refused by Stage C, the merge gate and merge-pr.
+# Absent: task branches are pushed to the repository itself (agent needs Write). Enabled by a founder-merged
+# change to this file once the fork existed and the agent token could push to it (B5 option A, 2026-10-20).
+publish_forks:
+  seerxo/os: seerxo-agent/os

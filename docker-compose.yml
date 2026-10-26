@@ -1,0 +1,337 @@
+# Company OS runs BESIDE Coolify, not inside it (docs/ARCHITECTURE_PROPOSAL.md §1).
+# Coolify deploys the revenue apps; the system that watches them must not share that
+# lifecycle, or a Coolify failure blinds the monitor.
+name: company-os
+
+services:
+  company-postgres:
+    image: postgres:18-alpine
+    container_name: company-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-company}
+      POSTGRES_USER: ${POSTGRES_USER:-company}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      TZ: UTC
+    volumes:
+      # Postgres 18+ expects a single mount at /var/lib/postgresql and stores data in a
+      # major-version subdirectory, so pg_upgrade --link works without crossing a mount
+      # boundary. Mounting /var/lib/postgresql/data as in <=17 makes the image refuse to start.
+      - company-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-company} -d ${POSTGRES_DB:-company}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    # No ports: the database is reachable only from this compose network.
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  company-api:
+    build:
+      context: .
+      target: api
+    # Deploy sets COMPANY_OS_IMAGE_TAG to the release SHA: the container names the exact build.
+    image: company-os-api:${COMPANY_OS_IMAGE_TAG:-latest}
+    container_name: company-api
+    restart: unless-stopped
+    depends_on:
+      company-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-company}:${POSTGRES_PASSWORD}@company-postgres:5432/${POSTGRES_DB:-company}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_CHAT_IDS: ${TELEGRAM_ADMIN_CHAT_IDS:-}
+      ALERT_DEDUPE_HOURS: ${ALERT_DEDUPE_HOURS:-6}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      # Run provenance (§9), shown on the Desk next to the worker's. Set by the deploy.
+      COMPANY_OS_GIT_SHA: ${COMPANY_OS_GIT_SHA:-}
+      # Caller scopes (app/api_auth.py). Unset = enforce. log (set explicitly, during a
+      # rollout) records what enforce would refuse and lets it through.
+      API_AUTH_MODE: ${API_AUTH_MODE:-enforce}
+      # The Docker network gateway address the API sees for requests to the published port (host specific).
+      API_HOST_IPS: ${API_HOST_IPS:-}
+      COMPANY_API_TOKEN_ADMIN: ${COMPANY_API_TOKEN_ADMIN:-}
+      COMPANY_API_TOKEN_DESK: ${COMPANY_API_TOKEN_DESK:-}
+      COMPANY_API_TOKEN_YOUTUBE: ${COMPANY_API_TOKEN_YOUTUBE:-}
+      # Optional direct Founder Desk Access identity; API only, no worker credentials.
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_DESK_AUD: ${CF_ACCESS_DESK_AUD:-}
+      CF_ACCESS_DESK_EMAILS: ${CF_ACCESS_DESK_EMAILS:-}
+      CF_ACCESS_DESK_HOST: ${CF_ACCESS_DESK_HOST:-}
+      # Founder switch, turned ON by the founder 2026-10-06: goal planning tasks
+      # (GOAL_NO_WORK/GOAL_BEHIND) are opted in to the unattended worker; proposals land as
+      # BACKLOG. Set false in the host .env to pause it. app/business_reconciler.py.
+      RECONCILER_AUTONOMOUS_PLANNING: ${RECONCILER_AUTONOMOUS_PLANNING:-true}
+      # Polar organization token, scope metrics:read only (app/polar_metrics.py). Empty = no sync.
+      POLAR_METRICS_TOKEN: ${POLAR_METRICS_TOKEN:-}
+      # Seerxo funnel pull (app/seerxo_funnel.py); same value as Seerxo's COMPANY_OS_FUNNEL_TOKEN.
+      SEERXO_FUNNEL_TOKEN: ${SEERXO_FUNNEL_TOKEN:-}
+      SEERXO_FUNNEL_URL: ${SEERXO_FUNNEL_URL:-}
+      # CI usage monitor (app/ci_usage.py): fine-grained GitHub token, Actions: read on Seerxo/os only. Empty = no data.
+      CI_USAGE_GITHUB_TOKEN: ${CI_USAGE_GITHUB_TOKEN:-}
+      # Experiment scheduler (app/experiment_scheduler.py), run by the watchdog tick. OFF unless the founder
+      # sets BOTH in the host .env: EXPERIMENT_SCHEDULER_ENABLED=true and EXPERIMENT_SCHEDULER_APPLY=yes.
+      EXPERIMENT_SCHEDULER_ENABLED: ${EXPERIMENT_SCHEDULER_ENABLED:-false}
+      EXPERIMENT_SCHEDULER_APPLY: ${EXPERIMENT_SCHEDULER_APPLY:-}
+      TZ: UTC
+    ports:
+      # Loopback ONLY. This is not public exposure: nothing outside the host can reach
+      # 127.0.0.1, ufw is untouched, and §110's question ("does this need to be public?")
+      # is still answered no. The founder reaches the desk with an SSH tunnel:
+      #   ssh -N -L 8099:127.0.0.1:8099 <production-host>   then open http://localhost:8099
+      - "127.0.0.1:8099:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    volumes:
+      # Host-side backup.sh writes dumps here; the API uploads them to R2 with boto3,
+      # so the host needs no AWS tooling of its own.
+      - ${BACKUP_LOCAL_DIR:-/opt/company-os/backups}:/backups
+    networks:
+      - default
+      # Joined so youtube-auto can POST to http://company-api:8000/webhooks/youtube-auto
+      # without any port being exposed to the host or the internet.
+      - youtube-auto
+    logging: *logging
+
+  # Unattended worker (docs/AUTONOMOUS_AGENT_ARCHITECTURE.md). Polls PostgreSQL every
+  # 60 s; a model runs only for opted-in READY work. No ports, not on the youtube-auto
+  # network, non-root. Pausing agents (companyctl / Desk) stops it without stopping it.
+  company-worker:
+    build:
+      context: .
+      target: worker
+    image: company-os-worker:${COMPANY_OS_IMAGE_TAG:-latest}
+    container_name: company-worker
+    restart: unless-stopped
+    depends_on:
+      company-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-company}:${POSTGRES_PASSWORD}@company-postgres:5432/${POSTGRES_DB:-company}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_CHAT_IDS: ${TELEGRAM_ADMIN_CHAT_IDS:-}
+      ALERT_DEDUPE_HOURS: ${ALERT_DEDUPE_HOURS:-6}
+      # Stage B model CLIs run in company-reasoner; this container holds no provider login.
+      REASONER_URL: http://company-reasoner:8100
+      # Run provenance (§9). Set at deploy: COMPANY_OS_GIT_SHA=$(git rev-parse --short HEAD)
+      COMPANY_OS_GIT_SHA: ${COMPANY_OS_GIT_SHA:-}
+      WORKER_IMAGE: company-os-worker:${COMPANY_OS_IMAGE_TAG:-latest}
+      # Stage C stays off until the sandbox exists and the founder enables it.
+      ENABLE_AUTONOMOUS_CODE_WRITE: "false"
+      # Control-plane only: one-repository fine-grained GitHub credential. Never passed
+      # to either provider CLI or the host coder/checks launcher. Absent = no Stage C writes.
+      GH_TOKEN: ${COMPANY_STAGE_C_GITHUB_TOKEN:-}
+      # Only explicitly configured, low-risk external waits may be released.
+      ENABLE_AUTOMATIC_EXTERNAL_RELEASE: ${ENABLE_AUTOMATIC_EXTERNAL_RELEASE:-false}
+      # Founder decision 2026-10-06: read-only research/analysis proposals start on their own
+      # (app/task_policy.py). false in the host .env parks them in BACKLOG instead.
+      PROPOSAL_AUTO_READY: ${PROPOSAL_AUTO_READY:-true}
+      # Close only a supervised GOAL_NO_WORK plan that created an owned, read-only next task.
+      AUTO_CLOSE_GOAL_NO_WORK: ${AUTO_CLOSE_GOAL_NO_WORK:-false}
+      TZ: UTC
+    volumes:
+      # Stage C (docs/CODER_RUNTIME.md D1): the only path shared with the host coder launcher.
+      # Short syntax on purpose: Docker creates it (root-owned, so unwritable for uid 10001)
+      # if step 3 has not run yet, and the worker still starts. Step 3 chowns it to 10001.
+      # Unused until Stage C is wired; ENABLE_AUTONOMOUS_CODE_WRITE stays false.
+      - /srv/company-coder/jobs:/srv/company-coder/jobs
+    # Blast radius (§5): no capabilities, immutable image filesystem, writes only to
+    # tmpfs, the two login volumes and the coder jobs directory. Verified on
+    # production host, 2026-10-01 (before the jobs directory was added).
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /home/worker:size=64m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: 1.0
+    mem_limit: 2g
+    networks: [default, reasoner-net]
+    logging: *logging
+
+  # Stage B model runtime (app/reasoner.py). The provider CLIs and their logins live here,
+  # away from the worker's DATABASE_URL, Telegram and GitHub tokens: not on the database
+  # network, no control-plane secret, no Docker socket, no published port. The worker is
+  # its only caller (reasoner-net). Own minimal image (Dockerfile `reasoner`), worker hardening.
+  company-reasoner:
+    build:
+      context: .
+      target: reasoner
+    image: company-os-reasoner:${COMPANY_OS_IMAGE_TAG:-latest}
+    container_name: company-reasoner
+    restart: unless-stopped
+    environment:
+      # Subscription token from `claude setup-token` (existing access, not an API key).
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Second subscription account, used only when the first cannot answer (login, quota, rate limit).
+      CLAUDE_CODE_OAUTH_TOKEN_2: ${CLAUDE_CODE_OAUTH_TOKEN_2:-}
+      WORKER_CLAUDE_MODEL: ${WORKER_CLAUDE_MODEL:-sonnet}
+      COMPANY_OS_GIT_SHA: ${COMPANY_OS_GIT_SHA:-}
+      # The only way out (reasoner-net is internal): the allowlist proxy, provider hosts only.
+      HTTPS_PROXY: http://company-reasoner-egress:8888
+      HTTP_PROXY: http://company-reasoner-egress:8888
+      NO_PROXY: ""
+      TZ: UTC
+    depends_on: [company-reasoner-egress]
+    volumes:
+      # Codex ChatGPT login (`codex login --device-auth`) and Claude state survive rebuilds.
+      # Volume names kept from when the CLIs ran in company-worker: the logins carry over.
+      - company-worker-codex:/home/worker/.codex
+      - company-worker-claude:/home/worker/.claude
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /home/worker:size=64m,uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: 1.0
+    mem_limit: 2g
+    networks: [reasoner-net, review-net]
+    logging: *logging
+
+  # Release review signer (docs/security/RELEASE_GATEWAY.md, F1). The only holder of the reviewer key: no model CLI,
+  # no Docker socket, no control-plane secret, no route out. It reaches company-reasoner on review-net (the worker is
+  # not on it); the host gateway reaches it through a Unix socket in /run/review-signer-socket, which no agent
+  # container mounts. Inert until the founder installs the key and the gateway public key and starts the profile.
+  company-review-signer:
+    profiles: [release]
+    build:
+      context: .
+      target: review-signer
+    image: company-os-review-signer:${COMPANY_OS_IMAGE_TAG:-latest}
+    container_name: company-review-signer
+    restart: unless-stopped
+    user: "10002:10002"
+    environment:
+      REASONER_URL: http://company-reasoner:8100
+      REVIEW_SIGNING_KEY: /run/review-signer/key
+      REVIEW_REQUESTER_KEY: /run/review-signer/gateway.pub
+      REVIEW_SIGNER_SOCKET: /run/review-signer-socket/signer.sock
+      TZ: UTC
+    volumes:
+      - /etc/review-signer:/run/review-signer:ro
+      - /run/review-signer-socket:/run/review-signer-socket
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    cpus: 0.5
+    mem_limit: 256m
+    networks: [review-net]
+    logging: *logging
+
+  # The reasoner's egress (same image and allowlist as the Stage C coder's company-egress,
+  # scripts/coder/allowlist): CONNECT to 443 on the provider hosts, nothing else. A separate
+  # instance, so the coder and reasoner networks never share a container.
+  company-reasoner-egress:
+    build:
+      context: .
+      target: egress
+    image: company-os-egress:${COMPANY_OS_IMAGE_TAG:-latest}
+    container_name: company-reasoner-egress
+    restart: unless-stopped
+    networks: [reasoner-net, reasoner-egress]
+    read_only: true
+    tmpfs:
+      - /run:size=1m,uid=65534,gid=65534
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    logging: *logging
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: company-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN is required}
+    # TASK-0017: lets the tunnel reach Coolify's webhook listener on the host
+    # (http://host.docker.internal:8000) without port 8000 being public. Traffic enters
+    # through the docker bridge, not eth0, so the COOLIFY-EDGE firewall does not see it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      company-api:
+        condition: service_healthy
+    logging: *logging
+
+  # Stage C coder egress (docs/CODER_RUNTIME.md D3). Profile-gated: a normal `up` never
+  # starts it; the founder runs `docker compose --profile stage-c up -d company-egress`.
+  company-egress:
+    build:
+      context: .
+      target: egress
+    image: company-os-egress:${COMPANY_OS_IMAGE_TAG:-latest}
+    container_name: company-egress
+    profiles: ["stage-c"]
+    restart: unless-stopped
+    networks: [coder-net, coder-egress]
+    read_only: true
+    tmpfs:
+      - /run:size=1m,uid=65534,gid=65534
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    logging: *logging
+
+volumes:
+  company-postgres-data:
+    name: company-postgres-data
+  company-worker-codex:
+    name: company-worker-codex
+  company-worker-claude:
+    name: company-worker-claude
+  # Legacy, unattached volume. Stage C coding is Claude-only; the Codex reviewer uses
+  # company-worker-codex in company-reasoner and must never be logged in here.
+  company-coder-codex:
+    name: company-coder-codex
+
+networks:
+  default:
+    name: company-os
+  youtube-auto:
+    external: true
+    name: youtube-auto_default
+  # company-worker <-> company-reasoner (+ its egress proxy). No route out: the CLIs reach
+  # their providers only through company-reasoner-egress.
+  reasoner-net:
+    name: company-reasoner-net
+    internal: true
+  reasoner-egress:
+    name: company-reasoner-egress
+  # No route out: a coder on this network reaches only company-egress.
+  coder-net:
+    name: company-coder-net
+    internal: true
+  coder-egress:
+    name: company-coder-egress
+  # company-review-signer <-> company-reasoner only. No route out, no worker.
+  review-net:
+    name: company-review-net
+    internal: true

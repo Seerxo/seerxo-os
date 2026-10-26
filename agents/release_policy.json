@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "repository": "seerxo/os",
+  "branch": "main",
+  "gateway_key": "REPLACE-AT-ENROLMENT ssh-ed25519 public key of the gateway service",
+  "low_risk_paths": [
+    "docs/*"
+  ],
+  "high_risk_paths": [
+    ".github/*",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "Dockerfile",
+    "agents/*",
+    "alembic.ini",
+    "app/api_auth.py",
+    "app/approval_identity.py",
+    "app/cloudflare_access.py",
+    "app/merge_authorization.py",
+    "app/providers.py",
+    "app/reasoner.py",
+    "app/review_signer.py",
+    "app/release_gateway.py",
+    "app/repo_guardian*.py",
+    "app/stage_c*.py",
+    "docker-compose.yml",
+    "docs/CONSTITUTION_REFERENCE.md",
+    "docs/PERMANENT_FACTS.md",
+    "docs/security/*",
+    "migrations/*",
+    "requirements.txt",
+    "scripts/*"
+  ],
+  "max_changed_paths": 40,
+  "coders": [
+    "claude"
+  ],
+  "reviewer_keys": {
+    "codex": "REPLACE-AT-ENROLMENT ssh-ed25519 public key held by company-review-signer"
+  },
+  "require_trusted_checks": true,
+  "require_independent_review": true,
+  "auto_release": true
+}

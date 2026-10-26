@@ -1,0 +1,40 @@
+# Prowler IaC scan of this repository (Dockerfile, docker-compose.yml, workflows) on a GitHub-hosted runner (ubuntu-24.04).
+# No cloud provider is scanned. No secrets,
+# read-only token. Advisory: findings never fail the job and it is not a required gate in
+# agents/repository_guardian.yaml. Results are a workflow artifact (SARIF upload needs Code Scanning,
+# unavailable on this plan). Weekly and on demand only.
+name: prowler
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"  # Sundays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prowler
+  cancel-in-progress: false
+
+jobs:
+  iac:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Let the Prowler container user read the checkout
+        # The image uses a different UID. Read-only for others; the checkout holds no credentials.
+        run: chmod -R a+rX "$GITHUB_WORKSPACE"
+      - name: Prowler Security Scan
+        uses: prowler-cloud/prowler@bffc8844c1c9a3666e37a2ada4ee05f62e1446b0 # 5.45.0
+        with:
+          provider: iac
+          image-tag: 5.45.0  # the action defaults to the moving `stable` tag; its input rejects digests
+          output-formats: json-ocsf html
+          push-to-cloud: "false"
+          upload-sarif: "false"
+          fail-on-findings: "false"
+          flags: --log-level INFO  # Prowler logs Trivy FATAL lines at info; the default level hides them

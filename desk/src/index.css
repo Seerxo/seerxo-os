@@ -1,0 +1,234 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --color-success: var(--success);
+    --color-warning: var(--warning);
+    --color-info: var(--info);
+    --color-brand: var(--brand);
+    --color-brand-foreground: var(--brand-foreground);
+    --color-surface: var(--surface);
+    --color-subtle: var(--subtle);
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+    --shadow-float: var(--float);
+    --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* SEZ Command.
+   Neutral ink and graphite surfaces create a calm operational canvas. One restrained blue accent marks
+   identity, active navigation, focus, and the CEO command
+   surface. Brand is iris (hue ~275), deliberately apart from the info blue (250) so identity never reads as status. It never carries status: success / warning / info / destructive stay semantic and are always
+   paired with a label. Surfaces step by lightness only: background < surface (inline panels) < card/popover. */
+:root {
+    --background: oklch(0.985 0.0021 272);
+    --foreground: oklch(0.205 0.0084 272);
+    --surface: oklch(0.963 0.0035 272);
+    --subtle: oklch(0.94 0.0049 272);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.205 0.0084 272);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.205 0.0084 272);
+    --primary: oklch(0.225 0.0084 272);
+    --primary-foreground: oklch(0.985 0.0014 272);
+    --secondary: oklch(0.958 0.0042 272);
+    --secondary-foreground: oklch(0.225 0.0084 272);
+    --muted: oklch(0.954 0.0042 272);
+    --muted-foreground: oklch(0.45 0.0098 272);
+    --accent: oklch(0.95 0.0056 272);
+    --accent-foreground: oklch(0.225 0.0084 272);
+    --destructive: oklch(0.53 0.21 27);
+    --border: oklch(0.905 0.0056 272);
+    --input: oklch(0.875 0.0070 272);
+    --ring: oklch(0.5 0.22 277 / 50%);
+    --brand: oklch(0.5 0.22 277);
+    --brand-foreground: oklch(0.985 0.005 275);
+    --chart-1: oklch(0.62 0.14 155);
+    --chart-2: oklch(0.74 0.14 75);
+    --chart-3: oklch(0.6 0.19 27);
+    --chart-4: oklch(0.58 0.15 250);
+    --chart-5: oklch(0.6 0.14 300);
+    --success: oklch(0.54 0.13 155);
+    --warning: oklch(0.52 0.12 60);
+    --info: oklch(0.54 0.15 250);
+    --radius: 0.5rem;
+    --float: 0 1px 2px oklch(0.2 0.0070 272 / 5%), 0 12px 28px -8px oklch(0.2 0.0070 272 / 12%);
+    --panel-shadow: 0 1px 2px oklch(0.2 0.0070 272 / 4%);
+    --sidebar: oklch(0.973 0.0028 272);
+    --sidebar-foreground: oklch(0.205 0.0084 272);
+    --sidebar-primary: oklch(0.225 0.0084 272);
+    --sidebar-primary-foreground: oklch(0.985 0.0014 272);
+    --sidebar-accent: oklch(0.94 0.0056 272);
+    --sidebar-accent-foreground: oklch(0.205 0.0084 272);
+    --sidebar-border: oklch(0.91 0.0056 272);
+    --sidebar-ring: oklch(0.55 0.16 275 / 55%);
+}
+
+.dark {
+    --background: oklch(0.145 0.0084 272);
+    --foreground: oklch(0.948 0.0042 272);
+    --surface: oklch(0.195 0.0091 272);
+    --subtle: oklch(0.225 0.0098 272);
+    --card: oklch(0.205 0.0091 272);
+    --card-foreground: oklch(0.955 0.0042 272);
+    --popover: oklch(0.2 0.0098 272);
+    --popover-foreground: oklch(0.955 0.0042 272);
+    --primary: oklch(0.94 0.0042 272);
+    --primary-foreground: oklch(0.18 0.0098 272);
+    --secondary: oklch(0.225 0.0098 272);
+    --secondary-foreground: oklch(0.955 0.0042 272);
+    --muted: oklch(0.222 0.0098 272);
+    --muted-foreground: oklch(0.69 0.0084 272);
+    --accent: oklch(0.232 0.0098 272);
+    --accent-foreground: oklch(0.955 0.0042 272);
+    --destructive: oklch(0.69 0.18 24);
+    --border: oklch(1 0 0 / 7.5%);
+    --input: oklch(1 0 0 / 12%);
+    --ring: oklch(0.72 0.13 278 / 60%);
+    --brand: oklch(0.74 0.13 278);
+    --brand-foreground: oklch(0.17 0.03 278);
+    --chart-1: oklch(0.7 0.14 155);
+    --chart-2: oklch(0.79 0.13 75);
+    --chart-3: oklch(0.68 0.18 25);
+    --chart-4: oklch(0.69 0.14 250);
+    --chart-5: oklch(0.7 0.13 300);
+    --success: oklch(0.74 0.14 155);
+    --warning: oklch(0.8 0.13 75);
+    --info: oklch(0.73 0.13 250);
+    --float: 0 1px 2px oklch(0 0 0 / 32%), 0 16px 36px -10px oklch(0 0 0 / 48%);
+    --panel-shadow: 0 0 0 0 transparent;
+    --sidebar: oklch(0.147 0.0084 272);
+    --sidebar-foreground: oklch(0.948 0.0042 272);
+    --sidebar-primary: oklch(0.94 0.0042 272);
+    --sidebar-primary-foreground: oklch(0.18 0.0098 272);
+    --sidebar-accent: oklch(0.2 0.0098 272);
+    --sidebar-accent-foreground: oklch(0.955 0.0042 272);
+    --sidebar-border: oklch(1 0 0 / 6%);
+    --sidebar-ring: oklch(0.72 0.13 278 / 60%);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-size: 14px;
+    line-height: 1.5;
+    font-feature-settings: "cv11", "ss03";
+  }
+  button:not(:disabled), [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  /* Operational numbers line up; identifiers stay mono, prose never is. */
+  .num { font-variant-numeric: tabular-nums; }
+  ::selection { background: color-mix(in oklch, var(--brand) 28%, transparent); }
+  :focus-visible { outline-color: var(--ring); }
+  h1, h2, h3 { text-wrap: balance; letter-spacing: -0.025em; }
+  p { text-wrap: pretty; }
+  /* Quiet scrollbars: present when needed, never a grey slab. */
+  * { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--foreground) 16%, transparent) transparent; }
+}
+
+@layer components {
+  /* Small caps-style label above a group: the only uppercase text in the Desk. */
+  .eyebrow { font-size: 11px; line-height: 16px; font-weight: 550; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-foreground); }
+  .desk-main { max-width: 1480px; }
+  /* The one bordered surface for lists and acted-on objects (Panel, approval, incident); nested surfaces are never boxed again. */
+  .panel { border: 1px solid var(--border); border-radius: 12px; background: var(--card); box-shadow: var(--panel-shadow); }
+  .surface-panel { border: 1px solid var(--border); border-radius: 12px; background: var(--card); box-shadow: var(--panel-shadow); }
+  .page-heading h1 { font-size: clamp(1.75rem, 2.4vw, 2rem); line-height: 1.1; font-weight: 650; letter-spacing: -.045em; }
+  /* Headline figures: large, tabular, never decorative. */
+  .metric { font-size: 1.75rem; line-height: 2rem; font-weight: 600; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+  .page-heading p { max-width: 46rem; font-size: .875rem; line-height: 1.55; }
+  [data-slot="table-head"] { height: 40px; font-size: 11px; font-weight: 600; letter-spacing: 0.035em; text-transform: uppercase; }
+  [data-slot="table-cell"] { padding-block: 13px; }
+  [data-slot="table-row"]:last-child { border-bottom: 0; }
+}
+
+/* Pages settle in on navigation; nothing else moves on its own. */
+@keyframes desk-enter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.desk-enter { animation: desk-enter 160ms var(--ease-out-quint) both; }
+
+/* A live step (an agent executing) breathes slowly; the only repeating motion, and it stops for reduced motion. */
+@keyframes desk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.desk-pulse { animation: desk-pulse 1.8s ease-in-out infinite; }
+/* A row whose status just changed (lib/changes.ts): a tint that fades out. Reduced motion keeps the text mark only. */
+@keyframes desk-flash { from { background-color: color-mix(in oklab, var(--info) 14%, transparent); } to { background-color: transparent; } }
+.desk-flash { animation: desk-flash 3s ease-out; }
+
+@media (min-width: 640px) { .metric { font-size: 2rem; line-height: 2.25rem; } }
+
+/* Filter chips scroll sideways at every width; only the fade hint is phone-specific. */
+.task-filters-scroll { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+.task-filters-scroll::-webkit-scrollbar { display: none; }
+
+@media (max-width: 639px) {
+  .desk-main { gap: 1.25rem; }
+  input, textarea, select { scroll-margin-block: 1rem; }
+  .task-filters-scroll[data-more="true"] { mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent); }
+}
+
+/* Recharts 3 makes a chart keyboard-focusable; give it the same visible focus as any control. */
+.recharts-surface:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
+
+/* Touch screens get 44px targets (WCAG 2.5.5, Apple HIG). Unlayered on purpose: the h-* and min-h-* utilities that
+   size each control live in a layer, and a layered rule would lose to them. Desktop keeps its dense sizes. */
+@media (pointer: coarse) {
+  button, [role="tab"], [data-slot="tabs-trigger"], [data-slot="select-trigger"], [data-slot="input"], [data-sidebar="menu-sub-button"], [data-sidebar="menu-button"],
+  input:not([type="checkbox"]):not([type="radio"]), select, textarea { min-height: 2.75rem; }
+  button[data-size^="icon"] { min-width: 2.75rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
