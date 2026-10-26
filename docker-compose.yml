@@ -72,7 +72,7 @@ services:
       # Seerxo funnel pull (app/seerxo_funnel.py); same value as Seerxo's COMPANY_OS_FUNNEL_TOKEN.
       SEERXO_FUNNEL_TOKEN: ${SEERXO_FUNNEL_TOKEN:-}
       SEERXO_FUNNEL_URL: ${SEERXO_FUNNEL_URL:-}
-      # CI usage monitor (app/ci_usage.py): fine-grained GitHub token, Actions: read on Seerxo/os only. Empty = no data.
+      # CI usage monitor (app/ci_usage.py): fine-grained GitHub token, Actions: read on Seerxo/seerxo-os only. Empty = no data.
       CI_USAGE_GITHUB_TOKEN: ${CI_USAGE_GITHUB_TOKEN:-}
       # Experiment scheduler (app/experiment_scheduler.py), run by the watchdog tick. OFF unless the founder
       # sets BOTH in the host .env: EXPERIMENT_SCHEDULER_ENABLED=true and EXPERIMENT_SCHEDULER_APPLY=yes.

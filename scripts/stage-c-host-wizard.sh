@@ -325,7 +325,7 @@ step "NO Workflows, NO Administration, nothing else. Generate and copy the token
 ask_secret COMPANY_STAGE_C_GITHUB_TOKEN "Paste the token (hidden):"
 if [[ -n "$COMPANY_STAGE_C_GITHUB_TOKEN" ]]; then
   code=$(printf 'header = "Authorization: Bearer %s"\n' "$COMPANY_STAGE_C_GITHUB_TOKEN" \
-         | curl -sS -K - -o /tmp/.repo.json -w '%{http_code}' https://api.github.com/repos/seerxo/os || true)
+         | curl -sS -K - -o /tmp/.repo.json -w '%{http_code}' https://api.github.com/repos/seerxo/seerxo-os || true)
   say "GitHub answered $code for the repository; permissions: $(python3 -c 'import json;print(json.load(open("/tmp/.repo.json")).get("permissions"))' 2>/dev/null || echo unknown)"
   rm -f /tmp/.repo.json
   if [[ "$code" == 200 ]] && confirm "Write COMPANY_STAGE_C_GITHUB_TOKEN to $ENV_FILE? (picked up when the worker is next recreated, i.e. by the #127 deploy)"; then

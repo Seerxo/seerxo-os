@@ -14,7 +14,7 @@ from tests.test_worker import _db, _task, _good, SPECS
 
 @pytest.fixture(autouse=True)
 def _same_repository_publishing(monkeypatch):
-    """These tests cover publishing from Seerxo/os itself; the repository's policy now names the B5 fork, whose
+    """These tests cover publishing from Seerxo/seerxo-os itself; the repository's policy now names the B5 fork, whose
     path the B5 tests cover by setting it explicitly."""
     from app import repo_guardian_github
     load = repo_guardian_github.load_policy
@@ -35,7 +35,7 @@ FOUNDER_ID = "founder:access:founder@example.invalid"
 
 def write_task(db, **over):
     project = models.Project(key="company-os", name="Company OS",
-                             repository="seerxo/os", status=enums.ProjectStatus.ACTIVE)
+                             repository="seerxo/seerxo-os", status=enums.ProjectStatus.ACTIVE)
     db.add(project)
     db.flush()
     agent = db.query(models.Agent).filter_by(key="developer").one()
@@ -204,7 +204,7 @@ class Reviewer(providers.Provider):
             "verdict": "APPROVE", "fingerprint": packet["fingerprint"], "findings": []})
 
 
-def pipeline(monkeypatch, tmp_path, hooks=None, *, mock_authorization=True, publish_repository="seerxo/os"):
+def pipeline(monkeypatch, tmp_path, hooks=None, *, mock_authorization=True, publish_repository="seerxo/seerxo-os"):
     hooks = hooks if hooks is not None else {}
     monkeypatch.setattr(worker, "ENABLE_AUTONOMOUS_CODE_WRITE", True)
     monkeypatch.setenv("STAGE_C_JOBS_ROOT", str(tmp_path / "jobs"))
@@ -271,7 +271,7 @@ def pipeline(monkeypatch, tmp_path, hooks=None, *, mock_authorization=True, publ
         def fake_open_pr(*a, **k):
             if hooks.get("during_open_pr"):
                 hooks["during_open_pr"](db, task)
-            return "https://github.com/seerxo/os/pull/999"
+            return "https://github.com/seerxo/seerxo-os/pull/999"
         return original_publish(db, task, job, diff, worktree, str(remote),
                                 fake_open_pr, *args, **kwargs)
     monkeypatch.setattr(stage_c_runner, "publish", publish)
@@ -310,7 +310,7 @@ def test_worker_routes_write_through_export_checks_independent_review_and_publis
     db = _db()
     task = write_task(db)
     task.context = {**task.context, "improvement": {"measure": {
-        "selector": {"subject": "repository:seerxo/os", "metric": "metrics_test_cases",
+        "selector": {"subject": "repository:seerxo/seerxo-os", "metric": "metrics_test_cases",
                      "source": "pytest-collection", "window": ""}, "direction": "up", "window_hours": 0}}}
     db.commit()
     ps = {n: Reviewer(n) for n in ("claude", "codex")}
@@ -376,7 +376,7 @@ def test_only_control_plane_https_git_gets_the_scoped_credential(monkeypatch, tm
         return SimpleNamespace(stdout=b"diff with trailing space \n\n")
     monkeypatch.setattr(stage_c_runner.subprocess, "run", git)
     assert stage_c_runner._git(tmp_path, "diff", strip=False) == "diff with trailing space \n\n"
-    stage_c_runner._git(tmp_path, "ls-remote", "https://github.com/seerxo/os.git", protocol="https")
+    stage_c_runner._git(tmp_path, "ls-remote", "https://github.com/seerxo/seerxo-os.git", protocol="https")
     assert "GH_TOKEN" not in calls[0][1]
     assert calls[1][1]["GH_TOKEN"] == "fixture-credential"
     assert "credential.helper=!gh auth git-credential" in calls[1][0]
@@ -392,7 +392,7 @@ def test_disarmed_control_loop_recognizes_a_green_interval_missed_during_an_outa
     monkeypatch.setattr(worker, "ENABLE_AUTONOMOUS_CODE_WRITE", False)
     now = datetime.now(timezone.utc)
     facts = {"state": "closed", "merged": True, "merged_by": "semihbugrasezer", "draft": False,
-             "head_sha": commit, "head_ref": "task/TASK-0100", "head_repo": "seerxo/os",
+             "head_sha": commit, "head_ref": "task/TASK-0100", "head_repo": "seerxo/seerxo-os",
              "base_ref": "main", "merge_commit": "c" * 40,
              "checks_complete": True, "checks": [{"name": "ci", "status": "completed", "conclusion": "success"}],
              "statuses": dict(GREEN_STATUSES), "statuses_complete": True, "status_problems": [],
@@ -413,7 +413,7 @@ def test_control_loop_tracks_ci_founder_merge_and_unknown_live_evidence(monkeypa
     worker.run_once(db, {n: Reviewer(n) for n in ("claude", "codex")}, SPECS)
     commit = task.artifacts["commit"]
     facts = {"state": "open", "head_sha": commit, "head_ref": "task/TASK-0100",
-             "head_repo": "seerxo/os", "base_ref": "main",
+             "head_repo": "seerxo/seerxo-os", "base_ref": "main",
              "checks_complete": True, "statuses": dict(GREEN_STATUSES), "statuses_complete": True, "status_problems": [],
              "checks": [{"name": "ci", "status": "completed", "conclusion": "success"}]}
     monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: facts)
@@ -742,7 +742,7 @@ def test_lease_contention_does_not_call_a_model(monkeypatch, tmp_path):
     pipeline(monkeypatch, tmp_path)
     db = _db()
     task = write_task(db)
-    stage_c.acquire(db, "seerxo/os", stage_c_runner.HOLDER, timedelta(minutes=30))
+    stage_c.acquire(db, "seerxo/seerxo-os", stage_c_runner.HOLDER, timedelta(minutes=30))
     db.commit()
     out = worker.run_once(db, {n: Reviewer(n) for n in ("claude", "codex")}, SPECS)
     assert out["verdict"] == "LEASE_BUSY" and out["model_calls"] == 0
@@ -883,7 +883,7 @@ def test_acceptance_requires_founder_all_checks_and_this_deployed_source(monkeyp
 
 BASE = "b" * 40
 FINGERPRINT = "f" * 64
-STAGE_EVIDENCE = {"DETECTED": {"repository": "seerxo/os"}, "PLANNED": {"paths": ["tests/test_metrics.py"]},
+STAGE_EVIDENCE = {"DETECTED": {"repository": "seerxo/seerxo-os"}, "PLANNED": {"paths": ["tests/test_metrics.py"]},
                   "IMPLEMENTING": {"base": BASE}, "TESTING": {"fingerprint": FINGERPRINT, "coder": "claude"},
                   "INDEPENDENT_REVIEW": {"fingerprint": FINGERPRINT, "checks": "ok"}}
 
@@ -975,7 +975,7 @@ def test_a_published_attempt_is_never_abandoned_by_worker_loss():
     assert task.status == enums.TaskStatus.REVIEW and task.retry_count == 0
 
 
-PR_URL = "https://github.com/seerxo/os/pull/7"
+PR_URL = "https://github.com/seerxo/seerxo-os/pull/7"
 
 
 def interrupted_repair(db, stage):
@@ -1145,7 +1145,7 @@ def test_an_authorization_is_for_one_task_one_sha_and_a_short_time(monkeypatch, 
 
 
 @pytest.mark.parametrize("value", [None, [], "yes", {}, {"task_key": "TASK-0100"},
-                                   {"task_key": "TASK-0100", "repository": "seerxo/os",
+                                   {"task_key": "TASK-0100", "repository": "seerxo/seerxo-os",
                                     "source_sha": SHA_A, "issued_by": "founder", "issued_at": "yesterday",
                                     "expires_at": "tomorrow", "consumed_at": None}])
 def test_malformed_or_unknown_authorization_is_denied(monkeypatch, tmp_path, value):
@@ -1471,7 +1471,7 @@ def test_published_guard_supplies_repository_when_recording_an_eligible_founder_
     worker.run_once(db, {n: Reviewer(n) for n in ("claude", "codex")}, SPECS)
     commit = task.artifacts["commit"]
     facts = {"state": "open", "merged": False, "head_sha": commit,
-             "head_ref": "task/TASK-0100", "head_repo": "seerxo/os",
+             "head_ref": "task/TASK-0100", "head_repo": "seerxo/seerxo-os",
              "base_ref": "main", "checks_complete": True, "statuses": dict(GREEN_STATUSES), "statuses_complete": True, "status_problems": [],
              "checks": [{"name": "ci", "status": "completed", "conclusion": "success"}]}
     monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: facts)
@@ -1593,7 +1593,7 @@ def test_a_takeover_between_the_claim_and_the_coder_never_reaches_the_coder(monk
     assert task.assigned_agent_id == db.query(models.Agent).filter_by(key="ceo").one().id
 
 
-@pytest.mark.parametrize("role", [("FAIL", "the token can write seerxo/os (push)"),
+@pytest.mark.parametrize("role", [("FAIL", "the token can write seerxo/seerxo-os (push)"),
                                   ("UNKNOWN", "GitHub refused or failed the role read")])
 def test_write_granted_after_admission_stops_the_push(monkeypatch, tmp_path, role):
     # Break caught (#192): admission trusts a preflight up to 15 min old; Write granted to the agent account in
@@ -1970,12 +1970,12 @@ def test_b5_worker_publishes_to_the_configured_fork_and_opens_the_pr_from_it(mon
     from app import repo_guardian_github
     remote = pipeline(monkeypatch, tmp_path)
     monkeypatch.setattr(repo_guardian_github, "publish_repository",
-                        lambda policy, repository: "seerxo-agent/os" if repository == "seerxo/os" else repository)
+                        lambda policy, repository: "seerxo-agent/seerxo-os" if repository == "seerxo/seerxo-os" else repository)
     seen, fixture_publish = [], stage_c_runner.publish
 
     def publish(db, task, job, diff, worktree, destination, open_pr, *args, **kwargs):
         seen.append((destination, job.repository))
-        return fixture_publish(db, task, job, diff, worktree, "https://github.com/seerxo/os.git", open_pr, *args, **kwargs)
+        return fixture_publish(db, task, job, diff, worktree, "https://github.com/seerxo/seerxo-os.git", open_pr, *args, **kwargs)
     monkeypatch.setattr(stage_c_runner, "publish", publish)
     openers = []
     monkeypatch.setattr(stage_c_runner, "gh_pr_opener", lambda *a: openers.append(a) or (lambda *x: "unused"))
@@ -1983,6 +1983,6 @@ def test_b5_worker_publishes_to_the_configured_fork_and_opens_the_pr_from_it(mon
     db = _db()
     task = write_task(db)
     out = worker.run_once(db, {n: Reviewer(n) for n in ("claude", "codex")}, SPECS)
-    assert seen == [("https://github.com/seerxo-agent/os.git", "seerxo/os")], out   # lease stays on upstream
-    assert openers == [("seerxo/os", "main", "seerxo-agent/os")] * 2
+    assert seen == [("https://github.com/seerxo-agent/seerxo-os.git", "seerxo/seerxo-os")], out   # lease stays on upstream
+    assert openers == [("seerxo/seerxo-os", "main", "seerxo-agent/seerxo-os")] * 2
     assert task.context["improvement"]["stage"] == "PR_OPEN"

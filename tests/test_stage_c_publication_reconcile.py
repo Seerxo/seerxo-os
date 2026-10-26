@@ -12,7 +12,7 @@ from tests.test_stage_c_worker import Reviewer, SPECS, _db, pipeline, record_cod
 @pytest.fixture
 def failed_publication(monkeypatch, tmp_path, request):
     from app import repo_guardian_github
-    destination = getattr(request, "param", "seerxo/os")
+    destination = getattr(request, "param", "seerxo/seerxo-os")
     monkeypatch.setattr(repo_guardian_github, "publish_repository", lambda policy, repository: destination)
     def lost_response(*args):
         raise TimeoutError("PR response and immediate verification unavailable")
@@ -33,7 +33,7 @@ def failed_publication(monkeypatch, tmp_path, request):
     assert result["verdict"] == "PR_FAILED" and task.status == enums.TaskStatus.BLOCKED
     run = db.query(models.AgentRun).one()
     reads = []
-    url = "https://github.com/seerxo/os/pull/999"
+    url = "https://github.com/seerxo/seerxo-os/pull/999"
 
     def lookup(branch, commit):
         reads.append((branch, commit))
@@ -54,7 +54,7 @@ def test_transient_pr_lookup_failure_recovers_delivery_without_another_execution
 
     assert task.status == enums.TaskStatus.REVIEW
     assert task.context["improvement"]["stage"] == "PR_OPEN"
-    assert task.artifacts["pr"] == "https://github.com/seerxo/os/pull/999" and len(reads) == 1
+    assert task.artifacts["pr"] == "https://github.com/seerxo/seerxo-os/pull/999" and len(reads) == 1
     assert coded == ["claude"] and len(providers["codex"].packets) == 1
     assert db.query(models.AgentRun).count() == 1 and run.status == enums.AgentRunStatus.FAILED
     assert db.query(models.AuditLog).filter_by(action="improvement.publication_recovered").count() == 1
@@ -62,7 +62,7 @@ def test_transient_pr_lookup_failure_recovers_delivery_without_another_execution
     assert len(reads) == 1 and db.query(models.AgentRun).count() == 1
 
 
-@pytest.mark.parametrize("failed_publication", ["seerxo-agent/os"], indirect=True)
+@pytest.mark.parametrize("failed_publication", ["seerxo-agent/seerxo-os"], indirect=True)
 def test_b5_fork_publication_recovers_after_restart_without_another_coder_or_pr_create(failed_publication, monkeypatch):
     db, task, run, coded, providers, reads, _ = failed_publication
     task_id = task.id
@@ -74,14 +74,14 @@ def test_b5_fork_publication_recovers_after_restart_without_another_coder_or_pr_
 
     def lookup(repository, branch, head_repository):
         lookups.append((repository, branch, head_repository))
-        return lambda ref, sha: reads.append((ref, sha)) or "https://github.com/seerxo/os/pull/999"
+        return lambda ref, sha: reads.append((ref, sha)) or "https://github.com/seerxo/seerxo-os/pull/999"
 
     monkeypatch.setattr(stage_c_runner, "gh_pr_lookup", lookup)
     monkeypatch.setattr(stage_c_runner, "gh_pr_opener", lambda *a: pytest.fail("recovery must not create a PR"))
     stage_c_worker.reconcile(fresh)
     task = fresh.get(models.Task, task_id)
     assert task.status == enums.TaskStatus.REVIEW and task.context["improvement"]["stage"] == "PR_OPEN"
-    assert lookups == [("seerxo/os", "main", "seerxo-agent/os")]
+    assert lookups == [("seerxo/seerxo-os", "main", "seerxo-agent/seerxo-os")]
     assert len(reads) == 1 and coded == ["claude"] and len(providers["codex"].packets) == 1
     assert fresh.query(models.AgentRun).count() == 1
     stage_c_worker.reconcile(fresh)
@@ -178,7 +178,7 @@ def test_founder_takeover_during_the_read_wins(failed_publication, monkeypatch):
         audit.record(db, actor="founder", action="task.status", entity_type="task", entity_key=task.key,
                      after={"status": "BLOCKED"}, task_id=task.id)
         db.commit()
-        return "https://github.com/seerxo/os/pull/999"
+        return "https://github.com/seerxo/seerxo-os/pull/999"
     monkeypatch.setattr(stage_c_runner, "gh_pr_lookup", lambda *args: takeover)
     stage_c_worker.reconcile(db)
     assert task.status == enums.TaskStatus.BLOCKED and task.error == "founder decision: keep blocked"
@@ -205,7 +205,7 @@ def test_concurrent_restriction_is_visible_with_the_production_session_cache(fai
                 control.set_agents_paused(other, True, actor="founder", reason="stop")
             other.commit()
         changed.append(True)
-        return "https://github.com/seerxo/os/pull/999"
+        return "https://github.com/seerxo/seerxo-os/pull/999"
     monkeypatch.setattr(stage_c_runner, "gh_pr_lookup", lambda *args: changed_during_lookup)
     stage_c_worker.reconcile(db)
     assert changed == [True] and task.status == enums.TaskStatus.BLOCKED and reads == [1]
@@ -217,7 +217,7 @@ def test_a_second_observer_cannot_spend_the_reserved_probe(failed_publication, m
         reads.append(1)
         with Session(db.get_bind()) as other:
             assert stage_c_worker.reconcile(other) == []
-        return "https://github.com/seerxo/os/pull/999"
+        return "https://github.com/seerxo/seerxo-os/pull/999"
     monkeypatch.setattr(stage_c_runner, "gh_pr_lookup", lambda *args: concurrent_lookup)
     stage_c_worker.reconcile(db)
     assert task.status == enums.TaskStatus.REVIEW and reads == [1]

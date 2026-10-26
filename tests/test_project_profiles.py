@@ -6,7 +6,7 @@ import yaml
 from app import project_profiles, stage_c_worker
 from tests.test_worker import _db, _task
 
-PILOT = "seerxo/os"
+PILOT = "seerxo/seerxo-os"
 YOUTUBE = "semihbugrasezer/youtube-auto"
 
 

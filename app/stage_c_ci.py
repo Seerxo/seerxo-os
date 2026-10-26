@@ -411,7 +411,7 @@ def gh_facts(repository: str, number: int, workflows: set[str], *, publisher: di
                    and checks and all(c["status"] == "completed" and c["conclusion"] == "success" for c in checks)
                    and completed and all(at is not None for at in completed))
     return {"state": pr["state"], "merged": bool(pr["merged"]), "head_sha": sha,
-            # GitHub returns the canonical casing ("Seerxo/os"); repository identities here are lowercase.
+            # GitHub returns the canonical casing ("Seerxo/seerxo-os"); repository identities here are lowercase.
             "head_ref": pr["head_ref"], "head_repo": (pr["head_repo"] or "").lower() or None, "checks": checks,
             "draft": bool(pr["draft"]), "base_ref": pr["base_ref"], "merged_by": pr["merged_by"],
             "merge_commit": pr["merge_commit"] if pr["merged"] else None,

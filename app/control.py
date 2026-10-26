@@ -90,7 +90,7 @@ def _set_agents_paused(db: Session, paused: bool, *, actor: str, reason: str) ->
 # authorization: one task, one repository, one deployed SHA, short-lived, spent when an attempt claims it.
 PILOT_AUTHORIZATION = "stage-c-pilot-authorization"
 PILOT_ACTION = "stage_c.code_write"
-AUTH_REPOSITORY = "seerxo/os"
+AUTH_REPOSITORY = "seerxo/seerxo-os"
 AUTH_MAX_TTL = timedelta(hours=1)
 _TASK_KEY = re.compile(r"^[A-Z]+-\d{1,6}$")
 _SHA = re.compile(r"^[a-f0-9]{40}$")

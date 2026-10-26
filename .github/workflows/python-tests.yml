@@ -1,5 +1,5 @@
 # Python 3.12 + PostgreSQL 18 backend tests on a GitHub-hosted runner (ubuntu-24.04). This is the mandatory backend
-# validation on Seerxo/os: it reports the check run "python-tests" on the exact PR head and the exact main
+# validation on Seerxo/seerxo-os: it reports the check run "python-tests" on the exact PR head and the exact main
 # commit. Secrets: none. Disposable PostgreSQL service only; tests refuse the production database name.
 name: python-tests
 

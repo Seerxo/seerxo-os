@@ -72,7 +72,7 @@ gh pr checks "$pr" --watch --interval 15 >/dev/null 2>&1 || true
 
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 repo=$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')
-if [ "$repo" = "seerxo/os" ]; then
+if [ "$repo" = "seerxo/seerxo-os" ]; then
   # Read the CI policy from the trusted PR base, never from the candidate branch being merged.
   base=$(gh pr view "$pr" --json baseRefName -q .baseRefName)
   policy_b64=$(gh api "repos/$repo/contents/agents/repository_guardian.yaml?ref=$base" --jq .content) || {
@@ -231,7 +231,7 @@ fi
 # Other repositories and ordinary branches keep the existing founder-invoked CI gate.
 stage_c_task=""
 branch=$(gh pr view "$pr" --json headRefName -q .headRefName)
-if [ "$repo" = "seerxo/os" ]; then
+if [ "$repo" = "seerxo/seerxo-os" ]; then
   identity=$(ssh "${COMPANY_SERVER:-company-os-host}" sudo companyctl stage-c identify-pr "$pr") || {
     echo "merge-pr: control-plane PR classification unavailable; refusing merge" >&2; exit 1; }
   stage_c_task=$(printf '%s' "$identity" | python3 -c '

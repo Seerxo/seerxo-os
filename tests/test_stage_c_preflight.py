@@ -48,8 +48,8 @@ READ_ONLY = {"admin": False, "maintain": False, "push": False, "triage": False, 
 
 
 def role(**perms):
-    """`gh api repos/seerxo/os`: the worker token's effective upstream role, as GitHub reports it."""
-    return SimpleNamespace(returncode=0, stdout=json.dumps({"full_name": "seerxo/os",
+    """`gh api repos/seerxo/seerxo-os`: the worker token's effective upstream role, as GitHub reports it."""
+    return SimpleNamespace(returncode=0, stdout=json.dumps({"full_name": "seerxo/seerxo-os",
                                                             "permissions": READ_ONLY | perms}))
 
 
@@ -57,7 +57,7 @@ def readable(argv, **kwargs):
     """GitHub answers the worker's identity and whichever CI evidence sources the test policy requires."""
     if argv[-1] == "user":
         return whoami("seerxo-agent")
-    if argv[-1] == "repos/seerxo/os":
+    if argv[-1] == "repos/seerxo/seerxo-os":
         return role()
     return SimpleNamespace(returncode=0, stdout='{"workflow_runs": []}' if "/actions/" in argv[-1] else "[]")
 
@@ -90,8 +90,8 @@ def test_actions_only_preflight_does_not_demand_commit_status_permission(tmp_pat
     assert status(report, "github_actions") == "PASS"
     assert status(report, "github_commit_statuses") == "PASS"
     assert "not required" in next(c["detail"] for c in report["checks"] if c["name"] == "github_commit_statuses")
-    assert calls == ["user", "repos/seerxo/os",                           # identity and role, then Actions
-                     "repos/seerxo/os/actions/runs?per_page=1"]          # no statuses
+    assert calls == ["user", "repos/seerxo/seerxo-os",                           # identity and role, then Actions
+                     "repos/seerxo/seerxo-os/actions/runs?per_page=1"]          # no statuses
 
 
 @pytest.mark.parametrize("contexts", [None, "", ["ci", "ci"]])
@@ -256,14 +256,14 @@ def test_ci_access_checks_the_deployed_commit_using_only_the_worker_environment(
     report = pf.evaluate(**args)
     assert report["ready"] is True  # empty statuses prove read access, not green CI
     assert calls[0][0] == ["gh", "api", "--hostname", "github.com", "-i", "user"]       # whose token, first
-    assert calls[1][0] == ["gh", "api", "--hostname", "github.com", "repos/seerxo/os"]  # then its upstream role
+    assert calls[1][0] == ["gh", "api", "--hostname", "github.com", "repos/seerxo/seerxo-os"]  # then its upstream role
     identity, calls = calls[:2], calls[2:]
     assert all(c[1]["env"] == args["environ"] for c in identity)
     assert calls[0][0] == ["gh", "api", "--method", "GET",
-                          f"repos/seerxo/os/commits/{SHA}/statuses?per_page=1"]
+                          f"repos/seerxo/seerxo-os/commits/{SHA}/statuses?per_page=1"]
     # The test policy also requires Actions workflows, so their read access is proven too.
     assert [c[0] for c in calls[1:]] == [["gh", "api", "--method", "GET",
-                                          "repos/seerxo/os/actions/runs?per_page=1"]]
+                                          "repos/seerxo/seerxo-os/actions/runs?per_page=1"]]
     assert all(c[1]["env"] == args["environ"] and c[1]["timeout"] == 10 for c in calls)
     assert "does not assert CI passed" in pf.render(report)
 
@@ -516,13 +516,13 @@ def test_the_agent_identity_with_a_read_only_upstream_role_passes(tmp_path):
     report = pf.evaluate(**world(tmp_path))
     check = next(c for c in report["checks"] if c["name"] == "worker_identity")
     assert check["status"] == "PASS" and report["ready"] is True
-    assert "seerxo-agent" in check["detail"] and "read-only on seerxo/os" in check["detail"]
+    assert "seerxo-agent" in check["detail"] and "read-only on seerxo/seerxo-os" in check["detail"]
     assert "x" not in check["detail"].split()                                 # the token value is never echoed
 
 
 def answering_role_with(response):
     def run(argv, **kwargs):
-        return response(argv) if argv[-1] == "repos/seerxo/os" else readable(argv, **kwargs)
+        return response(argv) if argv[-1] == "repos/seerxo/seerxo-os" else readable(argv, **kwargs)
     return run
 
 
@@ -536,10 +536,10 @@ def test_an_agent_later_granted_upstream_write_is_never_ready(tmp_path, granted)
 @pytest.mark.parametrize("response, expected", [
     (lambda a: SimpleNamespace(returncode=1, stdout="", stderr="HTTP 401 secret"), "UNKNOWN"),
     (lambda a: SimpleNamespace(returncode=1, stdout="", stderr="HTTP 403 secret"), "UNKNOWN"),
-    (lambda a: SimpleNamespace(returncode=0, stdout='{"full_name": "seerxo/os"}'), "UNKNOWN"),
+    (lambda a: SimpleNamespace(returncode=0, stdout='{"full_name": "seerxo/seerxo-os"}'), "UNKNOWN"),
     (lambda a: SimpleNamespace(returncode=0, stdout="not json: secret"), "FAIL"),
     (lambda a: role(push="false"), "FAIL"),
-    (lambda a: SimpleNamespace(returncode=0, stdout='{"full_name": "seerxo/os", "permissions": {"pull": true}}'),
+    (lambda a: SimpleNamespace(returncode=0, stdout='{"full_name": "seerxo/seerxo-os", "permissions": {"pull": true}}'),
      "FAIL"),
     (lambda a: SimpleNamespace(returncode=0, stdout=json.dumps(
         {"full_name": "other/repo", "permissions": READ_ONLY})), "FAIL"),            # wrong repository

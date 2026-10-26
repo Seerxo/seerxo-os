@@ -197,7 +197,7 @@ def test_only_this_repositorys_actions_endpoints_are_read():
     db = _db()
     gh = FakeGitHub([run(1)], {1: [job(10, 60)]})
     ci_usage.collect(db, gh, NOW)
-    assert all(path.startswith("repos/Seerxo/os/actions/") for path, _ in gh.calls)
+    assert all(path.startswith("repos/Seerxo/seerxo-os/actions/") for path, _ in gh.calls)
 
 
 # --------------------------------------------------------------------------- findings

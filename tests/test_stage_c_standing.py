@@ -85,7 +85,7 @@ def test_anything_outside_the_grant_is_denied_and_spends_nothing(monkeypatch, tm
 
 
 @pytest.mark.parametrize("value", [None, [], "yes", {}, {"paths": [PATH]},
-                                   {"repository": "seerxo/os", "source_sha": SHA_A, "issued_by": "founder",
+                                   {"repository": "seerxo/seerxo-os", "source_sha": SHA_A, "issued_by": "founder",
                                     "action": "stage_c.code_write.standing", "paths": [PATH], "max_per_day": 99,
                                     "issued_at": "yesterday", "expires_at": "tomorrow"}])
 def test_a_malformed_or_hand_written_row_is_denied(monkeypatch, tmp_path, value):
