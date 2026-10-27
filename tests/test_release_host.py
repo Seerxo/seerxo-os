@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from app import release_gateway as rg, release_host as host
-from tests.test_release_gateway import Production, configs, images
+from tests.test_release_gateway import Production, configs, images, seed
 from tests.test_release_gateway_service import NOW, World, sh
 
 # World is a class, never None: the old `World is None` guard never skipped, so the Stage C checks image (no
@@ -55,8 +55,8 @@ def hw(tmp_path, monkeypatch):
                "Dockerfile": "\n", "docker-compose.yml": "\n", "docs/PERMANENT_FACTS.md": "\n"}
     w.base = w.commit("driver", **shipped)
     w.push()
-    w.cfg.ledger.write_text(json.dumps({"last_sha": w.base, "last_sequence": 6, "seen": [], "min_policy_version": 1,
-                                        "images": images(w.base), "configs": configs()}))
+    seed(w.cfg.ledger, {"last_sha": w.base, "last_sequence": 6, "seen": [], "min_policy_version": 1,
+                        "images": images(w.base), "configs": configs()})
     w.report(w.base)
     w.prod = Production(w.base)
     host_clone = tmp_path / "host-clone"
@@ -251,6 +251,7 @@ def test_a_driver_that_exits_0_but_did_not_switch_production_leaves_the_host_pen
 def test_founder_bootstrap_and_recovery_commands_on_the_host(hw, tmp_path):
     from tests.test_release_gateway import HOST
     hw.hcfg.ledger.unlink()
+    rg.history_path(hw.hcfg.ledger).unlink()                                # a new host: neither ledger nor history
     assert step(hw)["outcome"] == "BLOCKED"                                    # no baseline: nothing at all
     praw = hw.hcfg.policy.read_bytes()
     st = {"kind": "bootstrap", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "cd" * 16,

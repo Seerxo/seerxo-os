@@ -850,16 +850,20 @@ def history_problem(state: dict, history: list[dict]) -> str | None:
     missing rebase. Any of these must stop every release (the founder recovers the ledger: move it aside, then a
     founder-signed `recover` rebuilds it from history, including chain_base)."""
     if not history:
-        return None
-    if state.get("min_policy_version", 1) < max(e.get("policy_version", 1) for e in history):
-        return "the ledger's policy floor is below its history"
-    if state.get("last_sequence", 0) < max(e.get("sequence", 0) for e in history):
-        return "the ledger's sequence floor is below its history"
+        return "the release history is missing" if state.get("last_sha") else None
+    # Both directions: a ledger behind its history (crash, restored ledger copy) and a history behind its ledger
+    # (restored history copy) disagree on the floors or on what runs; either way nothing is released.
+    if state.get("min_policy_version", 1) != max(e.get("policy_version", 1) for e in history):
+        return "the ledger's policy floor differs from its history"
+    if state.get("last_sequence", 0) != max(e.get("sequence", 0) for e in history):
+        return "the ledger's sequence floor differs from its history"
     seen = set(state.get("seen", []))
     recent = [d for e in history[-1000:] for d in (e.get("digest"), e.get("pending_digest")) if isinstance(d, str)]
     if len(state.get("seen", [])) < 1000 and not set(recent) <= seen:
         return "the ledger has forgotten digests its history recorded"
     moves = [e for e in history if e.get("event") in MOVES]
+    if moves and moves[-1].get("sha") != state.get("last_sha"):
+        return "the history's last recorded release differs from the ledger's"
     if moves and moves[-1].get("event") == "rebase" and state.get("chain_base") != moves[-1].get("base_sha"):
         return "the history's last move is a rebase the ledger does not hold"
     return None
@@ -891,6 +895,8 @@ def release_transaction(ledger: Path, manifest_bytes: bytes, signature: str, *, 
         # chosen by release_host before this write, so no other upload can claim the pending SHA.
         _write_atomic(ledger, {**state, "pending": digest, "pending_sha": m["sha"], "pending_sequence": m["sequence"],
                                "pending_policy_version": policy["version"],
+                               # the verified payload, so an `applied` reconcile records it like a normal apply
+                               "pending_payload_digest": m["payload_digest"],
                                # #192 F4: the driver holds a gateway (LOW) release to the running images.
                                "pending_approver": m["approver"],
                                **({"pending_release_dir": release_dir} if release_dir else {})})
@@ -1073,7 +1079,9 @@ def reconcile(ledger: Path, statement: bytes, signature: str, *, founder_key: st
         _append_history(ledger, {"event": "reconcile", "outcome": st["outcome"], "digest": digest,
                                  "pending_digest": pending, "sha": st["release_sha"], "sequence": sequence,
                                  "images": st["images"], "configs": st["configs"],
-                                 "policy_version": min_policy, "at": now.isoformat()})
+                                 "policy_version": min_policy, "at": now.isoformat(),
+                                 **({"payload_digest": state["pending_payload_digest"]}
+                                    if st["outcome"] == "applied" and state.get("pending_payload_digest") else {})})
         new = {"last_sequence": sequence, "last_sha": st["release_sha"], "images": st["images"],
                "configs": st["configs"], "min_policy_version": min_policy,
                "seen": [*state.get("seen", []), pending, digest][-1000:]}
@@ -1131,8 +1139,8 @@ def rebase(ledger: Path, statement: bytes, signature: str, *, founder_key: str, 
         behind = history_problem(state, history)
         if behind:
             raise Refused(f"the ledger is behind its own history ({behind}): the founder must recover it")
-        recorded = [e.get("payload_digest") for e in history
-                    if e.get("event") == "applied" and e.get("sha") == state["last_sha"]]
+        recorded = [e.get("payload_digest") for e in history if e.get("sha") == state["last_sha"] and (
+                    e.get("event") == "applied" or (e.get("event") == "reconcile" and e.get("outcome") == "applied"))]
         if not recorded or not isinstance(recorded[-1], str) or st["old_payload_digest"] != recorded[-1]:
             raise Refused("rebase statement does not name the payload the host recorded for the running release")
         facts = provenance(st["base_sha"], state["last_sha"])
