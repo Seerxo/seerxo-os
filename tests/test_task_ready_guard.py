@@ -25,7 +25,7 @@ def engine(monkeypatch, tmp_path):
     with Session(eng) as db:
         for key in ("developer", "research"):
             db.add(models.Agent(key=key, role=key, enabled=True))
-        db.add(models.Project(key="company-os", name="Company OS", repository="seerxo/os", status=enums.ProjectStatus.ACTIVE))
+        db.add(models.Project(key="company-os", name="Company OS", repository="seerxo/seerxo-os", status=enums.ProjectStatus.ACTIVE))
         db.commit()
     for k, v in {"COMPANY_API_TOKEN_DESK": "d" * 40, "CF_ACCESS_DESK_HOST": DESK_HOST, "API_AUTH_MODE": "enforce",
                  "COMPANY_OS_GIT_SHA": SHA}.items():
@@ -131,7 +131,7 @@ def test_a_code_writing_task_needs_every_stage_c_condition_now(engine, setup, re
         if setup == "disabled_owner":
             db.get(models.Agent, t.assigned_agent_id).enabled = False
         if setup == "published_pr":
-            t.context = {**t.context, "improvement": {"stage": "PR_OPEN", "history": [{"stage": "PR_OPEN", "evidence": {"pr": "https://github.com/seerxo/os/pull/9"}}]}}
+            t.context = {**t.context, "improvement": {"stage": "PR_OPEN", "history": [{"stage": "PR_OPEN", "evidence": {"pr": "https://github.com/seerxo/seerxo-os/pull/9"}}]}}
         if setup == "other_task_authorized":
             _task(engine, "TASK-0011", T.BLOCKED, write=True)
             control.authorize_pilot(db, "TASK-0011", SHA, founder=FID)
@@ -197,8 +197,8 @@ def _interrupted_repair(engine):
     with Session(engine) as db:
         t = db.scalar(select(models.Task).where(models.Task.key == "TASK-0010"))
         t.context = {**t.context, "improvement": {"stage": "IMPLEMENTING", "history": [
-            {"stage": "PR_OPEN", "evidence": {"pr": "https://github.com/seerxo/os/pull/9"}}]}}
-        t.error = f"{stage_c_worker.REPAIR_INTERRUPTED} worker lost a CI repair of https://github.com/seerxo/os/pull/9 at IMPLEMENTING"
+            {"stage": "PR_OPEN", "evidence": {"pr": "https://github.com/seerxo/seerxo-os/pull/9"}}]}}
+        t.error = f"{stage_c_worker.REPAIR_INTERRUPTED} worker lost a CI repair of https://github.com/seerxo/seerxo-os/pull/9 at IMPLEMENTING"
         db.commit()
 
 

@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from app import audit, enums, models, repo_guardian_github, stage_c_ci
 
-REPOSITORY = "seerxo/os"
+REPOSITORY = "seerxo/seerxo-os"
 FOUNDER = "semihbugrasezer"
 ACTOR = "scripts/merge-pr"
 TASK_BRANCH = re.compile(r"^task/(TASK-[0-9]{1,6})$")

@@ -5,7 +5,7 @@ import pytest
 
 from app import repo_guardian_github as github
 
-REPO = "seerxo/os"
+REPO = "seerxo/seerxo-os"
 SHA = "a" * 40
 
 
@@ -108,7 +108,7 @@ def test_tracked_branch_is_required_per_repository_and_used_instead_of_default(m
 def test_repository_policy_in_git_names_a_branch_for_every_repository():
     from pathlib import Path
     policy = github.load_policy(Path(github.__file__).resolve().parents[1] / "agents/repository_guardian.yaml")
-    assert policy["branches"] == {"seerxo/os": "main"}
+    assert policy["branches"] == {"seerxo/seerxo-os": "main"}
 
 
 def test_merge_statuses_is_required_and_strictly_shaped():
@@ -134,7 +134,7 @@ def test_checked_in_policy_requires_the_frontend_and_python_workflows():
     from pathlib import Path
     policy = github.load_policy(Path(__file__).resolve().parents[1] / "agents/repository_guardian.yaml")
     assert policy["workflows"] == [".github/workflows/frontend.yml", ".github/workflows/python-tests.yml"]
-    # CircleCI does not report on Seerxo/os: no commit status is required, so the workflows are the evidence.
+    # CircleCI does not report on Seerxo/seerxo-os: no commit status is required, so the workflows are the evidence.
     assert github.merge_statuses(policy) == ({"login": "circleci-app[bot]", "id": 127350680}, ())
 
 
@@ -224,14 +224,14 @@ def test_status_contexts_need_a_trusted_publisher(monkeypatch):
 
 def test_b5_publish_fork_is_optional_exact_and_canonical(tmp_path):
     path = tmp_path / "policy.yaml"
-    base = ("enabled: false\nrepositories:\n  - seerxo/os\nworkflows:\n  - .github/workflows/ci.yml\n"
-            "branches:\n  seerxo/os: main\n")
+    base = ("enabled: false\nrepositories:\n  - seerxo/seerxo-os\nworkflows:\n  - .github/workflows/ci.yml\n"
+            "branches:\n  seerxo/seerxo-os: main\n")
     path.write_text(base)
-    assert github.publish_repository(github.load_policy(path), "seerxo/os") == "seerxo/os"   # unset: same repo
-    path.write_text(base + "publish_forks:\n  seerxo/os: seerxo-agent/os\n")
-    assert github.publish_repository(github.load_policy(path), "seerxo/os") == "seerxo-agent/os"
-    for bad in ("  seerxo/os: Seerxo-Agent/os\n", "  seerxo/os: seerxo/os\n", "  other/repo: seerxo-agent/os\n",
-                "  seerxo/os: https://evil/x\n", "  seerxo/os: [a/b]\n"):
+    assert github.publish_repository(github.load_policy(path), "seerxo/seerxo-os") == "seerxo/seerxo-os"   # unset: same repo
+    path.write_text(base + "publish_forks:\n  seerxo/seerxo-os: seerxo-agent/seerxo-os\n")
+    assert github.publish_repository(github.load_policy(path), "seerxo/seerxo-os") == "seerxo-agent/seerxo-os"
+    for bad in ("  seerxo/seerxo-os: Seerxo-Agent/os\n", "  seerxo/seerxo-os: seerxo/seerxo-os\n", "  other/repo: seerxo-agent/seerxo-os\n",
+                "  seerxo/seerxo-os: https://evil/x\n", "  seerxo/seerxo-os: [a/b]\n"):
         path.write_text(base + "publish_forks:\n" + bad)
         with pytest.raises(ValueError, match="publish_forks"):
             github.load_policy(path)
@@ -240,12 +240,12 @@ def test_b5_publish_fork_is_optional_exact_and_canonical(tmp_path):
 def test_b5_repository_policy_in_git_publishes_from_the_agent_fork():
     from pathlib import Path
     policy = github.load_policy(Path(github.__file__).resolve().parents[1] / "agents/repository_guardian.yaml")
-    assert github.publish_repository(policy, "seerxo/os") == "seerxo-agent/os"
+    assert github.publish_repository(policy, "seerxo/seerxo-os") == "seerxo-agent/seerxo-os"
 
 
 @pytest.mark.parametrize("declaration", [
-    "publish_forks:\n  seerxo/os: seerxo-agent/os\npublish_forks:\n  seerxo/os: other/os\n",
-    "publish_forks:\n  seerxo/os: seerxo-agent/os\n  seerxo/os: other/os\n",
+    "publish_forks:\n  seerxo/seerxo-os: seerxo-agent/seerxo-os\npublish_forks:\n  seerxo/seerxo-os: other/os\n",
+    "publish_forks:\n  seerxo/seerxo-os: seerxo-agent/seerxo-os\n  seerxo/seerxo-os: other/os\n",
 ])
 def test_b5_duplicate_fork_policy_is_rejected_instead_of_last_value_winning(tmp_path, declaration):
     from pathlib import Path

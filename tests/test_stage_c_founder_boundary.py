@@ -238,14 +238,14 @@ def test_inability_to_merge_is_never_reported_as_proven():
 
 
 def role_run(login="seerxo-agent", scopes="repo", role_stdout=None, role_rc=0):
-    """`gh api -i user` answers the identity; `gh api repos/seerxo/os` answers the upstream role."""
+    """`gh api -i user` answers the identity; `gh api repos/seerxo/seerxo-os` answers the upstream role."""
     perms = {"admin": False, "maintain": False, "push": False, "triage": False, "pull": True}
-    body = role_stdout if role_stdout is not None else json.dumps({"full_name": "seerxo/os", "permissions": perms})
+    body = role_stdout if role_stdout is not None else json.dumps({"full_name": "seerxo/seerxo-os", "permissions": perms})
 
     def run(argv, **kw):
         if argv == ["gh", "api", "--hostname", "github.com", "-i", "user"]:
             return SimpleNamespace(returncode=0, stdout=response(login, scopes), stderr="")
-        assert argv == ["gh", "api", "--hostname", "github.com", "repos/seerxo/os"]
+        assert argv == ["gh", "api", "--hostname", "github.com", "repos/seerxo/seerxo-os"]
         return SimpleNamespace(returncode=role_rc, stdout=body, stderr="secret")
     return run
 
@@ -261,19 +261,19 @@ def test_a_verified_read_only_upstream_role_proves_the_token_cannot_merge():
 def test_upstream_write_or_higher_fails_and_merge_stays_unproven(perms):
     base = {"admin": False, "maintain": False, "push": False, "pull": True}
     report = cb.evaluate({"GH_TOKEN": "x"},
-                         role_run(role_stdout=json.dumps({"full_name": "seerxo/os", "permissions": base | perms})))
+                         role_run(role_stdout=json.dumps({"full_name": "seerxo/seerxo-os", "permissions": base | perms})))
     assert status(report, "worker_upstream_role") == "FAIL"
     assert status(report, "worker_token_cannot_merge") == "UNKNOWN" and not report["separated"]
 
 
 @pytest.mark.parametrize("kwargs, expected", [
     ({"role_rc": 1}, "UNKNOWN"),                                             # 401/403/404/network
-    ({"role_stdout": '{"full_name": "seerxo/os"}'}, "UNKNOWN"),              # no permissions object
+    ({"role_stdout": '{"full_name": "seerxo/seerxo-os"}'}, "UNKNOWN"),              # no permissions object
     ({"role_stdout": "garbage secret"}, "FAIL"),
-    ({"role_stdout": '{"full_name": "seerxo/os", "permissions": []}'}, "FAIL"),
-    ({"role_stdout": '{"full_name": "seerxo/os", "permissions": {"admin": 0, "maintain": 0, "push": 0, '
+    ({"role_stdout": '{"full_name": "seerxo/seerxo-os", "permissions": []}'}, "FAIL"),
+    ({"role_stdout": '{"full_name": "seerxo/seerxo-os", "permissions": {"admin": 0, "maintain": 0, "push": 0, '
                      '"pull": 1}}'}, "FAIL"),
-    # Read-only, but for another repository: a rename redirect or a wrong answer proves nothing about seerxo/os.
+    # Read-only, but for another repository: a rename redirect or a wrong answer proves nothing about seerxo/seerxo-os.
     ({"role_stdout": '{"full_name": "other/repo", "permissions": {"admin": false, "maintain": false, '
                      '"push": false, "pull": true}}'}, "FAIL"),
     ({"role_stdout": '{"permissions": {"admin": false, "maintain": false, "push": false, "pull": true}}'}, "FAIL"),
@@ -291,7 +291,7 @@ def test_no_token_makes_no_role_read():
 
 
 def test_the_owner_case_github_returns_is_the_same_repository():
-    body = json.dumps({"full_name": "Seerxo/os", "permissions": {"admin": False, "maintain": False,
+    body = json.dumps({"full_name": "Seerxo/seerxo-os", "permissions": {"admin": False, "maintain": False,
                                                                  "push": False, "pull": True}})
     assert status(cb.evaluate({"GH_TOKEN": "x"}, role_run(role_stdout=body)), "worker_upstream_role") == "PASS"
 

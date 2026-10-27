@@ -36,7 +36,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # (BILLING_UNVERIFIED); the watchdog turns them into budget findings. Exit 2 = CI_USAGE_GITHUB_TOKEN not set.
 37 * * * *   root  docker exec company-api python -m app.ci_usage >> /opt/company-os/backups/ci-usage.log 2>&1
 
-# B5 interim detective control (app/main_guard.py): every commit on Seerxo/os main must be a founder-merged PR.
+# B5 interim detective control (app/main_guard.py): every commit on Seerxo/seerxo-os main must be a founder-merged PR.
 # Detects only; production is protected by the release gateway. Exit 1 = alert recorded, 2 = no GH_TOKEN (DEGRADED).
 */15 * * * * root  docker exec company-worker python -m app.main_guard >> /opt/company-os/backups/main-guard.log 2>&1
 

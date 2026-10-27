@@ -47,7 +47,7 @@ START_ACK_TIMEOUT = 105
 @dataclass(frozen=True)
 class Job:
     task_key: str
-    repository: str            # lease name, e.g. "seerxo/os"
+    repository: str            # lease name, e.g. "seerxo/seerxo-os"
     mirror: Path               # control plane's local mirror; the coder never sees it
     base: str                  # exact 40-hex commit
     paths: list[str]           # files the coder may modify (coder_source limits apply)

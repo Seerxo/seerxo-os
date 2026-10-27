@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 FOUNDER = "semihbugrasezer"
-UPSTREAM = "seerxo/os"
+UPSTREAM = "seerxo/seerxo-os"
 # Roles GitHub reports for the caller; any of the write-or-higher ones can push or merge upstream.
 WRITE_ROLES = ("admin", "maintain", "push")
 ROLES = (*WRITE_ROLES, "pull")

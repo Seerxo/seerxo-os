@@ -4,7 +4,7 @@ projects:
   company-os:
     business_unit: null
     repositories:
-      seerxo/os:
+      seerxo/seerxo-os:
         target_branch: main
         write_authorized: true
         allowed_paths:

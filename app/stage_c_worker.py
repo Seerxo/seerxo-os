@@ -16,7 +16,7 @@ from app import (audit, control, coder_source, enums, models, project_profiles, 
                  repo_guardian_github, stage_c, stage_c_ci, stage_c_credential_boundary, stage_c_runner,
                  stage_c_verify)
 
-REPOSITORY = "seerxo/os"
+REPOSITORY = "seerxo/seerxo-os"
 POLICY = Path(__file__).resolve().parents[1] / "agents/repository_guardian.yaml"
 # Start with the product logic whose boundaries are known. Scope expansion is a human PR.
 CODE_FILES = {"app/goals.py", "app/metrics_store.py", "app/packaging.py"}

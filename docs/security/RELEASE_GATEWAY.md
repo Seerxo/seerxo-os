@@ -14,7 +14,7 @@ change and no GitHub login can put an unapproved commit on production. GitHub Fr
 
 | Side | Holds | Can be changed by agents? |
 |---|---|---|
-| `Seerxo/os` repository, its workflows and CI results | code, tests, PRs | **yes**: untrusted input to a release |
+| `Seerxo/seerxo-os` repository, its workflows and CI results | code, tests, PRs | **yes**: untrusted input to a release |
 | Stage C worker, coder container, PostgreSQL rows they write | task state, Stage C review records | **yes**: untrusted |
 | `company-reasoner` (separate container: no database, no GitHub token, no Docker socket) | model CLIs only; answers the signer's review request like any /run call. Holds **no** key | reachable by the worker over /run (by design, for Stage B) |
 | `company-review-signer` (F1: own uid 10002, no model CLI, no Docker socket, read-only, no route out) | the reviewer signing key; builds the release review itself, validates the answer strictly, signs it | **no**, required (H6) |

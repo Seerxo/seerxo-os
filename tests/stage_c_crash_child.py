@@ -27,7 +27,7 @@ MIRROR = FIXTURE / "jobs" / ".control" / "sez-company.git"
 REMOTE = FIXTURE / "remote.git"
 KILL_AT = os.environ.get("KILL_AT", "")
 CALLS_LOG = os.environ["CALLS_LOG"]
-REPO = "https://github.com/seerxo/os.git"
+REPO = "https://github.com/seerxo/seerxo-os.git"
 
 
 def _log(line: str) -> None:
@@ -190,7 +190,7 @@ def main() -> None:
             db.commit()
             task = write_task(db)
             task.context = {**task.context, "improvement": {"measure": {
-                "selector": {"subject": "repository:seerxo/os", "metric": "metrics_test_cases",
+                "selector": {"subject": "repository:seerxo/seerxo-os", "metric": "metrics_test_cases",
                              "source": "pytest-collection", "window": ""}, "direction": "up", "window_hours": 0}}}
             db.commit()
             return

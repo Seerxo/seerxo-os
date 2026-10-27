@@ -318,7 +318,7 @@ The baseline moves as tests are added (seven when first written, 9 `test_*` func
 business unit. Set `context.improvement.measure` to:
 
 ```json
-{"selector": {"subject": "repository:Seerxo/os",
+{"selector": {"subject": "repository:Seerxo/seerxo-os",
               "metric": "metrics_test_cases", "source": "pytest-collection", "window": ""},
  "direction": "up", "window_hours": 0}
 ```

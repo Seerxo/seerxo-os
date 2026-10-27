@@ -14,7 +14,7 @@ bounded to RETENTION_DAYS. The billing cycle is not known from any source: it is
 month and labelled as an assumption.
 
 Run hourly from cron:  docker exec company-api python -m app.ci_usage
-Token: CI_USAGE_GITHUB_TOKEN, a fine-grained token with "Actions: read" on Seerxo/os only. No token, no state.
+Token: CI_USAGE_GITHUB_TOKEN, a fine-grained token with "Actions: read" on Seerxo/seerxo-os only. No token, no state.
 """
 import math
 import os
@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from app import enums, models
 
 CONTROL_KEY = "ci-usage"
-REPOSITORY = "Seerxo/os"
+REPOSITORY = "Seerxo/seerxo-os"
 ALLOWANCE_MINUTES = 3000
 THRESHOLDS = ((0.70, "warning", enums.Severity.MEDIUM), (0.85, "high", enums.Severity.HIGH),
               (0.95, "critical", enums.Severity.CRITICAL), (1.00, "exhausted", enums.Severity.CRITICAL))

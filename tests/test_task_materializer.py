@@ -112,13 +112,13 @@ SHA = "a" * 40
 METRICS = "tests/test_metrics.py"
 
 
-REPO = "https://github.com/seerxo/os"
+REPO = "https://github.com/seerxo/seerxo-os"
 
 
 def _project(db, repository=REPO, status=enums.ProjectStatus.ACTIVE):
     # Stage C hand-offs are now bound to the canonical project/repository profile.
     canonical = repo_guardian.repository_name(repository)
-    key = "company-os" if canonical == "seerxo/os" else f"p-{repository[-8:]}"
+    key = "company-os" if canonical == "seerxo/seerxo-os" else f"p-{repository[-8:]}"
     p = models.Project(key=key, name="p", repository=repository, status=status)
     db.add(p)
     db.commit()

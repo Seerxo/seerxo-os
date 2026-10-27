@@ -17,10 +17,10 @@ SCRIPT = REPO / "scripts" / "merge-pr"
 OWNER_REPO = "owner/repo"
 HEAD = "a" * 40
 GREEN = [{"name": "test", "state": "SUCCESS"}, {"name": "lint", "state": "SUCCESS"}]
-COMPANY_REPO = "seerxo/os"
+COMPANY_REPO = "seerxo/seerxo-os"
 COMPANY_CONTEXTS = ["ci/circleci: python-tests", "ci/circleci: frontend-tests"]
 COMPANY_WORKFLOW = ".github/workflows/frontend.yml"
-COMPANY_POLICY = '''branches:\n  seerxo/os: main\nworkflows:\n  - ".github/workflows/frontend.yml"\nstatus_publisher:\n  login: "circleci-app[bot]"\n  id: 127350680\nrequired_statuses:\n  - "ci/circleci: python-tests"\n  - "ci/circleci: frontend-tests"\n'''
+COMPANY_POLICY = '''branches:\n  seerxo/seerxo-os: main\nworkflows:\n  - ".github/workflows/frontend.yml"\nstatus_publisher:\n  login: "circleci-app[bot]"\n  id: 127350680\nrequired_statuses:\n  - "ci/circleci: python-tests"\n  - "ci/circleci: frontend-tests"\n'''
 CIRCLECI_ONLY_POLICY = COMPANY_POLICY.replace('workflows:\n  - ".github/workflows/frontend.yml"\n', "workflows: []\n")
 
 FAKE_GH = r'''#!/usr/bin/env python3
@@ -54,7 +54,7 @@ elif args[:2] == ["pr", "checks"]:
     print(os.environ.get("FAKE_CHECKS", "[]"))
 elif args[:2] == ["pr", "merge"]:
     if os.environ.get("FAKE_ALREADY_MERGED"):
-        print("! Pull request seerxo/os#7 was already merged", file=sys.stderr)
+        print("! Pull request seerxo/seerxo-os#7 was already merged", file=sys.stderr)
     sys.exit(int(os.environ.get("FAKE_MERGE_RC", "0")))
 elif args[:2] == ["repo", "view"]:
     print(os.environ["FAKE_OWNER_REPO"])
@@ -336,10 +336,10 @@ def test_company_merge_refuses_a_missing_circleci_status(env):
 
 
 def test_company_merge_strict_path_applies_to_github_casing(env):
-    """GitHub reports the repository as "Seerxo/os"; the strict CI path must still apply."""
+    """GitHub reports the repository as "Seerxo/seerxo-os"; the strict CI path must still apply."""
     statuses = json.loads(company_statuses())
     statuses.pop()
-    res = run(env, {"FAKE_OWNER_REPO": "Seerxo/os", "FAKE_POLICY": COMPANY_POLICY,
+    res = run(env, {"FAKE_OWNER_REPO": "Seerxo/seerxo-os", "FAKE_POLICY": COMPANY_POLICY,
                     "FAKE_STATUSES": json.dumps(statuses), "MERGE_PR_DELETE_BRANCH": "0"})
     assert res.returncode != 0
     assert "missing required status" in res.stderr
@@ -454,7 +454,7 @@ def test_company_merge_fails_closed_when_trusted_policy_is_unavailable(env):
 
 
 def test_stage_c_task_merges_require_control_plane_receipts_before_and_after_merge(env):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "task/TASK-0070",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "task/TASK-0070",
                     "FAKE_IS_STAGE_C": "1", "MERGE_PR_DELETE_BRANCH": "0"})
     assert res.returncode == 0, res.stderr
     ssh_calls = [json.loads(line) for line in Path(env["base"]["SSH_LOG"]).read_text().splitlines()]
@@ -465,7 +465,7 @@ def test_stage_c_task_merges_require_control_plane_receipts_before_and_after_mer
 
 
 def test_stage_c_task_refuses_merge_when_control_plane_is_unavailable(env):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "task/TASK-0070",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "task/TASK-0070",
                     "FAKE_SSH_FAIL": "1"})
     assert res.returncode != 0
     assert "PR classification unavailable" in res.stderr
@@ -474,7 +474,7 @@ def test_stage_c_task_refuses_merge_when_control_plane_is_unavailable(env):
 
 @pytest.mark.parametrize("receipt", ["true", "7.0", "8"])
 def test_malformed_stage_c_classification_receipt_refuses_before_merge(env, receipt):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "feat/example",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "feat/example",
                     "FAKE_IDENTIFY_PR_NUMBER": receipt})
     assert res.returncode != 0
     assert "invalid Stage C PR classification" in res.stderr
@@ -482,7 +482,7 @@ def test_malformed_stage_c_classification_receipt_refuses_before_merge(env, rece
 
 
 def test_stage_c_task_merge_is_founder_only_before_the_merge_call(env):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "task/TASK-0070",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "task/TASK-0070",
                     "FAKE_IS_STAGE_C": "1", "FAKE_ACTOR": "another-maintainer"})
     assert res.returncode != 0
     assert "founder-only" in res.stderr
@@ -496,7 +496,7 @@ def test_stage_c_task_merge_is_founder_only_before_the_merge_call(env):
     {"FAKE_AUTHORIZATION_PR_NUMBER": "true"},
 ])
 def test_malformed_stage_c_authorization_receipt_refuses_before_merge(env, extra):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "task/TASK-0070",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "task/TASK-0070",
                     "FAKE_IS_STAGE_C": "1", "MERGE_PR_DELETE_BRANCH": "0", **extra})
     assert res.returncode != 0
     assert "invalid Stage C authorization receipt" in res.stderr
@@ -504,7 +504,7 @@ def test_malformed_stage_c_authorization_receipt_refuses_before_merge(env, extra
 
 
 def test_malformed_task_branch_cannot_fall_through_to_generic_merge(env):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "task/TASK-0070-extra"})
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "task/TASK-0070-extra"})
     assert res.returncode != 0
     assert "task-prefixed branch has no durable Stage C publication" in res.stderr
     assert not merged(env) and not deleted(env)
@@ -512,7 +512,7 @@ def test_malformed_task_branch_cannot_fall_through_to_generic_merge(env):
 
 def test_stage_c_commit_without_committed_pr_record_cannot_use_generic_merge(env):
     # Stage C creates its GitHub PR before committing PR_OPEN; the commit identity closes that gap.
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "feat/renamed",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "feat/renamed",
                     "FAKE_COMMIT_MESSAGE": "TASK-0070: task title\n\nFingerprint: abc"})
     assert res.returncode != 0
     assert "no durable publication record" in res.stderr
@@ -520,7 +520,7 @@ def test_stage_c_commit_without_committed_pr_record_cannot_use_generic_merge(env
 
 
 def test_renamed_stage_c_branch_still_uses_control_plane_and_fails_closed(env):
-    res = run(env, {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "feat/renamed",
+    res = run(env, {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "feat/renamed",
                     "FAKE_IS_STAGE_C": "1"})
     assert res.returncode != 0
     assert "control-plane merge authorization" in res.stderr
@@ -528,7 +528,7 @@ def test_renamed_stage_c_branch_still_uses_control_plane_and_fails_closed(env):
 
 
 def test_stage_c_merge_completion_can_be_retried_after_github_merge(env):
-    common = {"FAKE_OWNER_REPO": "seerxo/os", "FAKE_BRANCH": "task/TASK-0070",
+    common = {"FAKE_OWNER_REPO": "seerxo/seerxo-os", "FAKE_BRANCH": "task/TASK-0070",
               "FAKE_IS_STAGE_C": "1", "FAKE_SSH_FAIL_COMPLETE_ONCE": "1",
               "MERGE_PR_DELETE_BRANCH": "0"}
     first = run(env, common)
@@ -569,9 +569,9 @@ def test_merge_is_refused_on_an_empty_confirmation(env):
     assert not any(c[:2] == ["pr", "merge"] for c in calls(env))
 
 
-# The checked-in policy since the move to Seerxo/os: both Actions workflows are the CI evidence, no statuses.
+# The checked-in policy since the move to Seerxo/seerxo-os: both Actions workflows are the CI evidence, no statuses.
 PYTHON_WORKFLOW = ".github/workflows/python-tests.yml"
-ACTIONS_POLICY = ('branches:\n  seerxo/os: main\nworkflows:\n  - ".github/workflows/frontend.yml"\n'
+ACTIONS_POLICY = ('branches:\n  seerxo/seerxo-os: main\nworkflows:\n  - ".github/workflows/frontend.yml"\n'
                   '  - ".github/workflows/python-tests.yml"\nstatus_publisher:\n  login: "circleci-app[bot]"\n'
                   '  id: 127350680\nrequired_statuses: []\n')
 
@@ -634,8 +634,8 @@ def test_a_policy_with_neither_workflows_nor_statuses_refuses(env):
 
 
 def test_actions_policy_accepts_githubs_casing_of_the_head_repository(env):
-    """GitHub reports the run's head repository as "Seerxo/os"; the policy identity is lowercase."""
-    res = actions_merge(env, company_run(head_repo="Seerxo/os"), company_run(id=2, path=PYTHON_WORKFLOW, head_repo="Seerxo/os"))
+    """GitHub reports the run's head repository as "Seerxo/seerxo-os"; the policy identity is lowercase."""
+    res = actions_merge(env, company_run(head_repo="Seerxo/seerxo-os"), company_run(id=2, path=PYTHON_WORKFLOW, head_repo="Seerxo/seerxo-os"))
     assert res.returncode == 0, res.stderr
     assert len(merged(env)) == 1
 
@@ -646,8 +646,8 @@ def test_a_run_without_a_head_repository_is_not_evidence(env):
     assert not merged(env)
 
 
-FORK = "seerxo-agent/os"
-FORK_POLICY = ACTIONS_POLICY + f"publish_forks:\n  seerxo/os: {FORK}\n"
+FORK = "seerxo-agent/seerxo-os"
+FORK_POLICY = ACTIONS_POLICY + f"publish_forks:\n  seerxo/seerxo-os: {FORK}\n"
 
 
 def fork_runs(head_repo=FORK, head_branch="feat/example"):
@@ -659,8 +659,8 @@ STAGE_C_FORK_PR = {"FAKE_IS_STAGE_C": "1", "FAKE_BRANCH": "task/TASK-0070"}
 
 
 def test_b5_stage_c_pr_from_the_trusted_publish_fork_merges_through_merge_authorize(env):
-    res = actions_merge(env, *fork_runs("Seerxo-Agent/os", "task/TASK-0070"), policy=FORK_POLICY,
-                        FAKE_HEAD_REPO="Seerxo-Agent/os", **STAGE_C_FORK_PR)
+    res = actions_merge(env, *fork_runs("Seerxo-Agent/seerxo-os", "task/TASK-0070"), policy=FORK_POLICY,
+                        FAKE_HEAD_REPO="Seerxo-Agent/seerxo-os", **STAGE_C_FORK_PR)
     assert res.returncode == 0, res.stderr
     assert len(merged(env)) == 1
     ssh_calls = [json.loads(line) for line in Path(env["base"]["SSH_LOG"]).read_text().splitlines()]
@@ -717,19 +717,19 @@ def test_b5_founder_branch_prs_still_merge_when_a_fork_is_declared(env):
 
 
 def test_b5_a_second_or_self_publish_fork_makes_the_policy_untrusted(env):
-    for bad in (FORK_POLICY + "  seerxo/os: other/os\n", ACTIONS_POLICY + "publish_forks:\n  seerxo/os: seerxo/os\n"):
+    for bad in (FORK_POLICY + "  seerxo/seerxo-os: other/os\n", ACTIONS_POLICY + "publish_forks:\n  seerxo/seerxo-os: seerxo/seerxo-os\n"):
         res = actions_merge(env, policy=bad)
         assert res.returncode != 0 and "policy" in res.stderr
 
 
 @pytest.mark.parametrize("declaration", [
-    "publish_forks:\n  seerxo/os: Seerxo-Agent/os\n",
-    "publish_forks:\n  other/os: seerxo-agent/os\n",
-    "publish_forks: {seerxo/os: seerxo-agent/os}\n",
+    "publish_forks:\n  seerxo/seerxo-os: Seerxo-Agent/seerxo-os\n",
+    "publish_forks:\n  other/os: seerxo-agent/seerxo-os\n",
+    "publish_forks: {seerxo/seerxo-os: seerxo-agent/seerxo-os}\n",
     "publish_forks: false\n",
-    "publish_forks:\n  seerxo/os: seerxo-agent/os\npublish_forks:\n  seerxo/os: other/os\n",
-    "publish_forks:\n  seerxo/os: seerxo-agent/os\n  seerxo/os: Other/os\n",
-    "\"publish_forks\":\n  seerxo/os: seerxo-agent/os\n",
+    "publish_forks:\n  seerxo/seerxo-os: seerxo-agent/seerxo-os\npublish_forks:\n  seerxo/seerxo-os: other/os\n",
+    "publish_forks:\n  seerxo/seerxo-os: seerxo-agent/seerxo-os\n  seerxo/seerxo-os: Other/os\n",
+    "\"publish_forks\":\n  seerxo/seerxo-os: seerxo-agent/seerxo-os\n",
 ])
 def test_b5_present_malformed_fork_policy_never_falls_back_to_upstream(env, declaration):
     result = actions_merge(env, policy=ACTIONS_POLICY + declaration)

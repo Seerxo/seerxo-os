@@ -98,7 +98,7 @@ def test_issued_authorization_is_bound_audited_and_attributed_to_the_founder(hos
     stored, writer = row(host)
     assert writer == FOUNDER and stored["issued_by"] == FOUNDER and stored["action"] == "stage_c.code_write"
     assert (stored["task_key"], stored["source_sha"]) == ("TASK-0045", SHA)
-    assert stored["repository"] == "seerxo/os" and stored["consumed_at"] is None and value == stored
+    assert stored["repository"] == "seerxo/seerxo-os" and stored["consumed_at"] is None and value == stored
     assert audits(host) == ["stage-c.authorization.issue"]
 
 
