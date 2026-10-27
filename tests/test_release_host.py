@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from app import release_gateway as rg, release_host as host
-from tests.test_release_gateway import Production, configs, images
+from tests.test_release_gateway import Production, configs, images, seed
 from tests.test_release_gateway_service import NOW, World, sh
 
 # World is a class, never None: the old `World is None` guard never skipped, so the Stage C checks image (no
@@ -55,8 +55,8 @@ def hw(tmp_path, monkeypatch):
                "Dockerfile": "\n", "docker-compose.yml": "\n", "docs/PERMANENT_FACTS.md": "\n"}
     w.base = w.commit("driver", **shipped)
     w.push()
-    w.cfg.ledger.write_text(json.dumps({"last_sha": w.base, "last_sequence": 6, "seen": [], "min_policy_version": 1,
-                                        "images": images(w.base), "configs": configs()}))
+    seed(w.cfg.ledger, {"last_sha": w.base, "last_sequence": 6, "seen": [], "min_policy_version": 1,
+                        "images": images(w.base), "configs": configs()})
     w.report(w.base)
     w.prod = Production(w.base)
     host_clone = tmp_path / "host-clone"
@@ -251,6 +251,7 @@ def test_a_driver_that_exits_0_but_did_not_switch_production_leaves_the_host_pen
 def test_founder_bootstrap_and_recovery_commands_on_the_host(hw, tmp_path):
     from tests.test_release_gateway import HOST
     hw.hcfg.ledger.unlink()
+    rg.history_path(hw.hcfg.ledger).unlink()                                # a new host: neither ledger nor history
     assert step(hw)["outcome"] == "BLOCKED"                                    # no baseline: nothing at all
     praw = hw.hcfg.policy.read_bytes()
     st = {"kind": "bootstrap", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "cd" * 16,
@@ -1253,6 +1254,10 @@ def test_the_driver_is_handed_exactly_the_staged_directory_the_ledger_marks_pend
     assert "pending_approver" not in json.loads(hw.cfg.ledger.read_text())
 
 
+def git_show(clone, sha, path):
+    return sh(clone, "git", "show", f"{sha}:{path}") + "\n"
+
+
 def _running_release(hw):
     """Apply one gateway release so the ledger history records the running payload (as in production)."""
     sha, _ = signed_docs_release(hw)
@@ -1271,6 +1276,7 @@ def _public_copy(hw, tmp_path, running):
     sh(work, "tar", "-xf", str(tmp_path / "base.tar"))
     (work / "docs/HANDOFF.md").unlink()                                   # private document: stays only in the old repo
     (work / "skills/x/SKILL.md").write_text("sanitized\n")               # a shipped file the public copy changed
+    (work / "docs/PERMANENT_FACTS.md").write_text("## FACT-0000 example\n")   # the public template, not the facts
     sh(work, "git", "add", "-A")
     sh(work, "git", "commit", "-qm", "Initial public release")
     sh(tmp_path, "git", "clone", "-q", "--bare", str(work), str(origin))
@@ -1342,7 +1348,8 @@ def test_the_host_rebases_onto_a_different_history_and_the_founder_releases_the_
     assert draft["parent_sha"] == base and draft["repository"] == "seerxo/seerxo-os"
     # Reviewed and listed: everything that changes in PRODUCTION, from what runs, payload only. The shipped file the
     # public copy changed is there although base..sha does not touch it; documents (never shipped) are not.
-    assert draft["changed_paths"] == ["skills/x/SKILL.md"]
+    assert draft["changed_paths"] == ["docs/PERMANENT_FACTS.md", "skills/x/SKILL.md"]
+    assert git_show(work, sha, "docs/PERMANENT_FACTS.md") == "## FACT-0000 example\n"   # the release ships the template
     _founder_inbox(hw, draft | {"approver": "founder"}, name=sha)
     hw.hcfg = new
     out = step(hw)

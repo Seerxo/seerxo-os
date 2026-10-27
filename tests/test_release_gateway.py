@@ -113,6 +113,16 @@ class Production:
 STATE = {"last_sequence": 6, "last_sha": PARENT, "seen": [], "images": images(PARENT), "configs": configs()}
 
 
+def seed(ledger: Path, state: dict) -> None:
+    """A ledger with the history it would have on a real host: one baseline event that agrees on what runs and on
+    the floors (the host refuses a ledger without history, or one that disagrees with it)."""
+    ledger.write_text(json.dumps(state))
+    rg.history_path(ledger).write_bytes(rg.canonical({
+        "event": "bootstrap", "sha": state.get("last_sha"), "sequence": state.get("last_sequence", 0),
+        "policy_version": state.get("min_policy_version", 1), "images": state.get("images"),
+        "configs": state.get("configs"), "at": NOW.isoformat()}) + b"\n")
+
+
 def transact(keys, ledger, m, signer="gateway", *, policy_over=None, min_version=None, apply=lambda m: None,
              host=None, prod=None):
     raw = rg.canonical(m)
@@ -147,7 +157,7 @@ def test_a_low_risk_release_signed_by_the_gateway_is_accepted_and_recorded(keys,
     rg.gateway_approve(m, policy, now=NOW, diff=DIFF)
     assert release(keys, policy, m)["sha"] == SHA
     ledger, applied = tmp_path / "ledger.json", []
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     transact(keys, ledger, m, apply=applied.append)
     state = json.loads(ledger.read_text())
     assert applied == [m] and "pending" not in state
@@ -165,7 +175,7 @@ def test_a_high_risk_or_migration_release_signed_by_the_founder_is_accepted(keys
 def test_replaying_an_applied_manifest_is_refused(keys, policy, tmp_path):
     m = manifest()
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     transact(keys, ledger, m)
     state = json.loads(ledger.read_text()) | {"last_sha": PARENT, "last_sequence": 6}   # even if sequence is reset
     refused("replay", release, keys, policy, m, state=state)
@@ -391,7 +401,7 @@ def test_without_a_bootstrapped_baseline_nothing_is_released_not_even_by_the_fou
 
 def test_deleting_the_ledger_does_not_reopen_automatic_release(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     transact(keys, ledger, manifest())
     ledger.unlink()
     refused("not bootstrapped", transact, keys, ledger, manifest(sequence=8, parent_sha=SHA))
@@ -407,7 +417,7 @@ def test_an_unreadable_ledger_refuses_everything(keys, tmp_path):
 
 def test_a_crash_or_failure_during_apply_fails_closed(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
 
     def boom(m):
         raise RuntimeError("deploy driver died")
@@ -421,7 +431,7 @@ def test_a_crash_or_failure_during_apply_fails_closed(keys, tmp_path):
 
 def test_an_older_founder_signed_policy_cannot_be_replayed(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     transact(keys, ledger, manifest(policy_version=2), policy_over={"version": 2})
     assert json.loads(ledger.read_text())["min_policy_version"] == 2
     refused("older than the newest", transact, keys, ledger, manifest(sequence=8, parent_sha=SHA))
@@ -429,7 +439,7 @@ def test_an_older_founder_signed_policy_cannot_be_replayed(keys, tmp_path):
 
 def test_the_transaction_holds_one_lock_for_verify_apply_and_record(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     seen = []
 
     def apply(m):
@@ -483,7 +493,7 @@ def test_a_reviewer_key_cannot_be_the_founder_or_gateway_key(keys, who):
 
 def bootstrapped(tmp_path, sha=PARENT):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps({**STATE, "last_sha": sha, "images": images(sha)}))
+    seed(ledger, {**STATE, "last_sha": sha, "images": images(sha)})
     return ledger
 
 
@@ -500,7 +510,7 @@ def test_production_that_is_not_exactly_the_recorded_release_blocks_everything(k
     before = ledger.read_text()
     refused("BLOCKED", transact, keys, ledger, manifest(), prod=prod)
     refused("BLOCKED", transact, keys, ledger, manifest(approver="founder"), "founder", prod=prod)
-    assert ledger.read_text() == before and not rg.read_history(ledger)        # nothing written, not even pending
+    assert ledger.read_text() == before and [e["event"] for e in rg.read_history(ledger)] == ["bootstrap"]   # nothing written
 
 
 def test_a_ledger_without_recorded_image_identity_blocks(keys, tmp_path):
@@ -520,7 +530,7 @@ def test_production_must_run_exactly_the_release_after_apply_or_the_ledger_stays
                                keys["gateway"][0], rg.NS_RELEASE), policy_bytes=signed_policy(keys)[0],
                                policy_sig=signed_policy(keys)[1], founder_key=keys["founder"][1],
                                host_facts=facts(), now=NOW, apply=half_deployed, observe=prod.observe)
-    assert json.loads(ledger.read_text())["pending"] and not rg.read_history(ledger)
+    assert json.loads(ledger.read_text())["pending"] and [e["event"] for e in rg.read_history(ledger)] == ["bootstrap"]
 
 
 def test_an_applied_release_records_the_new_image_identity(keys, tmp_path):
@@ -528,7 +538,7 @@ def test_an_applied_release_records_the_new_image_identity(keys, tmp_path):
     transact(keys, ledger, manifest(), prod=prod)
     state = json.loads(ledger.read_text())
     assert state["last_sha"] == SHA and state["images"] == images(SHA)
-    assert [e["event"] for e in rg.read_history(ledger)] == ["applied"]
+    assert [e["event"] for e in rg.read_history(ledger)] == ["bootstrap", "applied"]
 
 
 # --------------------------------------------------------------------------- founder bootstrap
@@ -831,7 +841,7 @@ def test_identity_needs_a_recorded_configuration_for_every_component(recorded):
 
 def test_the_same_image_with_another_configuration_is_blocked(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     prod = Production(PARENT)
     prod.running["worker"]["config"] = "f" * 64                     # e.g. recreated privileged or with docker.sock
     refused("BLOCKED: worker: container configuration", transact, keys, ledger, manifest(), prod=prod)
@@ -840,7 +850,7 @@ def test_the_same_image_with_another_configuration_is_blocked(keys, tmp_path):
 
 def test_the_configuration_after_apply_is_recorded_from_observation(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     transact(keys, ledger, manifest())
     state = json.loads(ledger.read_text())
     assert state["configs"] == configs() and rg.read_history(ledger)[-1]["configs"] == configs()
@@ -973,7 +983,7 @@ def test_reconcile_is_single_use_and_needs_a_pending_release(keys, tmp_path):
 @pytest.mark.parametrize("current_policy_version", [2, 3])
 def test_applied_reconcile_keeps_the_verified_pending_policy_floor(keys, tmp_path, current_policy_version):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps({**STATE, "min_policy_version": 1}))
+    seed(ledger, {**STATE, "min_policy_version": 1})
     prod = Production(PARENT)
     m = manifest(sequence=7, policy_version=2, approver="founder")
 
@@ -1062,7 +1072,7 @@ def test_a_held_lock_is_a_bounded_clean_refusal_with_nothing_written(keys, tmp_p
     import fcntl
     import time
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     before = ledger.read_text()
     with rg._locked(ledger):
         pass
@@ -1076,7 +1086,7 @@ def test_a_held_lock_is_a_bounded_clean_refusal_with_nothing_written(keys, tmp_p
     finally:
         os.close(holder)
     assert time.monotonic() - started < 5 and applied == [] and ledger.read_text() == before
-    assert not rg.history_path(ledger).exists()
+    assert [e["event"] for e in rg.read_history(ledger)] == ["bootstrap"]          # nothing appended
     assert rg.LOCK_TIMEOUT_S > 0                                        # production value is finite as well
 
 
@@ -1147,9 +1157,9 @@ def test_an_unreadable_history_refuses_a_rollback(keys, policy):
 
 def test_an_applied_release_records_its_payload_digest_for_later_rollbacks(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    ledger.write_text(json.dumps(STATE))
+    seed(ledger, STATE)
     transact(keys, ledger, manifest())
-    event, = rg.read_history(ledger)
+    _, event = rg.read_history(ledger)
     assert event["event"] == "applied" and event["sha"] == SHA and event["payload_digest"] == DIGEST
 
 
@@ -1359,3 +1369,61 @@ def test_a_ledger_behind_its_own_history_cannot_be_rebased(keys, tmp_path):
     history.write_bytes(b"".join(rg.canonical(e | {"policy_version": 5}) + b"\n" for e in events))   # e.g. an old copy
     ledger.write_text(json.dumps(state))                                                            # restored over it
     refused("behind its own history", do_rebase, keys, ledger, prod, rebase_statement(keys, ledger))
+
+
+def test_a_release_recorded_by_an_applied_reconcile_can_still_be_rebased(keys, tmp_path):
+    """The deploy succeeded but the record failed: the founder reconciles it as applied. Its verified payload digest
+    travels through `pending` into the reconcile event, so a later rebase can bind what runs."""
+    ledger, prod = applied_once(keys, tmp_path)
+    m = manifest(sequence=2, parent_sha=SHA, sha=OTHER, approver="founder")
+    m["evidence"]["trusted_checks"]["sha"] = OTHER
+    packet = rg.review_packet("seerxo/os", SHA, OTHER, DIFF, NONCE)
+    att = rg.attestation("codex", packet, {"verdict": "APPROVE", "fingerprint": packet["fingerprint"],
+                                           "findings": []}, NOW.isoformat())
+    m["evidence"]["review"] = {"nonce": NONCE, "attestation": att,
+                               "signature": rg.sign(rg.canonical(att), keys["reviewer"][0], rg.NS_REVIEW)}
+
+    def record_fails(manifest):
+        prod.deploy(manifest["sha"])
+        raise RuntimeError("the record failed after the switch")
+    with pytest.raises(RuntimeError):
+        transact(keys, ledger, m, "founder", prod=prod, apply=lambda x: record_fails(x),
+                 host=facts(sha=OTHER))
+    pending = json.loads(ledger.read_text())
+    assert pending["pending_payload_digest"] == DIGEST
+    praw, psig = signed_policy(keys)
+    body = {"kind": "reconcile", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "dd" * 16,
+            "pending_digest": pending["pending"], "outcome": "applied", "release_sha": OTHER,
+            "images": images(OTHER), "configs": configs(), "issued_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat()}
+    raw = rg.canonical(body)
+    rg.reconcile(ledger, raw, rg.sign(raw, keys["founder"][0], rg.NS_RECONCILE), founder_key=keys["founder"][1],
+                 policy_bytes=praw, policy_sig=psig, host_id=HOST, observe=prod.observe, now=NOW)
+    assert rg.read_history(ledger)[-1]["payload_digest"] == DIGEST
+    st = rebase_statement(keys, ledger, old_last_sha=OTHER, old_last_sequence=2, images=images(OTHER))
+    assert do_rebase(keys, ledger, prod, st)["chain_base"] == BASE
+
+
+@pytest.mark.parametrize("tamper, why", [
+    (lambda events: events[:-1], "differs from its history"),                       # history restored one step back
+    (lambda events: [], "history is missing"),                                      # history lost, ledger intact
+])
+def test_a_history_behind_its_ledger_blocks_every_release(keys, tmp_path, tamper, why):
+    ledger, prod = applied_once(keys, tmp_path)
+    events = rg.read_history(ledger)
+    rg.history_path(ledger).write_bytes(b"".join(rg.canonical(e) + b"\n" for e in tamper(events)))
+    refused(why, transact, keys, ledger, manifest(sequence=2, parent_sha=SHA, sha=OTHER), prod=prod,
+            host=facts(sha=OTHER))
+    refused(why, do_rebase, keys, ledger, prod, rebase_statement(keys, ledger))
+
+
+def test_a_history_restored_to_before_a_same_floor_recovery_blocks_releases(keys, tmp_path):
+    """A recovery keeps the sequence, policy floor and running SHA but appends its digest. Restoring the history to
+    the copy from before it must be noticed (else a later recovery from that history could replay the statement)."""
+    ledger, m, prod = lose_ledger_after_one_release(keys, tmp_path)
+    before_recovery = rg.history_path(ledger).read_bytes()
+    _, run = recovery(keys, ledger, prod)
+    run()
+    rg.history_path(ledger).write_bytes(before_recovery)
+    refused("lost digests", transact, keys, ledger, manifest(sequence=2, parent_sha=SHA, sha=OTHER), prod=prod,
+            host=facts(sha=OTHER))
