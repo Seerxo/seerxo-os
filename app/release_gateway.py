@@ -841,6 +841,30 @@ def _append_history(ledger: Path, event: dict) -> None:
         os.close(fd)
 
 
+MOVES = ("bootstrap", "applied", "recovery", "reconcile", "rebase")
+
+
+def history_problem(state: dict, history: list[dict]) -> str | None:
+    """Why the ledger disagrees with its own append-only history, or None. History is written first, so a crash or a
+    restored old ledger copy leaves the ledger BEHIND it: lower policy or sequence floor, a forgotten digest, or a
+    missing rebase. Any of these must stop every release (the founder recovers the ledger: move it aside, then a
+    founder-signed `recover` rebuilds it from history, including chain_base)."""
+    if not history:
+        return None
+    if state.get("min_policy_version", 1) < max(e.get("policy_version", 1) for e in history):
+        return "the ledger's policy floor is below its history"
+    if state.get("last_sequence", 0) < max(e.get("sequence", 0) for e in history):
+        return "the ledger's sequence floor is below its history"
+    seen = set(state.get("seen", []))
+    recent = [d for e in history[-1000:] for d in (e.get("digest"), e.get("pending_digest")) if isinstance(d, str)]
+    if len(state.get("seen", [])) < 1000 and not set(recent) <= seen:
+        return "the ledger has forgotten digests its history recorded"
+    moves = [e for e in history if e.get("event") in MOVES]
+    if moves and moves[-1].get("event") == "rebase" and state.get("chain_base") != moves[-1].get("base_sha"):
+        return "the history's last move is a rebase the ledger does not hold"
+    return None
+
+
 def release_transaction(ledger: Path, manifest_bytes: bytes, signature: str, *, policy_bytes: bytes,
                         policy_sig: str, founder_key: str, host_facts: dict, now: datetime, apply, observe,
                         release_dir: str | None = None) -> dict:
@@ -855,7 +879,8 @@ def release_transaction(ledger: Path, manifest_bytes: bytes, signature: str, *, 
         state = read_ledger(ledger)
         if not state.get("last_sha"):
             raise Refused("host is not bootstrapped: a founder-signed bootstrap must establish the production baseline")
-        problem = identity_problem(observe(), state["last_sha"], state.get("images"), state.get("configs"))
+        problem = identity_problem(observe(), state["last_sha"], state.get("images"), state.get("configs")) \
+            or history_problem(state, read_history(ledger))
         if problem:
             raise Refused(f"BLOCKED: {problem}")
         policy = load_policy(policy_bytes, policy_sig, founder_key, min_version=state.get("min_policy_version", 1))
@@ -1103,9 +1128,9 @@ def rebase(ledger: Path, statement: bytes, signature: str, *, founder_key: str, 
         problem = identity_problem(observe(), state["last_sha"], st["images"], st["configs"])
         if problem or (st["images"], st["configs"]) != (state.get("images"), state.get("configs")):
             raise Refused(f"production does not match the rebase statement: {problem or 'recorded identity differs'}")
-        if state.get("min_policy_version", 1) < max((e.get("policy_version", 1) for e in history), default=1) \
-                or state.get("last_sequence", 0) < max((e.get("sequence", 0) for e in history), default=0):
-            raise Refused("the ledger is behind its own history (policy or sequence floor): the founder must recover it")
+        behind = history_problem(state, history)
+        if behind:
+            raise Refused(f"the ledger is behind its own history ({behind}): the founder must recover it")
         recorded = [e.get("payload_digest") for e in history
                     if e.get("event") == "applied" and e.get("sha") == state["last_sha"]]
         if not recorded or not isinstance(recorded[-1], str) or st["old_payload_digest"] != recorded[-1]:

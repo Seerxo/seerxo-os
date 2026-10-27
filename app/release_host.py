@@ -342,7 +342,8 @@ def write_identity_report(cfg: Config, now: datetime, observed: dict) -> dict:
     production is exactly the ledger's release. The gateway cannot fix a mismatch; only the founder can."""
     try:
         ledger = rg.read_ledger(cfg.ledger)
-        problem = (rg.identity_problem(observed, ledger.get("last_sha"), ledger.get("images"), ledger.get("configs"))
+        problem = ((rg.identity_problem(observed, ledger.get("last_sha"), ledger.get("images"), ledger.get("configs"))
+                    or rg.history_problem(ledger, rg.read_history(cfg.ledger)))
                    if ledger.get("last_sha") else "host is not bootstrapped")
     except rg.Refused as error:
         ledger, problem = {}, str(error)
@@ -499,6 +500,10 @@ def rebase_provenance(cfg: Config, old: Config):
         except (OSError, subprocess.CalledProcessError) as error:
             raise RetryLater(f"fetch failed: {type(error).__name__}") from None
 
+        # The running commit comes from the current chain's own (trusted) clone into the new one, also when going
+        # back to a repository that never had it; it is then checked by object name and by recomputed payload.
+        subprocess.run(["git", "-C", str(cfg.clone), "fetch", "--no-tags", "--quiet", str(old.clone),
+                        f"+refs/remotes/origin/{old.branch}:refs/old/{old.branch}"], capture_output=True)
         on_branch = subprocess.run(["git", "-C", str(cfg.clone), "merge-base", "--is-ancestor", base_sha,
                                     f"refs/remotes/origin/{cfg.branch}"], capture_output=True).returncode == 0
         old_in_new = subprocess.run(["git", "-C", str(cfg.clone), "cat-file", "-e", f"{old_sha}^{{commit}}"],
