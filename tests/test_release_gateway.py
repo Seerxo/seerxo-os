@@ -1415,3 +1415,15 @@ def test_a_history_behind_its_ledger_blocks_every_release(keys, tmp_path, tamper
     refused(why, transact, keys, ledger, manifest(sequence=2, parent_sha=SHA, sha=OTHER), prod=prod,
             host=facts(sha=OTHER))
     refused(why, do_rebase, keys, ledger, prod, rebase_statement(keys, ledger))
+
+
+def test_a_history_restored_to_before_a_same_floor_recovery_blocks_releases(keys, tmp_path):
+    """A recovery keeps the sequence, policy floor and running SHA but appends its digest. Restoring the history to
+    the copy from before it must be noticed (else a later recovery from that history could replay the statement)."""
+    ledger, m, prod = lose_ledger_after_one_release(keys, tmp_path)
+    before_recovery = rg.history_path(ledger).read_bytes()
+    _, run = recovery(keys, ledger, prod)
+    run()
+    rg.history_path(ledger).write_bytes(before_recovery)
+    refused("lost digests", transact, keys, ledger, manifest(sequence=2, parent_sha=SHA, sha=OTHER), prod=prod,
+            host=facts(sha=OTHER))

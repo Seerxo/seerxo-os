@@ -858,9 +858,12 @@ def history_problem(state: dict, history: list[dict]) -> str | None:
     if state.get("last_sequence", 0) != max(e.get("sequence", 0) for e in history):
         return "the ledger's sequence floor differs from its history"
     seen = set(state.get("seen", []))
+    recorded = {d for e in history for d in (e.get("digest"), e.get("pending_digest")) if isinstance(d, str)}
     recent = [d for e in history[-1000:] for d in (e.get("digest"), e.get("pending_digest")) if isinstance(d, str)]
     if len(state.get("seen", [])) < 1000 and not set(recent) <= seen:
         return "the ledger has forgotten digests its history recorded"
+    if not seen <= recorded:          # a history restored behind its ledger at the same floors (e.g. before a recovery)
+        return "the history has lost digests the ledger recorded"
     moves = [e for e in history if e.get("event") in MOVES]
     if moves and moves[-1].get("sha") != state.get("last_sha"):
         return "the history's last recorded release differs from the ledger's"
