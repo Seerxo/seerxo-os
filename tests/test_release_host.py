@@ -1372,12 +1372,61 @@ def test_a_gateway_signature_cannot_ship_the_first_release_after_a_rebase(hw, tm
     assert json.loads(new.ledger.read_text())["chain_base"] == base
 
 
-def test_the_host_refuses_a_rebase_when_the_running_commit_is_not_in_the_new_clone(hw, tmp_path):
-    _, _, _, new, _, host_id = _rebase_setup(hw, tmp_path, fetch_old=False)
+def test_after_a_release_from_the_new_repository_the_founder_can_rebase_back(hw, tmp_path):
+    """Rollback of the repository move after the first new release: the old repository never had the commit that now
+    runs; the rebase brings it over from the current chain's clone and checks it by name and recorded payload."""
+    work, running, base, new, gateway, host_id = _rebase_setup(hw, tmp_path, fetch_old=False)
+    _rebase(hw, tmp_path, new, host_id)                                   # the host imports the running commit itself
+    (work / "docs/README.md").write_text("public\n")
+    sh(work, "git", "add", "-A")
+    sh(work, "git", "commit", "-qm", "first public release")
+    sh(work, "git", "push", "-q", "origin", "main")
+    sha = sh(work, "git", "rev-parse", "HEAD")
+    hw.cfg = gateway
+    sh(tmp_path, "git", "-C", str(tmp_path / "gateway-clone-new"), "fetch", "-q", str(hw.hcfg.clone),
+       "+refs/remotes/origin/main:refs/old/main")
+    assert hw.tick()["outcome"] == "FOUNDER_REQUIRED"
+    _founder_inbox(hw, _draft(hw) | {"approver": "founder"}, name=sha)
+    old_cfg, hw.hcfg = hw.hcfg, new
+    assert step(hw)["outcome"] == "APPLIED"
+
+    policy = json.loads(hw.cfg.policy.read_bytes()) | {"version": 3, "repository": "seerxo/os"}
+    praw = rg.canonical(policy)
+    (tmp_path / "policy-v3.json").write_bytes(praw)
+    (tmp_path / "policy-v3.sig").write_text(rg.sign(praw, hw.keys["founder"][0], rg.NS_POLICY))
+    back = host.Config({**{k: str(v) if isinstance(v, Path) else v for k, v in vars(old_cfg).items()},
+                        "inboxes": [str(p) for p in old_cfg.inboxes], "policy": str(tmp_path / "policy-v3.json"),
+                        "policy_sig": str(tmp_path / "policy-v3.sig")})
+    ledger = json.loads(new.ledger.read_text())
+    st = {"kind": "rebase", "host_id": host_id, "repository": "seerxo/os", "branch": "main", "nonce": "ab" * 16,
+          "old_repository": "seerxo/seerxo-os", "old_last_sha": sha, "old_last_sequence": ledger["last_sequence"],
+          "old_payload_digest": rg.payload_digest(rg.payload_listing(new.clone, sha)),
+          "history_sha256": hashlib.sha256(rg.history_path(new.ledger).read_bytes()).hexdigest(),
+          "base_sha": running, "policy_sha256": hashlib.sha256(praw).hexdigest(), "images": images(sha),
+          "configs": configs(), "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
+    raw = rg.canonical(st)
+    (tmp_path / "back.json").write_bytes(raw)
+    (tmp_path / "back.sig").write_text(rg.sign(raw, hw.keys["founder"][0], rg.NS_REBASE))
+    out = host.rebase_statement(back, new, tmp_path / "back.json", tmp_path / "back.sig", now=NOW,
+                                observe=hw.prod.observe, machine_id=host_id)
+    assert out == {"outcome": "REBASE_DONE", "last_sha": sha, "chain_base": running}
+    assert [e["event"] for e in rg.read_history(new.ledger)][-3:] == ["rebase", "applied", "rebase"]
+
+
+def test_a_ledger_left_behind_its_history_blocks_every_release(hw, tmp_path):
+    """A crash between the rebase's history event and its ledger write (or a restored old ledger copy) must not let a
+    gateway-signed release through: the host blocks and reports it, and the gateway prepares nothing."""
+    _, running, base, new, _, host_id = _rebase_setup(hw, tmp_path)
     before = hw.hcfg.ledger.read_text()
-    with pytest.raises(rg.Refused, match="not in the new clone"):
-        _rebase(hw, tmp_path, new, host_id)
-    assert hw.hcfg.ledger.read_text() == before
+    _rebase(hw, tmp_path, new, host_id)
+    hw.hcfg.ledger.write_text(before)                                    # the ledger write "did not happen"
+    hw.commit("docs again", **{"docs/HANDOFF.md": "newer\n"})
+    hw.push()
+    assert hw.tick()["outcome"] == "SIGNED"                              # a gateway-signed release from the old chain
+    out = step(hw)
+    assert out["outcome"] == "BLOCKED" and "history" in out["reason"], out
+    report = json.loads(hw.hcfg.identity_report.read_text())
+    assert report["ok"] is False and "history" in report["problem"]
 
 
 def test_the_host_refuses_a_rebase_when_the_old_clone_drifted_from_the_recorded_payload(hw, tmp_path):
