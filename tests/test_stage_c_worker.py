@@ -2057,7 +2057,35 @@ def test_malformed_history_does_not_abort_reconcile(monkeypatch):
     db.commit()
     monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: pytest.fail("polled GitHub"))
     assert stage_c_worker.reconcile(db) == [{"task": task.key, "outcome": "WAITING",
-                                             "reason": "evidence_unavailable"}]
+                                             "reason": "published_pr_identity_mismatch"}]
+
+
+def test_malformed_history_on_ready_repair_fails_closed_in_prepass(monkeypatch):
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    improvement = task.context["improvement"]
+    task.context = {**task.context, "improvement": {**improvement, "history": [*improvement["history"], None]}}
+    task.status = enums.TaskStatus.READY
+    db.commit()
+    monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: pytest.fail("polled GitHub"))
+    assert stage_c_worker.reconcile(db) == [{"task": task.key, "guard": "pr_identity_unverified"}]
+    assert stage_c_worker.published_guard(db, task) == "pr_identity_unverified"
+
+
+def test_legacy_pr_url_does_not_strand_post_merge_verification(monkeypatch):
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    improvement = task.context["improvement"]
+    history = [dict(row) for row in improvement["history"]]
+    history[-1] = {**history[-1], "evidence": {**history[-1]["evidence"],
+                                              "pr": "https://github.com/seerxo/os/pull/81"}}
+    task.context = {**task.context, "improvement": {**improvement, "stage": "VERIFYING", "history": history}}
+    db.commit()
+    steps = []
+    monkeypatch.setattr(stage_c_worker.stage_c_verify, "step",
+                        lambda db, task, facts: steps.append(task.key) or {"outcome": "WAITING"})
+    stage_c_worker.reconcile(db)
+    assert steps == [task.key]
 
 
 def test_current_public_pr_number_is_accepted():

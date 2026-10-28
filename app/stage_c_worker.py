@@ -507,9 +507,18 @@ def live_shas(db):
 
 
 def published_pr(task) -> dict | None:
-    """The evidence of the latest PR_OPEN publication, or None when the task never published."""
-    history = ((task.context or {}).get("improvement") or {}).get("history") or []
-    ev = next((h.get("evidence") or {} for h in reversed(history) if h.get("stage") == "PR_OPEN"), None)
+    """The evidence of the latest PR_OPEN publication, or None when the task never published.
+
+    Never raises: unreadable history fails closed as a publication whose PR cannot be identified, so
+    callers refuse it (pr_identity_unverified) instead of aborting a whole reconcile pass."""
+    ctx = task.context if isinstance(task.context, dict) else {}
+    imp = ctx.get("improvement") or {}
+    history = (imp.get("history") or []) if isinstance(imp, dict) else None
+    if not isinstance(history, list) or not all(isinstance(h, dict) for h in history):
+        return {"pr": None, "unreadable_history": True}
+    ev = next((h.get("evidence") for h in reversed(history) if h.get("stage") == "PR_OPEN"), None)
+    if ev is not None and not isinstance(ev, dict):
+        return {"pr": None, "unreadable_history": True}
     return ev if ev and ev.get("pr") else None
 
 
@@ -808,8 +817,10 @@ def reconcile(db):
         try:
             # A PR number is not a globally unique identity. Never reconcile old private-repo tasks
             # against a same-numbered PR in the new public repository after a cutover. Inside the
-            # try: malformed history must leave only this task waiting, not abort the pass.
-            if published_pr(task) is not None and published_pr_number(task) is None:
+            # try: malformed history must leave only this task waiting, not abort the pass. Only the
+            # PR-polling stages: MERGED/VERIFYING judge the merge commit, not the PR.
+            if (stage in ("PR_OPEN", "CI", "READY_TO_MERGE")
+                    and published_pr(task) is not None and published_pr_number(task) is None):
                 outcomes.append({"task": task.key, "outcome": "WAITING",
                                  "reason": "published_pr_identity_mismatch"})
                 db.commit()

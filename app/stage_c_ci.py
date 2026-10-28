@@ -42,7 +42,10 @@ AWAITING_APPROVAL = "action_required"
 
 def _evidence(task: models.Task, stage: str) -> dict:
     hist = ((task.context or {}).get("improvement") or {}).get("history", [])
-    return next((h.get("evidence") or {} for h in reversed(hist) if h["stage"] == stage), {})
+    # Malformed rows are skipped, never raised on: callers outside reconcile()'s per-task try use this.
+    ev = next((h.get("evidence") for h in reversed(hist if isinstance(hist, list) else [])
+               if isinstance(h, dict) and h.get("stage") == stage), None)
+    return ev if isinstance(ev, dict) else {}
 
 
 def merge_recovery_block(db: Session, task: models.Task):
