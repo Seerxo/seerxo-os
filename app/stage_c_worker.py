@@ -513,6 +513,21 @@ def published_pr(task) -> dict | None:
     return ev if ev and ev.get("pr") else None
 
 
+def published_pr_number(task) -> int | None:
+    """Resolve a PR only when its full URL names this deployment's upstream repository.
+
+    Public and private repositories can reuse PR numbers. Historical PR_OPEN evidence is retained,
+    but must never authorize or poll a different repository's PR after a source migration.
+    """
+    evidence = published_pr(task)
+    url = evidence.get("pr") if evidence else None
+    prefix = f"https://github.com/{REPOSITORY}/pull/"
+    if not isinstance(url, str) or not url.startswith(prefix):
+        return None
+    suffix = url[len(prefix):]
+    return int(suffix) if re.fullmatch(r"[1-9][0-9]*", suffix) else None
+
+
 REPAIR_STAGES = ("IMPLEMENTING", "TESTING", "INDEPENDENT_REVIEW")
 PR_CLOSED = "PR closed without merge"
 
@@ -581,7 +596,7 @@ def published_guard(db, task, expected=None) -> str | None:
     ev = published_pr(task)
     if ev is None:
         return None
-    number = stage_c_ci.pr_number(ev.get("pr"))
+    number = published_pr_number(task)
     if number is None:
         return "pr_identity_unverified"
     _, before = owner_state(db, task.id) if expected is None else (None, expected)
@@ -789,10 +804,16 @@ def reconcile(db):
         if stage not in ("PR_OPEN", "CI", "READY_TO_MERGE", "MERGED", "VERIFYING") or admission(db, task):
             db.commit()
             continue
+        # A PR number is not a globally unique identity. Never reconcile old private-repo tasks
+        # against a same-numbered PR in the new public repository after a cutover.
+        if published_pr(task) is not None and published_pr_number(task) is None:
+            outcomes.append({"task": task.key, "outcome": "WAITING",
+                             "reason": "published_pr_identity_mismatch"})
+            db.commit()
+            continue
         try:
             if stage in ("PR_OPEN", "CI", "READY_TO_MERGE"):
-                ev = stage_c_ci._evidence(task, "PR_OPEN")
-                number = stage_c_ci.pr_number(ev.get("pr"))
+                number = published_pr_number(task)
                 if number is None:
                     raise ValueError("missing PR identity")
                 publisher, contexts = repo_guardian_github.merge_statuses(policy)
