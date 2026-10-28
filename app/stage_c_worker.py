@@ -506,20 +506,13 @@ def live_shas(db):
     return runtime["api_sha"], runtime["worker_sha"]
 
 
+UNREADABLE_PUBLICATION = stage_c_ci.UNREADABLE_PUBLICATION
+
+
 def published_pr(task) -> dict | None:
     """The evidence of the latest PR_OPEN publication, or None when the task never published.
-
-    Never raises: unreadable history fails closed as a publication whose PR cannot be identified, so
-    callers refuse it (pr_identity_unverified) instead of aborting a whole reconcile pass."""
-    ctx = task.context if isinstance(task.context, dict) else {}
-    imp = ctx.get("improvement") or {}
-    history = (imp.get("history") or []) if isinstance(imp, dict) else None
-    if not isinstance(history, list) or not all(isinstance(h, dict) for h in history):
-        return {"pr": None, "unreadable_history": True}
-    ev = next((h.get("evidence") for h in reversed(history) if h.get("stage") == "PR_OPEN"), None)
-    if ev is not None and not isinstance(ev, dict):
-        return {"pr": None, "unreadable_history": True}
-    return ev if ev and ev.get("pr") else None
+    Fails closed on unreadable data (stage_c_ci.publication)."""
+    return stage_c_ci.publication(task)
 
 
 def published_pr_number(task) -> int | None:
@@ -548,7 +541,9 @@ def blocked_repair(db, task) -> bool:
     reconcile() keeps guarding its PR so a merge or close is never lost while it waits for the founder.
     An exact PR_FAILED with a valid publication receipt is excluded: _recover_publication owns it, so one task
     never has two owners. Without one, _recover_publication does nothing and this guard keeps the PR tracked."""
-    stage = ((task.context or {}).get("improvement") or {}).get("stage")
+    ctx = task.context if isinstance(task.context, dict) else {}
+    imp = ctx.get("improvement")
+    stage = imp.get("stage") if isinstance(imp, dict) else None  # unreadable: stays founder-owned BLOCKED
     error = task.error or ""
     return (task.status == enums.TaskStatus.BLOCKED and stage in REPAIR_STAGES and published_pr(task) is not None
             and not error.startswith((stage_c_ci.MERGE_NOT_RECORDED, PR_CLOSED))
