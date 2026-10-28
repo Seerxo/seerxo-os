@@ -2049,6 +2049,17 @@ def test_shared_pr_number_parser_rejects_oversized_numbers():
     assert stage_c_ci.pr_number("https://github.com/seerxo/seerxo-os/pull/81") == 81
 
 
+def test_malformed_history_does_not_abort_reconcile(monkeypatch):
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    improvement = task.context["improvement"]
+    task.context = {**task.context, "improvement": {**improvement, "history": [*improvement["history"], None]}}
+    db.commit()
+    monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: pytest.fail("polled GitHub"))
+    assert stage_c_worker.reconcile(db) == [{"task": task.key, "outcome": "WAITING",
+                                             "reason": "evidence_unavailable"}]
+
+
 def test_current_public_pr_number_is_accepted():
     db = _db()
     task = _published_task_for_merge_reconciliation(db)
