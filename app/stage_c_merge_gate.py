@@ -21,8 +21,11 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 def _task_for_pr_number(db, number: int) -> models.Task | None:
     matches = []
     for task in db.scalars(select(models.Task).where(models.Task.key.like("TASK-%"))):
-        published = stage_c_ci._evidence(task, "PR_OPEN")
-        if published.get("pr") == f"https://github.com/{REPOSITORY}/pull/{number}":
+        published = stage_c_ci.publication(task)
+        if published is not None and published.get("unreadable_history"):
+            # Fail closed: an unreadable publication could be this PR, so the gate cannot classify it.
+            raise ValueError(f"{task.key} has unreadable Stage C publication evidence")
+        if published is not None and published.get("pr") == f"https://github.com/{REPOSITORY}/pull/{number}":
             matches.append(task)
     if len(matches) > 1:
         raise ValueError("PR number is published by multiple Stage C tasks")

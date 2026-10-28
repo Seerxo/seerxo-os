@@ -2134,3 +2134,32 @@ def test_b3_old_repository_pr_is_refused_before_github_lookup(monkeypatch):
     out = stage_c_ci.ingest(db, task, {"state": "closed", "merged": False, "head_sha": "b" * 40},
                             repository=stage_c_worker.REPOSITORY, tracked_branch="main", required_statuses=())
     assert out["outcome"] == "WAITING" and task.status == enums.TaskStatus.REVIEW and task.context == before
+
+
+@pytest.mark.parametrize("stage", ["PR_OPEN", "CI", "READY_TO_MERGE", "MERGED", "VERIFYING"])
+@pytest.mark.parametrize("history", [None, []])
+def test_published_stage_without_history_is_unreadable(stage, history):
+    # A published stage with no PR_OPEN row cannot be "unpublished": it must never reach the coder.
+    imp = {"stage": stage} if history is None else {"stage": stage, "history": history}
+    task = SimpleNamespace(context={"improvement": imp})
+    assert stage_c_worker.published_pr(task) == {"pr": None, "unreadable_history": True}
+
+
+def test_merge_recovery_block_tolerates_a_malformed_envelope():
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    task.status, task.error = enums.TaskStatus.BLOCKED, stage_c_ci.MERGE_NOT_RECORDED + " x"
+    task.context = {"improvement": []}
+    db.commit()
+    assert stage_c_ci.merge_recovery_block(db, task) is None
+    stage_c_worker.reconcile(db)  # must not raise
+
+
+def test_merge_gate_refuses_to_classify_when_a_publication_is_unreadable():
+    from app import stage_c_merge_gate
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    task.context = {"improvement": {"stage": "CI", "history": [None]}}
+    db.commit()
+    with pytest.raises(ValueError, match="unreadable"):
+        stage_c_merge_gate.identify_pr(db, 81)

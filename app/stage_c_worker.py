@@ -506,33 +506,13 @@ def live_shas(db):
     return runtime["api_sha"], runtime["worker_sha"]
 
 
-UNREADABLE_PUBLICATION = {"pr": None, "unreadable_history": True}
+UNREADABLE_PUBLICATION = stage_c_ci.UNREADABLE_PUBLICATION
 
 
 def published_pr(task) -> dict | None:
     """The evidence of the latest PR_OPEN publication, or None when the task never published.
-
-    Never raises: an unreadable envelope or history, or a PR_OPEN row without a PR URL, fails closed as a
-    publication whose PR cannot be identified, so callers refuse it (pr_identity_unverified) instead of
-    treating the task as unpublished or aborting a whole reconcile pass."""
-    ctx = {} if task.context is None else task.context
-    if not isinstance(ctx, dict):
-        return dict(UNREADABLE_PUBLICATION)
-    imp = ctx.get("improvement")
-    if imp is None:
-        return None
-    history = imp.get("history") if isinstance(imp, dict) else None
-    if not isinstance(imp, dict) or (history is not None and not isinstance(history, list)):
-        return dict(UNREADABLE_PUBLICATION)
-    if not all(isinstance(h, dict) for h in history or []):
-        return dict(UNREADABLE_PUBLICATION)
-    rows = [h for h in history or [] if h.get("stage") == "PR_OPEN"]
-    if not rows:
-        return None
-    ev = rows[-1].get("evidence")
-    if not isinstance(ev, dict) or not isinstance(ev.get("pr"), str) or not ev["pr"]:
-        return dict(UNREADABLE_PUBLICATION)
-    return ev
+    Fails closed on unreadable data (stage_c_ci.publication)."""
+    return stage_c_ci.publication(task)
 
 
 def published_pr_number(task) -> int | None:

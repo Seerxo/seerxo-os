@@ -40,6 +40,37 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 AWAITING_APPROVAL = "action_required"
 
 
+UNREADABLE_PUBLICATION = {"pr": None, "unreadable_history": True}
+# Stages that exist only after a PR_OPEN publication was recorded.
+PUBLISHED_STAGES = ("PR_OPEN", "CI", "READY_TO_MERGE", "MERGED", "VERIFYING")
+
+
+def publication(task) -> dict | None:
+    """The evidence of the latest PR_OPEN publication, or None when the task never published.
+
+    Never raises. Fails closed: an unreadable envelope or history, a PR_OPEN row without a PR URL, or a
+    published stage with no PR_OPEN row is a publication whose PR cannot be identified, never "unpublished",
+    so callers refuse it instead of letting the task reach the coder or aborting a reconcile pass."""
+    ctx = {} if task.context is None else task.context
+    if not isinstance(ctx, dict):
+        return dict(UNREADABLE_PUBLICATION)
+    imp = ctx.get("improvement")
+    if imp is None:
+        return None
+    history = imp.get("history") if isinstance(imp, dict) else None
+    if not isinstance(imp, dict) or (history is not None and not isinstance(history, list)):
+        return dict(UNREADABLE_PUBLICATION)
+    if not all(isinstance(h, dict) for h in history or []):
+        return dict(UNREADABLE_PUBLICATION)
+    rows = [h for h in history or [] if h.get("stage") == "PR_OPEN"]
+    if not rows:
+        return dict(UNREADABLE_PUBLICATION) if imp.get("stage") in PUBLISHED_STAGES else None
+    ev = rows[-1].get("evidence")
+    if not isinstance(ev, dict) or not isinstance(ev.get("pr"), str) or not ev["pr"]:
+        return dict(UNREADABLE_PUBLICATION)
+    return ev
+
+
 def _evidence(task: models.Task, stage: str) -> dict:
     hist = ((task.context or {}).get("improvement") or {}).get("history", [])
     # Malformed rows are skipped, never raised on: callers outside reconcile()'s per-task try use this.
@@ -57,8 +88,9 @@ def merge_recovery_block(db: Session, task: models.Task):
     if (task.status != enums.TaskStatus.BLOCKED
             or not (task.error or "").startswith(MERGE_NOT_RECORDED)):
         return None
-    imp = (task.context or {}).get("improvement") or {}
-    stage = imp.get("stage")
+    ctx = task.context if isinstance(task.context, dict) else {}
+    imp = ctx.get("improvement")
+    stage = imp.get("stage") if isinstance(imp, dict) else None  # unreadable: stays founder-owned BLOCKED
     if stage not in ("PR_OPEN", "CI", "READY_TO_MERGE"):
         return None
     number = pr_number(_evidence(task, "PR_OPEN").get("pr"))
