@@ -64,7 +64,10 @@ def publication(task) -> dict | None:
         return dict(UNREADABLE_PUBLICATION)
     rows = [h for h in history or [] if h.get("stage") == "PR_OPEN"]
     if not rows:
-        return dict(UNREADABLE_PUBLICATION) if imp.get("stage") in PUBLISHED_STAGES else None
+        # A published stage needs its PR_OPEN row; any other stage with no history at all is corrupt,
+        # since stage_c.advance always records a history row.
+        corrupt = imp.get("stage") in PUBLISHED_STAGES or (imp.get("stage") is not None and not history)
+        return dict(UNREADABLE_PUBLICATION) if corrupt else None
     ev = rows[-1].get("evidence")
     if not isinstance(ev, dict) or not isinstance(ev.get("pr"), str) or not ev["pr"]:
         return dict(UNREADABLE_PUBLICATION)
@@ -268,8 +271,7 @@ def ingest(db: Session, task: models.Task, facts: dict, max_repairs: int = MAX_R
     if repository is not None and (number is None
                                    or published.get("pr") != f"https://github.com/{repository}/pull/{number}"):
         return {"outcome": "WAITING", "reason": "pr_identity_mismatch"}
-    if (facts.get("state") == "closed" and not facts.get("merged")
-            and facts.get("head_sha") is not None and facts.get("head_sha") != commit):
+    if facts.get("state") == "closed" and not facts.get("merged") and (not commit or facts.get("head_sha") != commit):
         return {"outcome": "WAITING", "reason": "closed_pr_head_mismatch"}
 
     if task.status == enums.TaskStatus.BLOCKED and not recovering:

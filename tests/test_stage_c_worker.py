@@ -2163,3 +2163,17 @@ def test_merge_gate_refuses_to_classify_when_a_publication_is_unreadable():
     db.commit()
     with pytest.raises(ValueError, match="unreadable"):
         stage_c_merge_gate.identify_pr(db, 81)
+
+
+def test_closed_pr_without_head_data_does_not_abandon():
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    before = task.context
+    out = stage_c_ci.ingest(db, task, {"state": "closed", "merged": False},
+                            repository=stage_c_worker.REPOSITORY, tracked_branch="main", required_statuses=())
+    assert out == {"outcome": "WAITING", "reason": "closed_pr_head_mismatch"} and task.context == before
+
+
+def test_repair_stage_without_history_is_unreadable():
+    task = SimpleNamespace(context={"improvement": {"stage": "IMPLEMENTING"}})
+    assert stage_c_worker.published_pr(task) == {"pr": None, "unreadable_history": True}
