@@ -21,7 +21,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from app import models, project_profiles, providers, repo_guardian_github, stage_c_credential_boundary, stage_c_worker
+from sqlalchemy import select
+
+from app import enums, models, project_profiles, providers, repo_guardian_github, stage_c_credential_boundary, stage_c_worker
 
 ACCEPTANCE_CHECKS = stage_c_worker.ACCEPTANCE_CHECKS
 WORKER_UID = 10001  # scripts/company-coder-launch: the only uid that owns the jobs tree
@@ -171,6 +173,25 @@ def evaluate(db, *, host: dict | None, health: dict | None, jobs: Path, flag: bo
             "profile registry does not match the supported Stage C writer")
     except Exception as error:
         add("project_profiles", "FAIL", f"{type(error).__name__}")
+
+    # B1: configuration alone cannot prove that the actual production Project row targets this
+    # repository. The worker looks up projects.repository for admission, so check that exact row
+    # without changing it. A stale private-repo identity must fail before unattended writes.
+    try:
+        projects = db.scalars(select(models.Project).where(
+            models.Project.key == "company-os").limit(2)).all()
+        if len(projects) != 1:
+            add("db_project_repository", "FAIL",
+                "company-os project is missing or ambiguous in the database")
+        else:
+            project = projects[0]
+            valid = (project.repository == stage_c_worker.REPOSITORY
+                     and project.status == enums.ProjectStatus.ACTIVE
+                     and project.business_unit_id is None)
+            add("db_project_repository", "PASS" if valid else "FAIL",
+                "company-os project must be active, have no business unit, and name the authorized public repository")
+    except Exception:
+        add("db_project_repository", "UNKNOWN", "database project identity could not be read")
 
     # Whose token the worker holds AND what it may do upstream. "Not the founder" alone is not enough: an agent
     # account later granted Write could merge (GitHub Free has no branch protection), so readiness also needs
