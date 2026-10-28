@@ -20,11 +20,13 @@ environment and are never logged. The client address is the TCP peer: uvicorn ru
 --no-proxy-headers, so X-Forwarded-For cannot impersonate loopback.
 """
 import hmac
+import ipaddress
 import logging
 import os
 import re
 
 from fastapi.responses import JSONResponse
+from starlette._utils import get_route_path  # private, but the exact function the router dispatches on
 
 from app import approval_identity, cloudflare_access, metric_sources
 
@@ -58,6 +60,31 @@ SCOPES = {"desk": DESK, "youtube": YOUTUBE}
 TOKENS = {"admin": "COMPANY_API_TOKEN_ADMIN", "desk": "COMPANY_API_TOKEN_DESK",
           "youtube": "COMPANY_API_TOKEN_YOUTUBE"}
 LOOPBACK = {"127.0.0.1", "::1"}
+# A Host header is a hostname or [IPv6] literal with an optional port, nothing else. Starlette builds
+# request.url from it, so "api:8000/health?x=" once made url.path differ from the routed path
+# (GHSA-86qp-5c8j-p5mr) and "x@desk.host" can fake url.hostname (GHSA-jp82-jpqv-5vv3).
+HOST_HEADER = re.compile(r"(?:\[([0-9A-Fa-f:.]+)\]|([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?))((?::[0-9]{1,5})?)")
+
+
+def _host(header: str | None) -> tuple[bool, str]:
+    """(valid, DNS name or ''). An absent Host (HTTP/1.0) is valid; a present one must be a name or IP."""
+    if header is None:
+        return True, ""
+    m = HOST_HEADER.fullmatch(header)
+    if not m or int(m.group(3)[1:] or 0) > 65535:
+        return False, ""
+    if m.group(1) is not None:
+        try:
+            ipaddress.IPv6Address(m.group(1))
+        except ValueError:
+            return False, ""
+        return True, ""
+    return True, _dns_name(m.group(2))
+
+
+def _dns_name(name: str) -> str:
+    """One spelling per DNS name: case-insensitive, and `desk.example.com.` is `desk.example.com`."""
+    return name.strip().lower().removesuffix(".")
 # What each token may write to /metrics/observations comes from app/metric_sources.py. A
 # route scope alone would let a leaked youtube token report Seerxo revenue or signups, which
 # goal progress and the business reconciler then act on. Trusted host callers (local, host,
@@ -128,10 +155,15 @@ def allowed(who: str, method: str, path: str) -> bool:
 
 
 async def middleware(request, call_next):
-    method, path = request.method, request.url.path
+    # Authorize the path the router dispatches (scope path minus root_path), never request.url, which is
+    # rebuilt from the Host header, whatever the Starlette version. A malformed Host is refused outright.
+    method, path = request.method, get_route_path(request.scope)
+    valid_host, host = _host(request.headers.get("host"))
+    if not valid_host:
+        return JSONResponse({"detail": "bad request"}, status_code=400)
     assertion = request.headers.get("cf-access-jwt-assertion")
-    desk_host = os.environ.get("CF_ACCESS_DESK_HOST", "")
-    is_desk_host = bool(desk_host and request.url.hostname == desk_host)
+    desk_host = _dns_name(os.environ.get("CF_ACCESS_DESK_HOST", ""))
+    is_desk_host = bool(desk_host and host == desk_host)
     authorization = request.headers.get("authorization")
     # The separate API hostname may add a service assertion to existing bearer
     # callers. They keep their own scopes; none can bypass founder verification on

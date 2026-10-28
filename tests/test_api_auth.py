@@ -202,3 +202,70 @@ def test_allowed_metrics_still_reach_the_writer(monkeypatch, mode, caller, unit,
         assert r.status_code == 201 and r.json() == {"inserted": 1}
     finally:
         main.app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("method, path, host, auth", [
+    # GHSA-86qp-5c8j-p5mr: Starlette < 1.0.1 rebuilt url.path from the Host header, so the middleware saw a
+    # PUBLIC path while the router dispatched a private one. Break caught: any network neighbour reads the Desk.
+    ("GET", "/desk/state", "testserver/health?x=", None),
+    ("GET", "/desk/state", "testserver:8000/?x=", None),
+    ("GET", "/desk/state", "testserver/sw.js#", None),
+    # ...or a youtube token reaches a route outside its scope by naming one of its own in Host.
+    ("POST", "/approvals/APR-1", "testserver/webhooks/youtube-auto?x=", "y"),
+    ("POST", "/control/agents", "testserver/metrics/observations#", "y"),
+])
+def test_a_crafted_host_header_cannot_change_the_authorized_path(monkeypatch, method, path, host, auth):
+    from app import approval_identity
+    monkeypatch.setattr(approval_identity, "founder", lambda email: pytest.fail("reached Access"))
+    c = _client(monkeypatch, "enforce")
+    headers = {"host": host, **({"authorization": "Bearer " + auth * 40} if auth else {})}
+    r = c.request(method, path, json={}, headers=headers)
+    assert r.status_code in (400, 401, 403), (r.status_code, r.text)
+
+
+@pytest.mark.parametrize("host", ["evil@desk.example.com", "desk.example.com/x", "a b", "desk.example.com:80:80",
+                                  "desk.example.com:99999", "desk.example.com:", "desk.example.com..",
+                                  "[::::]", "[desk.example.com]", "", ".desk.example.com"])
+def test_a_malformed_host_header_is_refused(monkeypatch, host):
+    # GHSA-jp82-jpqv-5vv3 class: the Desk-host decision must not come from a Host that is not a hostname.
+    monkeypatch.setenv("CF_ACCESS_DESK_HOST", "desk.example.com")
+    r = _client(monkeypatch, "enforce").get("/", headers={"host": host})
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.parametrize("host", ["testserver", "testserver:8000", "API:8000", "company-api:8000", "testserver.",
+                                  "127.0.0.1:8099", "[::1]:8099"])
+def test_ordinary_host_headers_still_work(monkeypatch, host):
+    assert _client(monkeypatch, "enforce").get("/", headers={"host": host}).status_code == 200
+
+
+def test_the_desk_host_is_matched_on_the_host_header_without_its_port(monkeypatch):
+    # Break caught: dropping url.hostname lets a Desk-host request skip founder verification.
+    monkeypatch.setenv("CF_ACCESS_DESK_HOST", "desk.example.com")
+    c = _client(monkeypatch, "enforce")
+    # A trailing dot is the same DNS name (Codex review): a Desk token must not skip Access through it.
+    for host in ("desk.example.com", "DESK.example.com:443", "desk.example.com.", "desk.example.com.:443"):
+        for token in ("a", "d"):
+            r = c.get("/desk/state", headers={"host": host, "authorization": "Bearer " + token * 40})
+            assert r.status_code == 401 and r.json()["detail"] == "founder authentication required", (host, token)
+
+
+def test_scopes_follow_the_routed_path_under_a_root_path(monkeypatch):
+    # A deployment behind a path prefix (uvicorn --root-path): the router strips root_path, so must the check.
+    # Break caught: matching the raw scope path refuses every public route, or a prefix smuggles a private one.
+    for k, v in TOK.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("API_AUTH_MODE", "enforce")
+    c = TestClient(main.app, root_path="/api", client=("172.18.0.5", 50000))
+    assert c.get("/api/").status_code == 200
+    assert c.get("/api/sw.js").status_code == 200
+    assert c.get("/api/desk/state").status_code == 401
+    # ...and a scoped caller still reaches a private route under the prefix (past the middleware: no 401/403;
+    # the handler then fails on the stub database, which is fine here).
+    main.app.dependency_overrides[main.get_db] = lambda: None
+    try:
+        r = TestClient(main.app, root_path="/api", client=("172.18.0.5", 50000), raise_server_exceptions=False).get(
+            "/api/desk/state", headers={"authorization": "Bearer " + "d" * 40})
+    finally:
+        main.app.dependency_overrides.pop(main.get_db, None)
+    assert r.status_code not in (400, 401, 403, 404), r.text
