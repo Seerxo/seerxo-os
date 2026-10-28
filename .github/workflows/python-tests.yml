@@ -86,6 +86,9 @@ jobs:
             tests/test_deploy_interlock.py \
             tests/test_stage_c_merge_gate_postgres.py
           # The crash-recovery suites give every test its own PostgreSQL schema, so they run in parallel.
-          python -u -m pytest -vv -n 4 -o faulthandler_timeout=60 --durations=20 \
+          # No faulthandler_timeout here: its periodic all-thread traceback dump races CPython 3.12 and
+          # segfaulted an xdist worker in these long tests (SIGSEGV in _Py_DumpTracebackThreads; seen on
+          # GitHub and the CI host). The job timeout still bounds a real hang.
+          python -u -m pytest -vv -n 4 --durations=20 \
             tests/test_stage_c_crash_recovery_postgres.py \
             tests/test_worker_crash_recovery_postgres.py
