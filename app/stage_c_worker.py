@@ -525,7 +525,8 @@ def published_pr_number(task) -> int | None:
     if not isinstance(url, str) or not url.startswith(prefix):
         return None
     suffix = url[len(prefix):]
-    return int(suffix) if re.fullmatch(r"[1-9][0-9]*", suffix) else None
+    # Bounded: int() refuses very long digit strings, and one malformed row must not abort reconcile().
+    return int(suffix) if re.fullmatch(r"[1-9][0-9]{0,9}", suffix) else None
 
 
 REPAIR_STAGES = ("IMPLEMENTING", "TESTING", "INDEPENDENT_REVIEW")

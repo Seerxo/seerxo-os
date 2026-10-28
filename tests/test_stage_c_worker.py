@@ -1995,6 +1995,7 @@ def test_b5_worker_publishes_to_the_configured_fork_and_opens_the_pr_from_it(mon
     "https://github.com/seerxo/seerxo-os/pull/81?unexpected=1",
     "https://github.com/seerxo/seerxo-os/pull/0",
     "https://github.com/seerxo/seerxo-os/pull/abc",
+    "https://github.com/seerxo/seerxo-os/pull/" + "9" * 5000,
 ])
 def test_published_pr_identity_rejects_other_repositories_and_malformed_urls(url):
     db = _db()
@@ -2023,6 +2024,23 @@ def test_old_private_pr_is_not_polled_against_new_public_repo(monkeypatch):
     assert result == [{"task": task.key, "outcome": "WAITING",
                        "reason": "published_pr_identity_mismatch"}]
     assert task.status == enums.TaskStatus.REVIEW
+
+
+def test_oversized_pr_number_does_not_abort_reconcile(monkeypatch):
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    improvement = task.context["improvement"]
+    history = [dict(row) for row in improvement["history"]]
+    history[-1] = {**history[-1], "evidence": {**history[-1]["evidence"],
+                                              "pr": "https://github.com/seerxo/seerxo-os/pull/" + "9" * 5000}}
+    task.context = {**task.context, "improvement": {**improvement, "history": history}}
+    db.commit()
+    calls = []
+    monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: calls.append(1))
+    result = stage_c_worker.reconcile(db)
+    assert calls == []
+    assert result == [{"task": task.key, "outcome": "WAITING",
+                       "reason": "published_pr_identity_mismatch"}]
 
 
 def test_current_public_pr_number_is_accepted():
