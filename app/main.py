@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from sqlalchemy import func, select
+from starlette._utils import get_route_path
 from sqlalchemy.orm import Session
 
 from app import (api_auth, approval_identity, audit, keys, context_builder, control, desk as desk_read, desk_stream, dispatch, enums, goals,
@@ -122,7 +123,7 @@ def desk() -> HTMLResponse:
 @app.get("/icons/{icon}", include_in_schema=False)
 def pwa_asset(request: Request) -> FileResponse:
     """A fixed allowlist keeps service-worker scope at / without exposing other files."""
-    asset_path = request.url.path.lstrip("/")
+    asset_path = get_route_path(request.scope).lstrip("/")  # the routed path, not one rebuilt from Host
     media_type = _PWA_ASSETS.get(asset_path)
     if not media_type:
         raise HTTPException(404)
