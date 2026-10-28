@@ -28,6 +28,10 @@ def world(tmp_path, db=None, **over):
     jobs = tmp_path / "jobs"
     (jobs / ".control/sez-company.git").mkdir(parents=True)
     db = db or _db()
+    # Real Stage C readiness must include the actual DB project identity, not policy alone.
+    if not db.query(models.Project).filter_by(key="company-os").first():
+        db.add(models.Project(key="company-os", name="Company OS", repository="seerxo/seerxo-os",
+                              status=pf.enums.ProjectStatus.ACTIVE))
     db.add(models.ControlState(key="stage-c-host-acceptance", updated_by="founder",
                                value={"source_sha": SHA, "checks": CHECKS}))
     db.commit()
@@ -600,3 +604,35 @@ def test_host_facts_report_whether_the_coder_network_is_really_internal(tmp_path
     cfg.write_text(json.dumps(LAUNCHER_CFG))
     facts = host_facts.collect(runner({"docker network inspect": answer}), config=cfg, claude_env=tmp_path / "x")
     assert facts["launcher_config_ok"] is expected
+
+
+@pytest.mark.parametrize("repository,status,unit_id,expected", [
+    ("seerxo/seerxo-os", pf.enums.ProjectStatus.ACTIVE, None, "PASS"),
+    ("seerxo/os", pf.enums.ProjectStatus.ACTIVE, None, "FAIL"),
+    ("seerxo/seerxo-os", pf.enums.ProjectStatus.PAUSED, None, "FAIL"),
+    ("seerxo/seerxo-os", pf.enums.ProjectStatus.ACTIVE, 101, "FAIL"),
+])
+def test_preflight_checks_real_database_project_identity(tmp_path, repository, status, unit_id, expected):
+    args = world(tmp_path)
+    project = args["db"].query(models.Project).filter_by(key="company-os").one()
+    project.repository = repository
+    project.status = status
+    project.business_unit_id = unit_id
+    args["db"].commit()
+    report = pf.evaluate(**args)
+    assert status_check(report, "db_project_repository") == expected
+    assert report["ready"] is (expected == "PASS")
+
+
+def status_check(report, name):
+    return next(c["status"] for c in report["checks"] if c["name"] == name)
+
+
+def test_preflight_missing_project_stays_blocked_without_db_mutation(tmp_path):
+    args = world(tmp_path)
+    args["db"].query(models.Project).filter_by(key="company-os").delete()
+    args["db"].commit()
+    report = pf.evaluate(**args)
+    assert status_check(report, "db_project_repository") == "FAIL"
+    assert report["ready"] is False
+    assert args["db"].query(models.Project).filter_by(key="company-os").count() == 0
