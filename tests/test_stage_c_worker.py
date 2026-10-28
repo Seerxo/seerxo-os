@@ -1986,3 +1986,46 @@ def test_b5_worker_publishes_to_the_configured_fork_and_opens_the_pr_from_it(mon
     assert seen == [("https://github.com/seerxo-agent/seerxo-os.git", "seerxo/seerxo-os")], out   # lease stays on upstream
     assert openers == [("seerxo/seerxo-os", "main", "seerxo-agent/seerxo-os")] * 2
     assert task.context["improvement"]["stage"] == "PR_OPEN"
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/seerxo/os/pull/81",
+    "https://github.com/attacker/seerxo-os/pull/81",
+    "https://github.com/seerxo/seerxo-os/pull/81/extra",
+    "https://github.com/seerxo/seerxo-os/pull/81?unexpected=1",
+    "https://github.com/seerxo/seerxo-os/pull/0",
+    "https://github.com/seerxo/seerxo-os/pull/abc",
+])
+def test_published_pr_identity_rejects_other_repositories_and_malformed_urls(url):
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    improvement = task.context["improvement"]
+    history = [dict(row) for row in improvement["history"]]
+    history[-1] = {**history[-1], "evidence": {**history[-1]["evidence"], "pr": url}}
+    task.context = {**task.context, "improvement": {**improvement, "history": history}}
+    db.commit()
+    assert stage_c_worker.published_pr_number(task) is None
+
+
+def test_old_private_pr_is_not_polled_against_new_public_repo(monkeypatch):
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    improvement = task.context["improvement"]
+    history = [dict(row) for row in improvement["history"]]
+    history[-1] = {**history[-1], "evidence": {**history[-1]["evidence"],
+                                              "pr": "https://github.com/seerxo/os/pull/81"}}
+    task.context = {**task.context, "improvement": {**improvement, "history": history}}
+    db.commit()
+    calls = []
+    monkeypatch.setattr(stage_c_ci, "gh_facts", lambda *a, **k: calls.append(1))
+    result = stage_c_worker.reconcile(db)
+    assert calls == []
+    assert result == [{"task": task.key, "outcome": "WAITING",
+                       "reason": "published_pr_identity_mismatch"}]
+    assert task.status == enums.TaskStatus.REVIEW
+
+
+def test_current_public_pr_number_is_accepted():
+    db = _db()
+    task = _published_task_for_merge_reconciliation(db)
+    assert stage_c_worker.published_pr_number(task) == 81
