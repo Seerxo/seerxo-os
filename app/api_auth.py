@@ -66,6 +66,15 @@ LOOPBACK = {"127.0.0.1", "::1"}
 HOST_HEADER = re.compile(r"(?:\[([0-9A-Fa-f:.]+)\]|([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?))((?::[0-9]{1,5})?)")
 
 
+def _host_header(scope) -> tuple[bool, str | None]:
+    """(valid, the one Host value). HTTP/1.1 requires exactly one Host field (RFC 9112 3.2); only HTTP/1.0
+    may omit it. Read from the raw ASGI headers: a dict-style lookup would silently pick one duplicate."""
+    values = [v for k, v in scope.get("headers", ()) if k.lower() == b"host"]
+    if len(values) > 1 or (not values and scope.get("http_version") != "1.0"):
+        return False, None
+    return True, values[0].decode("latin-1") if values else None
+
+
 def _host(header: str | None) -> tuple[bool, str]:
     """(valid, DNS name or ''). An absent Host (HTTP/1.0) is valid; a present one must be a name or IP."""
     if header is None:
@@ -158,7 +167,8 @@ async def middleware(request, call_next):
     # Authorize the path the router dispatches (scope path minus root_path), never request.url, which is
     # rebuilt from the Host header, whatever the Starlette version. A malformed Host is refused outright.
     method, path = request.method, get_route_path(request.scope)
-    valid_host, host = _host(request.headers.get("host"))
+    one_host, header = _host_header(request.scope)
+    valid_host, host = _host(header) if one_host else (False, "")
     if not valid_host:
         return JSONResponse({"detail": "bad request"}, status_code=400)
     assertion = request.headers.get("cf-access-jwt-assertion")

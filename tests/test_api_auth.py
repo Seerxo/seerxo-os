@@ -269,3 +269,33 @@ def test_scopes_follow_the_routed_path_under_a_root_path(monkeypatch):
     finally:
         main.app.dependency_overrides.pop(main.get_db, None)
     assert r.status_code not in (400, 401, 403, 404), r.text
+
+
+@pytest.mark.parametrize("headers,version,ok", [
+    ([(b"host", b"api:8000")], "1.1", True),
+    ([], "1.0", True),
+    ([], "1.1", False),                                            # HTTP/1.1 requires a Host
+    ([(b"host", b"api:8000"), (b"host", b"desk.example.com")], "1.1", False),   # duplicate Host
+    ([(b"Host", b"api"), (b"host", b"desk.example.com")], "1.1", False),
+])
+def test_host_field_count_follows_rfc_9112(headers, version, ok):
+    assert api_auth._host_header({"headers": headers, "http_version": version})[0] is ok
+
+
+def test_duplicate_host_is_refused_by_the_middleware(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("API_AUTH_MODE", "enforce")
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+             "scheme": "http", "path": "/desk/state", "raw_path": b"/desk/state", "root_path": "",
+             "query_string": b"", "client": ("172.18.0.5", 50000), "server": ("api", 8000),
+             "headers": [(b"host", b"api:8000"), (b"host", b"desk.example.com")]}
+    asyncio.run(main.app(scope, receive, send))
+    assert sent[0]["status"] == 400
