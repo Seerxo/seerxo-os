@@ -507,10 +507,35 @@ def live_shas(db):
 
 
 def published_pr(task) -> dict | None:
-    """The evidence of the latest PR_OPEN publication, or None when the task never published."""
-    history = ((task.context or {}).get("improvement") or {}).get("history") or []
-    ev = next((h.get("evidence") or {} for h in reversed(history) if h.get("stage") == "PR_OPEN"), None)
+    """The evidence of the latest PR_OPEN publication, or None when the task never published.
+
+    Never raises: unreadable history fails closed as a publication whose PR cannot be identified, so
+    callers refuse it (pr_identity_unverified) instead of aborting a whole reconcile pass."""
+    ctx = task.context if isinstance(task.context, dict) else {}
+    imp = ctx.get("improvement") or {}
+    history = (imp.get("history") or []) if isinstance(imp, dict) else None
+    if not isinstance(history, list) or not all(isinstance(h, dict) for h in history):
+        return {"pr": None, "unreadable_history": True}
+    ev = next((h.get("evidence") for h in reversed(history) if h.get("stage") == "PR_OPEN"), None)
+    if ev is not None and not isinstance(ev, dict):
+        return {"pr": None, "unreadable_history": True}
     return ev if ev and ev.get("pr") else None
+
+
+def published_pr_number(task) -> int | None:
+    """Resolve a PR only when its full URL names this deployment's upstream repository.
+
+    Public and private repositories can reuse PR numbers. Historical PR_OPEN evidence is retained,
+    but must never authorize or poll a different repository's PR after a source migration.
+    """
+    evidence = published_pr(task)
+    url = evidence.get("pr") if evidence else None
+    prefix = f"https://github.com/{REPOSITORY}/pull/"
+    if not isinstance(url, str) or not url.startswith(prefix):
+        return None
+    suffix = url[len(prefix):]
+    # Bounded: int() refuses very long digit strings, and one malformed row must not abort reconcile().
+    return int(suffix) if re.fullmatch(r"[1-9][0-9]{0,9}", suffix) else None
 
 
 REPAIR_STAGES = ("IMPLEMENTING", "TESTING", "INDEPENDENT_REVIEW")
@@ -581,7 +606,7 @@ def published_guard(db, task, expected=None) -> str | None:
     ev = published_pr(task)
     if ev is None:
         return None
-    number = stage_c_ci.pr_number(ev.get("pr"))
+    number = published_pr_number(task)
     if number is None:
         return "pr_identity_unverified"
     _, before = owner_state(db, task.id) if expected is None else (None, expected)
@@ -790,9 +815,18 @@ def reconcile(db):
             db.commit()
             continue
         try:
+            # A PR number is not a globally unique identity. Never reconcile old private-repo tasks
+            # against a same-numbered PR in the new public repository after a cutover. Inside the
+            # try: malformed history must leave only this task waiting, not abort the pass. Only the
+            # PR-polling stages: MERGED/VERIFYING judge the merge commit, not the PR.
+            if (stage in ("PR_OPEN", "CI", "READY_TO_MERGE")
+                    and published_pr(task) is not None and published_pr_number(task) is None):
+                outcomes.append({"task": task.key, "outcome": "WAITING",
+                                 "reason": "published_pr_identity_mismatch"})
+                db.commit()
+                continue
             if stage in ("PR_OPEN", "CI", "READY_TO_MERGE"):
-                ev = stage_c_ci._evidence(task, "PR_OPEN")
-                number = stage_c_ci.pr_number(ev.get("pr"))
+                number = published_pr_number(task)
                 if number is None:
                     raise ValueError("missing PR identity")
                 publisher, contexts = repo_guardian_github.merge_statuses(policy)
