@@ -148,13 +148,15 @@ if cmd == "images":
 if cmd == "ps":
     flt = args[args.index("--filter") + 1] if "--filter" in args else ""
     needle = flt.split("=", 1)[1] if "=" in flt else ""
+    def shown(img):   # real Docker cuts an image ID to 12 hex characters unless --no-trunc is given
+        return img if "--no-trunc" in args or not img.startswith("sha256:") else img[7:19]
     for name in sorted(set(s["containers"]) | set(s["anchors"])):
         if needle not in name:
             continue
         if "{{.Names}}" in fmt():
-            print(name + "\t" + image_of(s, name))
+            print(name + "\t" + shown(image_of(s, name)))
         elif "{{.Image}}" in fmt():
-            print(image_of(s, name))
+            print(shown(image_of(s, name)))
         else:
             print(name)
     sys.exit(0)

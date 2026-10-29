@@ -11,6 +11,7 @@ import subprocess
 import tarfile
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -140,7 +141,10 @@ def hw(tmp_path, monkeypatch):
                 | {c["image"] for c in w.prod.running.values()}
             return done(0, argv[-1] + "\n") if argv[-1] in known else done(1)
         if argv[:2] == ["docker", "ps"]:
-            return done(0, "".join(f"{name}\t{img}\n" for name, img in sorted(anchors().items())))
+            # Real Docker (29.5) prints a container's image ID cut to 12 hex characters unless --no-trunc is given.
+            def shown(img):
+                return img if "--no-trunc" in argv or not img.startswith("sha256:") else img[7:19]
+            return done(0, "".join(f"{name}\t{shown(img)}\n" for name, img in sorted(anchors().items())))
         if argv[:2] == ["docker", "inspect"]:
             key = {v: k for k, v in host.CONTAINERS.items()}[argv[-1]]
             image_id = w.prod.running.get(key, {}).get("image")
@@ -1673,3 +1677,31 @@ def test_the_review_packet_names_the_running_commit_the_diff_starts_from(hw, tmp
     hw.review = lambda packet: packets.append(packet) or review(packet)
     hw.tick()
     assert packets[-1]["base"] == running != base
+
+
+def test_anchor_reads_compare_full_image_ids_and_gc_keeps_the_bound_set(tmp_path, monkeypatch):
+    """G2 HIGH-1: `docker ps` prints a 12-hex image ID unless --no-trunc is given. Read truncated, a fully anchored
+    bound set looked unanchored (every v2 manifest rejected) and GC removed every anchor it should keep."""
+    bound = {c: "sha256:" + str(i) * 64 for i, c in enumerate(rg.BOUND, start=1)}
+    stale = "sha256:" + "f" * 64
+    anchors = {f"company-os-bound-x-a1-{c}": image for c, image in bound.items()} | {"company-os-bound-old-api": stale}
+    removed = []
+
+    def docker(argv, **kw):
+        if argv[1] == "ps":
+            full = "--no-trunc" in argv
+            rows = "".join(f"{n}\t{i if full else i[7:19]}\n" for n, i in anchors.items())
+            return subprocess.CompletedProcess(argv, 0, stdout=rows, stderr="")
+        if argv[1] == "inspect":    # the four containers run the bound set
+            name = {v: k for k, v in host.CONTAINERS.items()}[argv[-1]]
+            return subprocess.CompletedProcess(argv, 0, stdout=bound[name] + "\n", stderr="")
+        if argv[1] == "rm":
+            removed.extend(argv[3:])
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(host, "_young_record_images", lambda now: set())
+    assert host.anchored_images(docker) == set(bound.values()) | {stale}
+    assert host.images_anchored(bound, docker)
+    host.gc_anchors(SimpleNamespace(ledger=tmp_path / "ledger.json"), {"bound_images": bound}, now=NOW, docker=docker)
+    assert removed == ["company-os-bound-old-api"]   # only the unkept anchor; never one holding the bound set

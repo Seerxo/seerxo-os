@@ -313,9 +313,10 @@ def image_present(image_id: str, docker=subprocess.run) -> bool:
 
 def anchored_images(docker=subprocess.run) -> set[str]:
     """The image IDs held by every `company-os-bound-*` anchor container (never started; Coolify's cleanup only
-    removes tagged images no container uses). A failing listing is infrastructure: GC and verify retry later."""
-    result = _bounded_call(docker, ["ps", "-a", "--filter", "name=company-os-bound-", "--format",
-                                    "{{.Names}}\t{{.Image}}"])
+    removes tagged images no container uses). A failing listing is infrastructure: GC and verify retry later.
+    --no-trunc here and in gc_anchors: without it `docker ps` prints a 12-character ID that never equals a bound one."""
+    result = _bounded_call(docker, ["ps", "-a", "--no-trunc", "--filter", "name=company-os-bound-",
+                                    "--format", "{{.Names}}\t{{.Image}}"])
     if result.returncode != 0:
         raise RetryLater("docker ps failed while reading the release anchors")
     held = set()
@@ -760,8 +761,8 @@ def gc_anchors(cfg: Config, ledger: dict, *, now: datetime, docker=subprocess.ru
     for bound in [b for b in applied if rg.images_ok(b)][-KEEP_APPLIED:]:
         keep.update(bound.values())
     keep.update(_young_record_images(now))
-    result = _bounded_call(docker, ["ps", "-a", "--filter", "name=company-os-bound-", "--format",
-                                    "{{.Names}}\t{{.Image}}"])
+    result = _bounded_call(docker, ["ps", "-a", "--no-trunc", "--filter", "name=company-os-bound-",
+                                    "--format", "{{.Names}}\t{{.Image}}"])
     if result.returncode != 0:
         return
     for line in result.stdout.splitlines():
