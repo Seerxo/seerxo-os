@@ -485,10 +485,16 @@ if [ "${APPLY:-}" = --apply ] && [ -z "${RECOVER_DIR:-}" ] && { [ -e "$RELEASE_L
 fi
 # Images are content-addressed; a tag may only live on a fixed name (company-os-<c>:<sha|rollback-…|latest>). A
 # repository literally named `sha256` would make a later tag/restore ambiguous, so it is refused before anything moves.
-# grep reads to the end (no -q): an early exit would SIGPIPE the writer and pipefail would turn the refusal into a pass.
-if [ "$BOUND" = yes ] && docker images --format '{{.Repository}}' | grep -x sha256 >/dev/null; then
-  echo "ABORT: a local image tag is named like an image ID (repository 'sha256'); tags only live on fixed names. Nothing was changed."
-  exit 1
+# Capture first: Docker failure must not be interpreted as the absence of a forbidden repository.
+if [ "$BOUND" = yes ]; then
+  repositories=$(docker images --format '{{.Repository}}') || {
+    echo "ABORT: could not list local image repositories. Nothing was changed."
+    exit 1
+  }
+  if grep -x sha256 <<< "$repositories" >/dev/null; then
+    echo "ABORT: a local image tag is named like an image ID (repository 'sha256'); tags only live on fixed names. Nothing was changed."
+    exit 1
+  fi
 fi
 # Nothing sourced later (./.env runs as root under set -a) may change what the gate decided on.
 readonly APPLY SHA RELEASE_DIR REL RECOVER_DIR
@@ -1357,7 +1363,8 @@ progress 90 "switching containers and verifying health"
 # The SHA tag (set above) is what a legacy container runs; a bound release starts the pinned IDs.
 phase SWITCHING
 trap rollback_release ERR
-COMPANY_OS_GIT_SHA=$SHA COMPANY_OS_IMAGE_TAG=$SHA up_services bound
+# Nested functions do not inherit ERR traps: propagate their failure to rollback explicitly.
+COMPANY_OS_GIT_SHA=$SHA COMPANY_OS_IMAGE_TAG=$SHA up_services bound || rollback_release
 # The containers must run exactly the bound IDs: a tag that moved, a fallback to `latest`, or an older image is a
 # failed switch, and the ERR trap rolls the previous release back.
 if [ "$BOUND" = yes ] || [ "$BOOTSTRAP" = yes ]; then
@@ -1373,7 +1380,7 @@ for _ in $(seq 1 30); do
 done
 fence_live || { echo "pause fence is not live on the new company-api (CODER_PAUSE_FENCE_ENABLED != true)" >&2; false; }
 "$GATE" "$SHA"
-install_cron "$REL/main.sha256"   # last mutation, only for a verified release; a failure here rolls the release back (ERR trap)
+install_cron "$REL/main.sha256" || rollback_release   # last mutation, only for a verified release
 trap - ERR
 phase VERIFIED
 echo "RELEASE VERIFIED: $SHA (worker restarted at $(docker inspect company-worker --format '{{.State.StartedAt}}'), was $W0)"

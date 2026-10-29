@@ -170,7 +170,7 @@ def test_the_deploy_script_installs_before_the_switch_and_restores_on_rollback()
     source = DEPLOY.read_text()
     install = source.index('"$HCLI" install --backup "$B"')
     trap = source.index("trap rollback_release ERR")
-    switch = source.index("COMPANY_OS_GIT_SHA=$SHA COMPANY_OS_IMAGE_TAG=$SHA up_services bound\n")
+    switch = source.index("COMPANY_OS_GIT_SHA=$SHA COMPANY_OS_IMAGE_TAG=$SHA up_services bound || rollback_release\n")
     # up_services recreates all four release containers (company-api with the verified pause fence when kept).
     up = source[source.index("up_services() {"):source.index("fence_live() {")]
     for service in ("company-api", "company-worker", "company-reasoner-egress", "company-reasoner"):
