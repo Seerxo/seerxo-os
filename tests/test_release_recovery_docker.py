@@ -198,8 +198,12 @@ def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, mon
              "--tmpfs", "/var/run/postgresql:uid=" + uid + ",mode=0770", "--tmpfs", "/tmp:mode=1777",
              "-e", "POSTGRES_USER=" + user, "-e", "POSTGRES_DB=" + database,
              "-e", "POSTGRES_PASSWORD=disposable-drill-only", base, "postgres", "-c", "listen_addresses=")
+        # The image's entrypoint first runs a socket-only init server that pg_isready already calls ready, before
+        # POSTGRES_DB exists, then restarts it. Ready means the init finished and the final server accepts the DB.
         deadline = time.monotonic() + 60
-        while call("docker", "exec", pg, "pg_isready", "-U", user, "-d", database, check=False).returncode:
+        while not (b"PostgreSQL init process complete" in call("docker", "logs", pg, check=False).stdout
+                   and not call("docker", "exec", pg, "psql", "-U", user, "-d", database, "-Atc", "SELECT 1",
+                                check=False).returncode):
             assert time.monotonic() < deadline, "disposable PostgreSQL did not start"
             time.sleep(0.2)
         sql("CREATE TABLE alembic_version(version_num varchar(32)); INSERT INTO alembic_version VALUES ('aaaaaaaaaaaa');"
