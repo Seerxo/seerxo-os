@@ -1,7 +1,7 @@
 scripts/deploy-company-os.sh
-  s_7236fe8a19f823::t_254d0c9e9bb0b9 488-489,845-846
+  s_7236fe8a19f823::t_cefa84fc179e71 488-489,845-846
 tests/test_release_recovery_docker.py
-  s_7236fe8a19f823::t_cf8a3dda895cdb 52-101
+  s_7236fe8a19f823::t_ca5aff99bab952 52-101
 ---
 {
   "schema_version": "authorship/3.0.0",
