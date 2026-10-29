@@ -43,6 +43,25 @@ def locked(path, shared=False):
 try:
     ledger = Path(sys.argv[1])
     args, profiles = sys.argv[2:], []
+    if any(name in os.environ for name in ("COMPOSE_FILE", "COMPOSE_PROFILES", "COMPOSE_ENV_FILES")):
+        raise ValueError("Compose configuration environment overrides are refused")
+    pilot = bool(args and args[0] == "--stage-c-pilot")
+    if pilot:
+        args = args[1:]
+        if args != ["up", "-d", "--no-deps", "company-worker"]:
+            raise ValueError("pilot override only supports up -d --no-deps company-worker")
+        override = Path("/root/stage-c-pilot.compose.yml")
+        for parent in override.parents:
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+                raise ValueError("untrusted pilot override directory")
+        info = override.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in (0, os.geteuid())
+                or info.st_mode & 0o022 or info.st_size > 4096):
+            raise ValueError("untrusted pilot override file")
+        expected = {"services": {"company-worker": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "true"}}}}
+        if json.loads(override.read_bytes()) != expected:
+            raise ValueError("pilot override must contain only the worker code-write flag (JSON)")
     while args and args[0] == "--profile":
         if len(args) < 3:
             raise ValueError("--profile requires a name and a command")
@@ -71,7 +90,11 @@ try:
                 or not all(isinstance(v, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", v) for v in images.values())):
             raise ValueError("the ledger binds no complete running image set")
         env = os.environ | {"COMPANY_OS_IMAGE_" + c.upper(): images[c] for c in components}
-        compose = ["docker", "compose", *profiles]
+        # Pin selection even when .env contains Compose control variables; service interpolation still reads .env.
+        env |= {"COMPOSE_PROFILES": "", "COMPOSE_ENV_FILES": ""}
+        compose = ["docker", "compose", "--env-file", ".env", "-f", "docker-compose.yml", *profiles]
+        if pilot:
+            compose += ["-f", str(override)]
         config = json.loads(subprocess.check_output([*compose, "config", "--format", "json"], env=env))
         services = config.get("services") or {}
         for c, name in zip(components, ("company-api", "company-worker", "company-reasoner", "company-reasoner-egress")):

@@ -7,8 +7,10 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -35,7 +37,7 @@ def call(*args, input=None, check=True, env=None, cwd=None):
 def function(name):
     start = REMOTE.index("\n" + name + "() {") + 1
     first = REMOTE[start:REMOTE.index("\n", start)]
-    if first.rstrip().endswith("}"):
+    if re.search(r"\}\s*(?:#.*)?$", first):
         return first + "\n"
     return REMOTE[start:REMOTE.index("\n}\n", start) + 3]
 
@@ -54,7 +56,7 @@ def require_hosted_local_docker():
 FAKE_DOCKER = r"""#!/bin/bash
 case "$1" in
   image) echo "${@: -1}" ;;
-  images) cat "$REPOSITORIES" ;;
+  images) cat "$REPOSITORIES"; exit "${DOCKER_IMAGES_RC:-0}" ;;
   ps) if [[ " $* " == *" --no-trunc "* ]]; then cat "$ANCHORS"; else sed -E 's/^sha256:(.{12}).*/\1/' "$ANCHORS"; fi ;;
 esac
 """
@@ -92,11 +94,63 @@ def test_prebind_still_refuses_an_unanchored_image(tmp_path):
 @pytest.mark.parametrize("extra", [0, 20000])
 def test_a_repository_named_sha256_is_refused_however_long_the_listing(tmp_path, extra):
     """The same early-exit under pipefail turned this refusal into a pass: fail open on a long image list."""
-    start = SOURCE.index('if [ "$BOUND" = yes ] && docker images')
-    gate = SOURCE[start:SOURCE.index("\nfi\n", start) + 4]
+    gate = SOURCE[SOURCE.index("# Images are content-addressed;"):SOURCE.index("# Nothing sourced later")]
     env = fake_docker(tmp_path, [], ["sha256", *["company-os-api"] * extra]) | {"BOUND": "yes"}
     result = call("bash", "-c", "set -euo pipefail\n" + gate + "echo PASSED", env=env, check=False)
     assert result.returncode == 1 and b"named like an image ID" in result.stdout
+
+
+@pytest.mark.parametrize("repositories", [(), ("sha256",)])
+def test_repository_inspection_failure_aborts_before_apply(tmp_path, repositories):
+    gate = SOURCE[SOURCE.index("# Images are content-addressed;"):SOURCE.index("# Nothing sourced later")]
+    env = fake_docker(tmp_path, [], repositories) | {"BOUND": "yes", "DOCKER_IMAGES_RC": "1"}
+    result = call("bash", "-c", "set -euo pipefail\n" + gate + "echo PASSED", env=env, check=False)
+    assert result.returncode == 1 and b"could not list local image repositories" in result.stdout
+    assert b"PASSED" not in result.stdout
+
+
+@pytest.mark.parametrize("failure", ["compose", "cron"])
+def test_nested_switch_failures_run_the_rollback_handler(tmp_path, failure):
+    """Errexit inside a nested function does not inherit the caller's ERR trap without explicit propagation."""
+    (tmp_path / "main.sha256").write_text("")
+    (tmp_path / "test.cron").write_text("previous schedule\n")
+    config = {"services": {"company-" + ("reasoner-egress" if c == "egress" else c): {"image": BOUND[c]}
+                           for c in COMPONENTS}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    driver = "\n".join(function(n) for n in (
+        "compose_env", "compose_check", "compose_bound", "run_compose", "up_services", "fence_live", "phase",
+        "place_cron", "install_cron", "rollback_release"))
+    switch = REMOTE[REMOTE.index("phase SWITCHING\ntrap rollback_release ERR"):
+                    REMOTE.index('\necho "RELEASE VERIFIED:')]
+    stubs = r'''
+rollback_core() { ROLLBACK_RESULT=VERIFIED; }
+docker() {
+  case "$1:$2" in
+    compose:config) cat "$COMPOSE_CONFIG" ;;
+    compose:up) [ "$FAILURE" != compose ] || { echo SIMULATED_PARTIAL_COMPOSE_FAILURE; return 23; } ;;
+    inspect:*)
+      case "$*" in
+        *State.Health.Status*) echo healthy ;;
+        *) case "$2" in
+          company-api) echo "$BOUND_API" ;; company-worker) echo "$BOUND_WORKER" ;;
+          company-reasoner) echo "$BOUND_REASONER" ;; company-reasoner-egress) echo "$BOUND_EGRESS" ;;
+        esac ;;
+      esac ;;
+  esac
+}
+rm() {
+  [ "$FAILURE" != cron ] || { echo SIMULATED_CRON_INSTALL_FAILURE; return 23; }
+  command rm "$@"
+}
+'''
+    env = os.environ | {"B": str(tmp_path), "REL": str(tmp_path), "CRON_FILE": str(tmp_path / "test.cron"),
+        "COMPOSE_CONFIG": str(tmp_path / "config.json"), "BOUND": "yes", "BOOTSTRAP": "no", "FENCE_KEEP": "no",
+        "OLD_SHA": OLD, "SHA": NEW, "GATE": "true", "FAILURE": failure,
+        **{"BOUND_" + c.upper(): BOUND[c] for c in COMPONENTS}}
+    result = call("bash", "-c", "set -euo pipefail\n" + driver + "\n" + stubs + "\n" + switch,
+                  env=env, check=False)
+    assert result.returncode == 23 and b"ROLLBACK VERIFIED:" in result.stdout, result.stdout.decode()
+    assert (tmp_path / "phase").read_text().strip() == "ROLLED_BACK_VERIFIED"
 
 
 def test_remote_context_cannot_override_the_local_endpoint(monkeypatch):
@@ -124,10 +178,10 @@ def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, mon
                "--security-opt", "no-new-privileges", base, "id", "-u", "postgres").stdout.decode().strip()
     assert re.fullmatch(r"[0-9]+", uid)
     user, database = "release_test", "company_recovery_test"
-    compose_dir = tmp_path / "compose"
-    compose_dir.mkdir()
-    backup = tmp_path / "backup"
-    backup.mkdir()
+    # RECOVER_DIR checks every parent: /tmp is deliberately untrusted, so use the hosted checkout's trusted tree.
+    compose_dir = Path(tempfile.mkdtemp(prefix=".recovery-drill-", dir=ROOT))
+    backup = compose_dir / "backups" / "deploy-20261030T000000Z"
+    backup.mkdir(parents=True, mode=0o700)
 
     def sql(statement, db=database):
         return call("docker", "exec", pg, "psql", "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1", "-Atc",
@@ -223,12 +277,6 @@ def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, mon
              "-d", "restored_drill", input=(backup / "db.dump").read_bytes())
         assert sql("SELECT value FROM drill_data", "restored_drill") == "preserved"
         assert sql("SELECT version_num FROM alembic_version", "restored_drill") == "aaaaaaaaaaaa"
-        call("docker", "compose", "up", "-d", "--no-build", "--pull", "never", env=new_env, cwd=compose_dir)
-        healthy()
-        # The never-started production anchors keep the old images even while the new generation is running.
-        assert call("docker", "image", "rm", old["api"], check=False).returncode != 0
-        with pytest.raises(ValueError):
-            identity.recovery_check("verify", backup, OLD, user, database)
         mapping = "\n".join("    " + key + ") args+=(\"" + names[c] + "\") ;;" for c, key in zip(
             COMPONENTS, ("company-api", "company-worker", "company-reasoner", "company-reasoner-egress")))
         wrapper = '''docker() {
@@ -238,13 +286,100 @@ def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, mon
 ''' + mapping + '''
       *) args+=("$arg") ;; esac; done
     command docker inspect "${args[@]}"
+  elif [ "$1" = compose ] && [[ " $* " == *" up "* ]] && [ "${FAIL_FORWARD_COMPOSE:-no}" = yes ] \
+       && [ "${COMPANY_OS_GIT_SHA:-}" = "${SHA:-}" ]; then
+    command docker compose up -d --no-deps --no-build --pull never company-api || return
+    return 23
   else command docker "$@"; fi
 }
+rm() {
+  if [ "${FAIL_CRON_INSTALL:-no}" = yes ] && [ "$#" = 2 ] && [ "$1" = -f ] && [ "$2" = "$CRON_FILE" ]; then
+    return 23
+  fi
+  command rm "$@"
+}
 '''
-        restore = "\n".join(function(n) for n in ("restore_env", "restore_resolve", "compose_restore"))
-        restore += "\n" + wrapper + "\nFENCE_KEEP=no\ncompose_restore \"$@\"\n"
-        call("bash", "-c", "set -euo pipefail\n" + restore, "_", *[old[c] for c in COMPONENTS], "restore-drill",
-             env=new_env | {"COMPANY_OS_GIT_SHA": OLD}, cwd=compose_dir)
+        # Namespace relocation only: the recovery CLI still executes its real Docker/PG identity checks.
+        recovery = (ROOT / "app/release_identity.py").read_text()
+        for c, service in identity.SERVICES.items():
+            recovery = recovery.replace('"company-' + ("reasoner-egress" if c == "egress" else c) + '"',
+                                        json.dumps(service))
+        recovery = recovery.replace('"company-postgres"', json.dumps(pg))
+        (backup / "recovery-identity.py").write_text(recovery)
+        # Provider health and the host CLI installation have separate tests; neither fixture can bypass identity.
+        for name in ("host-cli.sh", "release-health-gate.sh"):
+            (backup / name).write_text("#!/bin/sh\nexit 0\n")
+            (backup / name).chmod(0o755)
+        (backup / "cli-files-before.sha256").write_text("host CLI is outside this rehearsal\n")
+        (backup / "main.sha256").write_text("")
+        (compose_dir / "source-marker").write_text("previous source\n")
+        with tarfile.open(backup / "files-before.tgz", "w:gz") as archive:
+            for name in ("docker-compose.yml", "source-marker"):
+                archive.add(compose_dir / name, arcname=name)
+        (backup / "files-new.list").write_text("new-source-file\n")
+        cron = compose_dir / "test.cron"
+        cron.write_text("# previous schedule\n")
+        journal = {"S": "20261030T000000Z", "OLD_SHA": OLD, "BOUND": "yes", "API_IMG": old["api"],
+                   "FENCE_BEFORE": "no", **{"PREV_IMAGE_" + c.upper(): old[c] for c in COMPONENTS}}
+        (backup / "deploy.env").write_text("".join(k + "=" + v + "\n" for k, v in journal.items()))
+        driver = "\n".join(function(n) for n in (
+            "compose_env", "compose_check", "compose_bound", "run_compose", "restore_env", "restore_resolve",
+            "compose_restore", "up_services", "fence_live", "restore_source", "cron_meta", "snapshot_cron",
+            "place_cron", "install_cron", "restore_cron", "phase", "phase_is_clean", "read_env", "trusted_dir",
+            "rollback_core", "rollback_release"))
+        driver = driver.replace("/opt/company-os", str(compose_dir)) + "\n" + wrapper
+        driver_env = new_env | journal | {"SHA": NEW, "BOOTSTRAP": "no", "B": str(backup), "REL": str(backup),
+            "PGU": user, "PGD": database, "CRON_FILE": str(cron), "FENCE_KEEP": "no",
+            "GATE": str(backup / "release-health-gate.sh"),
+            **{"BOUND_" + c.upper(): new[c] for c in COMPONENTS}}
+        call("bash", "-c", "set -euo pipefail\n" + driver + '\nsnapshot_cron "$B"',
+             env=driver_env, cwd=compose_dir)
+        switch = REMOTE[REMOTE.index("phase SWITCHING\ntrap rollback_release ERR"):
+                        REMOTE.index('\necho "RELEASE VERIFIED:')]
+        forward = "set -euo pipefail\n" + driver + "\n" + switch
+        call("bash", "-c", forward, env=driver_env, cwd=compose_dir)
+        healthy()
+        assert identity.recovery_state(NEW, user, database)["images"] == new
+        assert (backup / "phase").read_text().strip() == "VERIFIED"
+        # The never-started production anchors keep the old images even while the new generation is running.
+        assert call("docker", "image", "rm", old["api"], check=False).returncode != 0
+        with pytest.raises(ValueError):
+            identity.recovery_check("verify", backup, OLD, user, database)
+        (compose_dir / "source-marker").write_text("candidate source\n")
+        (compose_dir / "new-source-file").write_text("candidate-only\n")
+        failed_gate = backup / "failed-health-gate.sh"
+        failed_gate.write_text("#!/bin/sh\nexit 23\n")
+        failed_gate.chmod(0o755)
+        failed = call("bash", "-c", forward, env=driver_env | {"GATE": str(failed_gate)},
+                      cwd=compose_dir, check=False)
+        assert failed.returncode == 23, failed.stderr.decode()
+        assert b"ROLLBACK VERIFIED:" in failed.stdout
+        assert (backup / "phase").read_text().strip() == "ROLLED_BACK_VERIFIED"
+        assert (compose_dir / "source-marker").read_text() == "previous source\n"
+        assert not (compose_dir / "new-source-file").exists()
+        assert cron.read_text() == "# previous schedule\n"
+        healthy()
+        identity.recovery_check("verify", backup, OLD, user, database)
+        for failure in ("FAIL_FORWARD_COMPOSE", "FAIL_CRON_INSTALL"):
+            failed = call("bash", "-c", forward, env=driver_env | {failure: "yes"}, cwd=compose_dir, check=False)
+            assert failed.returncode == 23, failed.stderr.decode()
+            assert b"ROLLBACK VERIFIED:" in failed.stdout
+            assert (backup / "phase").read_text().strip() == "ROLLED_BACK_VERIFIED"
+            healthy()
+            identity.recovery_check("verify", backup, OLD, user, database)
+        # A fresh shell replays the durable journal after interruption, through the production RECOVER_DIR branch.
+        call("bash", "-c", forward, env=driver_env, cwd=compose_dir)
+        healthy()
+        assert identity.recovery_state(NEW, user, database)["images"] == new
+        (backup / "phase").write_text("SWITCHING\n")
+        recovery_branch = REMOTE[REMOTE.index('if [ -n "${RECOVER_DIR:-}" ]; then'):
+                                 REMOTE.index("\n# --- bound releases")]
+        recovery_branch = recovery_branch.replace("/opt/company-os", str(compose_dir))
+        recovered = call("bash", "-c", "set -euo pipefail\n" + driver + "\n" + recovery_branch,
+                         env=new_env | {"RECOVER_DIR": str(backup), "TRUSTED_UID": str(os.geteuid()),
+                                        "PGU": user, "PGD": database, "CRON_FILE": str(cron)}, cwd=compose_dir)
+        assert b"RECOVERY VERIFIED:" in recovered.stdout
+        assert (backup / "phase").read_text().strip() == "ROLLED_BACK_VERIFIED"
         healthy()
         identity.recovery_check("verify", backup, OLD, user, database)
         assert sql("SELECT value FROM drill_data") == "preserved"
@@ -260,6 +395,9 @@ def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, mon
             "checked_out_sha": call("git", "rev-parse", "HEAD").stdout.decode().strip(),
             "event_sha": os.environ.get("GITHUB_SHA"), "old_images": old, "new_images": new,
             "restored": restored, "healthy": True, "backup_restore_verified": True,
+            "bound_forward_switch_verified": True, "err_trap_rollback_verified": True,
+            "partial_compose_failure_rollback_verified": True, "cron_failure_rollback_verified": True,
+            "interrupted_journal_recovery_verified": True,
             "schema_drift_refused": True, "attempted_migration_refused": True}, sort_keys=True))
     finally:
         # Labels survive partial preparation too; remove only this random test namespace, never prune the daemon.
@@ -281,3 +419,4 @@ def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, mon
         images.update(owned_images.stdout.decode().split())
         for image in images:
             call("docker", "image", "rm", image, check=False)
+        shutil.rmtree(compose_dir)
