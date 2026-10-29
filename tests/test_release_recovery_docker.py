@@ -20,8 +20,6 @@ from app import release_identity as identity
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "scripts/deploy-company-os.sh").read_text()
 REMOTE = SOURCE[SOURCE.index("<<'REMOTE'\n") + len("<<'REMOTE'\n"):SOURCE.index("\nREMOTE\n")]
-pytestmark = pytest.mark.skipif(os.environ.get("SEERXO_REAL_RECOVERY") != "1",
-                                reason="real Docker/PostgreSQL rehearsal requires its isolated hosted-runner job")
 COMPONENTS = ("api", "worker", "reasoner", "egress")
 OLD, NEW = "1" * 40, "2" * 40
 
@@ -42,12 +40,28 @@ def function(name):
     return REMOTE[start:REMOTE.index("\n}\n", start) + 3]
 
 
-def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, monkeypatch):
+def require_hosted_local_docker():
     assert os.environ.get("GITHUB_ACTIONS") == "true"
     assert os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted", "never run this on a persistent runner"
+    assert not os.environ.get("DOCKER_CONTEXT"), "DOCKER_CONTEXT may override DOCKER_HOST; refuse it"
     endpoint = os.environ.get("DOCKER_HOST") or json.loads(call(
         "docker", "context", "inspect", "--format", "{{json .Endpoints.docker.Host}}").stdout)
     assert endpoint.startswith("unix://"), "remote Docker contexts are forbidden"
+
+
+def test_remote_context_cannot_override_the_local_endpoint(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote-context")
+    with pytest.raises(AssertionError, match="DOCKER_CONTEXT"):
+        require_hosted_local_docker()
+
+
+@pytest.mark.skipif(os.environ.get("SEERXO_REAL_RECOVERY") != "1",
+                    reason="real Docker/PostgreSQL rehearsal requires its isolated hosted-runner job")
+def test_real_prepared_images_restore_four_identities_and_postgres(tmp_path, monkeypatch):
+    require_hosted_local_docker()
     call("docker", "version")
     base = "postgres:18-alpine"
     call("docker", "image", "inspect", base)  # the job pulls this one test dependency explicitly
