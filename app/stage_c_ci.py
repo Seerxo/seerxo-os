@@ -21,7 +21,7 @@ before CI passed) leaves the task unmerged and BLOCKED for the founder to look a
 import json
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from sqlalchemy import select
@@ -38,6 +38,11 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 # A fork PR's workflow run that waits for the founder's "Approve and run workflows" has not run: it is pending, never a
 # failure (B-15, 2026-10-23: PR #432 was sent back to repair and its merge then refused as MERGE_UNVERIFIED).
 AWAITING_APPROVAL = "action_required"
+# Finished without a result: not the code's fault, so never a repair. A re-run may still arrive, so it waits, but only
+# for ENDED_GRACE after the task reached CI; then it blocks for the founder instead of hanging an unattended task forever.
+# (The required workflows have no path filter or job condition, so none of these is a legitimate "nothing to test".)
+ENDED_WITHOUT_RESULT = {"cancelled", "skipped", "neutral", "stale"}
+ENDED_GRACE = timedelta(hours=6)
 
 
 UNREADABLE_PUBLICATION = {"pr": None, "unreadable_history": True}
@@ -373,6 +378,16 @@ def ingest(db: Session, task: models.Task, facts: dict, max_repairs: int = MAX_R
     awaiting = [c["name"] for c in checks if c.get("status") == "completed" and c.get("conclusion") == AWAITING_APPROVAL]
     if awaiting and not failed:
         return {"outcome": "WAITING", "reason": "workflow approval required: " + ", ".join(awaiting)}
+    ended = {c["name"]: c["conclusion"] for c in checks
+             if c.get("status") == "completed" and c.get("conclusion") in ENDED_WITHOUT_RESULT}
+    if ended and not failed:
+        why = "CI ended without a result: " + ", ".join(f"{n} {c}" for n, c in ended.items())
+        entered = next((_timestamp(h.get("at")) for h in reversed((task.context or {}).get("improvement", {})
+                                                                  .get("history", [])) if h.get("stage") == "CI"), None)
+        if entered is not None and datetime.now(timezone.utc) - entered < ENDED_GRACE:
+            return {"outcome": "WAITING", "reason": f"{why}; re-run it before {(entered + ENDED_GRACE).isoformat()}"}
+        _block(db, task, why, {**base, "ended_without_result": ended})
+        return {"outcome": "BLOCKED", "ended_without_result": list(ended)}
     if failed:
         used = repairs_used(task)
         if used >= max_repairs:
