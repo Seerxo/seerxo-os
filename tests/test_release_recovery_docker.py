@@ -49,6 +49,56 @@ def require_hosted_local_docker():
     assert endpoint.startswith("unix://"), "remote Docker contexts are forbidden"
 
 
+# A stand-in for the two docker reads the gates make, matching real Docker (checked on 29.5): `docker ps` prints a
+# container's image ID truncated to 12 hex characters unless --no-trunc is given; `image inspect` prints the full ID.
+FAKE_DOCKER = r"""#!/bin/bash
+case "$1" in
+  image) echo "${@: -1}" ;;
+  images) cat "$REPOSITORIES" ;;
+  ps) if [[ " $* " == *" --no-trunc "* ]]; then cat "$ANCHORS"; else sed -E 's/^sha256:(.{12}).*/\1/' "$ANCHORS"; fi ;;
+esac
+"""
+BOUND = {c: "sha256:" + hex(i)[2:] * 64 for i, c in enumerate(COMPONENTS, start=10)}
+
+
+def fake_docker(tmp_path, anchors, repositories=()):
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/docker").write_text(FAKE_DOCKER)
+    (tmp_path / "bin/docker").chmod(0o755)
+    (tmp_path / "anchors").write_text("".join(a + "\n" for a in anchors))
+    (tmp_path / "repositories").write_text("".join(r + "\n" for r in repositories))
+    return os.environ | {"PATH": str(tmp_path / "bin") + ":" + os.environ["PATH"], "ANCHORS": str(tmp_path / "anchors"),
+                         "REPOSITORIES": str(tmp_path / "repositories"),
+                         **{"BOUND_" + c.upper(): image for c, image in BOUND.items()}}
+
+
+# 20000 extra lines make the reader's early exit (grep -q) a SIGPIPE for the writer, which pipefail turns into failure.
+@pytest.mark.parametrize("extra", [0, 20000])
+def test_prebind_accepts_full_image_ids_held_by_anchors(tmp_path, extra):
+    """#19: `docker ps` without --no-trunc never printed a full ID, so every bound apply aborted as unanchored."""
+    env = fake_docker(tmp_path, [*BOUND.values(), *["sha256:" + "f" * 64] * extra])
+    result = call("bash", "-c", "set -euo pipefail\n" + function("prebind_images") + "\nprebind_images", env=env,
+                  check=False)
+    assert result.returncode == 0, result.stdout.decode()
+
+
+def test_prebind_still_refuses_an_unanchored_image(tmp_path):
+    env = fake_docker(tmp_path, [image for c, image in BOUND.items() if c != "reasoner"])
+    result = call("bash", "-c", "set -euo pipefail\n" + function("prebind_images") + "\nprebind_images", env=env,
+                  check=False)
+    assert result.returncode == 1 and b"reasoner image" in result.stdout and b"not anchored" in result.stdout
+
+
+@pytest.mark.parametrize("extra", [0, 20000])
+def test_a_repository_named_sha256_is_refused_however_long_the_listing(tmp_path, extra):
+    """The same early-exit under pipefail turned this refusal into a pass: fail open on a long image list."""
+    start = SOURCE.index('if [ "$BOUND" = yes ] && docker images')
+    gate = SOURCE[start:SOURCE.index("\nfi\n", start) + 4]
+    env = fake_docker(tmp_path, [], ["sha256", *["company-os-api"] * extra]) | {"BOUND": "yes"}
+    result = call("bash", "-c", "set -euo pipefail\n" + gate + "echo PASSED", env=env, check=False)
+    assert result.returncode == 1 and b"named like an image ID" in result.stdout
+
+
 def test_remote_context_cannot_override_the_local_endpoint(monkeypatch):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")

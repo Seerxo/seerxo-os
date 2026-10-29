@@ -485,7 +485,8 @@ if [ "${APPLY:-}" = --apply ] && [ -z "${RECOVER_DIR:-}" ] && { [ -e "$RELEASE_L
 fi
 # Images are content-addressed; a tag may only live on a fixed name (company-os-<c>:<sha|rollback-…|latest>). A
 # repository literally named `sha256` would make a later tag/restore ambiguous, so it is refused before anything moves.
-if [ "$BOUND" = yes ] && docker images --format '{{.Repository}}' | grep -qx sha256; then
+# grep reads to the end (no -q): an early exit would SIGPIPE the writer and pipefail would turn the refusal into a pass.
+if [ "$BOUND" = yes ] && docker images --format '{{.Repository}}' | grep -x sha256 >/dev/null; then
   echo "ABORT: a local image tag is named like an image ID (repository 'sha256'); tags only live on fixed names. Nothing was changed."
   exit 1
 fi
@@ -841,7 +842,8 @@ prebind_images() {
     [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ABORT: no valid $c image ID is bound; nothing was changed."; return 1; }
     [ "$(docker image inspect --format '{{.Id}}' "$id" 2>/dev/null)" = "$id" ] \
       || { echo "ABORT: the bound $c image $id is not present on this host; a bound apply never builds."; return 1; }
-    docker ps -a --filter name=company-os-bound- --format '{{.Image}}' | grep -qx -- "$id" \
+    # --no-trunc: without it `docker ps` prints a 12-character ID that never equals a full sha256 ID.
+    docker ps -a --no-trunc --filter name=company-os-bound- --format '{{.Image}}' | grep -x -- "$id" >/dev/null \
       || { echo "ABORT: the bound $c image $id is not anchored; nothing may start unanchored."; return 1; }
   done
 }
