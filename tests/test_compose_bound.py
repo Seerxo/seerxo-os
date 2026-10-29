@@ -60,6 +60,9 @@ if 'up' in sys.argv:
         script = root / "compose-bound.sh"
         script.write_text((ROOT / "scripts/compose-bound.sh").read_text().replace(
             'Path("/root/stage-c-pilot.compose.yml")', f'Path({str(override)!r})'))
+        for name in ("docker-compose.yml", ".env"):     # the host's working copy; compose-bound runs from it
+            (root / name).write_text("{}\n" if name.endswith(".yml") else "POSTGRES_DB=company\n")
+            (root / name).chmod(0o644)
         env = os.environ | {"COMPANY_OS_RELEASE_LEDGER": str(ledger), "MAINTENANCE_TEST": str(root),
                             "MAINTENANCE_SCRIPT": str(script),
                             "COMPANY_OS_STAGE_C_PILOT_OVERRIDE": str(override),
@@ -68,7 +71,7 @@ if 'up' in sys.argv:
 
 
 def command(env, *args):
-    return subprocess.run(["bash", env["MAINTENANCE_SCRIPT"], *args], env=env,
+    return subprocess.run(["bash", env["MAINTENANCE_SCRIPT"], *args], env=env, cwd=env["MAINTENANCE_TEST"],
                           text=True, capture_output=True, timeout=15)
 
 
@@ -198,4 +201,15 @@ def test_untrusted_pilot_file_is_refused_before_any_docker_call(maintenance, kin
 def test_pilot_cannot_start_dependencies_or_other_services(maintenance, args):
     root, env = maintenance
     assert command(env, "--stage-c-pilot", *args).returncode != 0
+    assert not (root / "calls").exists()
+
+
+@pytest.mark.parametrize("name", ["docker-compose.yml", ".env"])
+def test_arming_refuses_a_compose_file_or_env_another_user_could_write(maintenance, name):
+    """Root arming applies the working copy's Compose file and .env: if another account can write either, arming would
+    run a configuration that account chose. Refused before any Docker call (independent review EG-5)."""
+    root, env = maintenance
+    (root / name).chmod(0o664)
+    result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
+    assert result.returncode != 0 and "untrusted" in result.stderr
     assert not (root / "calls").exists()

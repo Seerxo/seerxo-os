@@ -59,6 +59,19 @@ try:
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in (0, os.geteuid())
                 or info.st_mode & 0o022 or info.st_size > 4096):
             raise ValueError("untrusted pilot override file")
+        # Arming applies the working copy's Compose file and .env as root: another account able to write either (or
+        # this directory) would choose what the armed worker runs. Both must be root- or caller-owned and not writable
+        # by group or other.
+        here = Path.cwd()
+        for parent in (here, *here.parents):
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+                raise ValueError("untrusted Compose working directory")
+        for name in ("docker-compose.yml", ".env"):
+            info = (here / name).lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in (0, os.geteuid())
+                    or info.st_mode & 0o022):
+                raise ValueError(f"untrusted {name} in the Compose working directory")
         expected = {"services": {"company-worker": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "true"}}}}
         if json.loads(override.read_bytes()) != expected:
             raise ValueError("pilot override must contain only the worker code-write flag (JSON)")
