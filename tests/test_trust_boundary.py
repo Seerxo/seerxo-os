@@ -25,7 +25,7 @@ WRITE_ALLOWLIST: dict[str, set[str]] = {}
 # Triggers that run with secrets or write access on behalf of code the workflow did not choose.
 PRIVILEGED_TRIGGERS = {"pull_request_target", "workflow_run", "issue_comment", "issues", "discussion_comment",
                        "pull_request_review_comment", "repository_dispatch"}
-SECRET_REF = re.compile(r"secrets\.([A-Za-z0-9_]+)")
+SECRET_REF = re.compile(r"""secrets(?:\.|\[\s*['"])([A-Za-z0-9_]+)""")   # secrets.X and secrets['X']
 PINNED = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 P0 = "known gap (docs/security/THREAT_MODEL.md); remove this marker only with the change that closes it"
 
@@ -71,6 +71,7 @@ def test_the_workflow_set_is_known():
 def test_secrets_are_named_only_where_allowed(path):
     text, workflow, _ = load(path)
     assert "secrets: inherit" not in text and "toJSON(secrets)" not in text.replace(" ", "")
+    assert not re.search(r"""secrets\s*\[\s*[^'"\s]""", text), path.name   # a computed name escapes this table
     assert set(SECRET_REF.findall(text)) <= SECRET_ALLOWLIST.get(path.name, set()), path.name
 
 

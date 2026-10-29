@@ -213,7 +213,6 @@ def summarize(state: dict, now: datetime) -> dict:
 
 RECOMMENDATION = {
     ".github/workflows/python-tests.yml": "batch commits and run the Python suite locally before pushing to a PR",
-    ".github/workflows/jules-review.yml": "add the jules-review label only when an AI review is worth its minutes",
 }
 
 
