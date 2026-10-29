@@ -13,6 +13,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+PILOT = {"services": {"company-worker": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "true"}}}}
+
+
 @pytest.fixture
 def maintenance():
     with tempfile.TemporaryDirectory(prefix=".compose-test-", dir=ROOT) as directory:
@@ -30,7 +33,18 @@ with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')
 if 'config' in sys.argv:
     names = ('company-api','company-worker','company-reasoner','company-reasoner-egress')
     components = ('API','WORKER','REASONER','EGRESS')
-    print(json.dumps({'services': {n: {'image': os.environ['COMPANY_OS_IMAGE_'+c]} for n,c in zip(names,components)}}))
+    services = {n: {'image': os.environ['COMPANY_OS_IMAGE_'+c], 'environment': {'ENABLE_AUTONOMOUS_CODE_WRITE': 'false'}}
+                for n,c in zip(names,components)}
+    files = [sys.argv[i+1] for i, a in enumerate(sys.argv) if a == '-f']
+    for extra in files[1:]:          # JSON is YAML: each later file merges per service, environment per key
+        for name, svc in json.loads(Path(extra).read_text()).get('services', {}).items():
+            merged = services.setdefault(name, {})
+            for key, value in svc.items():
+                if key == 'environment':
+                    merged.setdefault('environment', {}).update(value)
+                else:
+                    merged[key] = value
+    print(json.dumps({'services': services}))
 if 'up' in sys.argv:
     (root/'started').touch()
     while (root/'block').exists(): time.sleep(0.01)
@@ -39,7 +53,12 @@ if 'up' in sys.argv:
         ledger = root / "ledger/ledger.json"
         ledger.write_text(json.dumps({"bound_images": {c: "sha256:" + str(i) * 64
                           for i, c in enumerate(("api", "worker", "reasoner", "egress"), 1)}}))
+        override = root / "pilot/stage-c-pilot.compose.yml"
+        override.parent.mkdir(mode=0o755)
+        override.write_text(json.dumps(PILOT))
+        override.chmod(0o644)
         env = os.environ | {"COMPANY_OS_RELEASE_LEDGER": str(ledger), "MAINTENANCE_TEST": str(root),
+                            "COMPANY_OS_STAGE_C_PILOT_OVERRIDE": str(override),
                             "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"]}
         yield root, env
 
@@ -94,3 +113,53 @@ def test_install_and_build_locks_are_held_until_compose_finishes(maintenance):
         block.unlink()
         proc.communicate(timeout=10)
     assert proc.returncode == 0
+
+
+def test_the_pilot_override_arms_code_write_and_changes_nothing_else(maintenance):
+    """A Stage C pilot recreates the worker with exactly one change: ENABLE_AUTONOMOUS_CODE_WRITE "true". The bound
+    images are still checked on the configuration that is executed."""
+    root, env = maintenance
+    result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+    override = env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]
+    assert calls[-1][:6] == ["compose", "-f", "docker-compose.yml", "-f", override, "up"]
+    assert calls[-1][calls[-1].index("--pull") + 1] == "never"
+
+
+@pytest.mark.parametrize("change", [
+    {"company-worker": {"image": "sha256:" + "9" * 64}},                              # fights the binding
+    {"company-worker": {"command": ["sh", "-c", "id"]}},                              # anything beyond the flag
+    {"company-worker": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "true", "GH_TOKEN": "x"}}},
+    {"company-api": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "true"}}},       # another service
+    {"company-worker": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "false"}}},   # arms nothing
+])
+def test_an_override_that_changes_anything_else_is_refused_before_compose_runs_it(maintenance, change):
+    root, env = maintenance
+    Path(env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]).write_text(json.dumps({"services": change}))
+    result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
+    assert result.returncode != 0 and "pilot override" in result.stderr
+    assert not any(json.loads(line)[-1:] != ["json"] and "up" in json.loads(line)
+                   for line in (root / "calls").read_text().splitlines())
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o646])
+def test_a_writable_pilot_override_is_refused_before_any_docker_call(maintenance, mode):
+    root, env = maintenance
+    Path(env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]).chmod(mode)
+    assert command(env, "--stage-c-pilot", "up", "company-worker").returncode != 0
+    assert not (root / "calls").exists()
+
+
+def test_the_pilot_flag_is_refused_for_rm(maintenance):
+    root, env = maintenance
+    assert command(env, "--stage-c-pilot", "rm", "-sf", "company-worker").returncode != 0
+    assert not (root / "calls").exists()
+
+
+@pytest.mark.parametrize("name", ["COMPOSE_FILE", "COMPOSE_PROFILES", "COMPOSE_ENV_FILES"])
+def test_compose_environment_cannot_smuggle_another_configuration(maintenance, name):
+    """`env COMPOSE_FILE=… compose-bound.sh up` bypassed the "custom config files are refused" rule."""
+    root, env = maintenance
+    assert command(env | {name: "/tmp/other.yml"}, "up", "company-worker").returncode != 0
+    assert not (root / "calls").exists()
