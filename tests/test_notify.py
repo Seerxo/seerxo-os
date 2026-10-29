@@ -445,7 +445,7 @@ def test_pre_send_recovery_failure_stays_safely_retryable(monkeypatch):
 
         delivered, reason = svc.dispatch(db, event)
 
-        assert delivered is False and "transient before send intent" in reason
+        assert (delivered, reason) == (False, "recovery dispatch pending")   # a category; the text stays in the log
         assert event.notify_reason == "recovery dispatch pending"
         assert not event.notified
 
@@ -483,7 +483,7 @@ def test_dispatch_preserves_recovery_marker_when_rollback_and_marker_read_fail(m
             RuntimeError("marker lookup unavailable")))
 
         delivered, reason = svc.dispatch(db, event)
-        assert delivered is False and "simulated dispatch failure" in reason
+        assert (delivered, reason) == (False, "recovery delivery state unknown")
 
     with Session(engine) as verify:
         saved = verify.get(models.Event, event_id)
@@ -855,7 +855,7 @@ def test_post_send_commit_failure_preserves_ambiguous_recovery_marker(monkeypatc
 
         monkeypatch.setattr(db, "commit", fail_after_recovery_send)
         delivered, error = svc.dispatch(db, recovery)
-        assert delivered is False and "simulated database commit loss" in error
+        assert (delivered, error) == (False, "recovery delivery state preserved")
         assert recovery.notify_reason == "recovery delivery pending"
         assert len(adapter.sent) == 2
         state = db.scalar(select(models.NotificationState).where(
@@ -1055,3 +1055,32 @@ def test_the_token_filter_does_not_change_delivery(monkeypatch):
     monkeypatch.setattr(notify_module.settings, "telegram_admin_chat_ids", "42,43")
     notify_module.TelegramAdapter().send("x")
     assert len(sent) == 2 and all(u.endswith("/sendMessage") for u, _ in sent)
+
+
+def test_a_failed_delivery_returns_a_fixed_reason_and_keeps_the_detail_in_the_event():
+    """CodeQL py/stack-trace-exposure: API routes return dispatch's reason, so exception text (even redacted) must
+    stay in notify_error and the log, never reach a response."""
+    class Exploding(_Adapter):
+        def send(self, text):
+            raise RuntimeError("recipient 1: ConnectError: internal detail at /srv/app")
+
+    engine = create_engine("sqlite://")
+    models.Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        ev = _db_event(db)
+        delivered, reason = notify.NotificationService(Exploding()).dispatch(db, ev)
+        assert (delivered, reason) == (False, "delivery failed or uncertain")
+        assert "internal detail" in ev.notify_error
+
+
+def test_a_failing_decision_returns_a_fixed_reason():
+    class Broken(notify.NotificationService):
+        def _dispatch(self, db, event):
+            raise ValueError("internal detail at /srv/app")
+
+    engine = create_engine("sqlite://")
+    models.Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        ev = _db_event(db)
+        assert Broken(_Adapter()).dispatch(db, ev) == (False, "notification decision failed")
+        assert "internal detail" in ev.notify_error

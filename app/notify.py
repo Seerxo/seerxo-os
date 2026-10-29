@@ -258,7 +258,8 @@ class NotificationService:
 
     def dispatch(self, db: Session, event: models.Event) -> tuple[bool, str | None]:
         """Returns (delivered, reason_not_delivered). Never raises — a broken notifier
-        must not break the caller that recorded the event."""
+        must not break the caller that recorded the event. The reason is a fixed category: API routes return it,
+        so exception text (even redacted) stays in notify_error and the log, never in a response."""
         try:
             event_type = event.event_type
             event_id = event.id
@@ -280,7 +281,7 @@ class NotificationService:
             if event_type in ("WATCHDOG_CONDITION_RECOVERED", "INCIDENT_RESOLVED"):
                 if event_id is None or db is None:
                     log.error("recovery delivery state is unknown: %s", msg)
-                    return False, msg
+                    return False, "recovery delivery state unknown"
                 try:
                     with Session(bind=db.get_bind()) as marker_db:
                         marker = marker_db.execute(select(
@@ -288,7 +289,7 @@ class NotificationService:
                         ).where(models.Event.id == event_id)).one_or_none()
                         if marker is None or marker.notify_reason is not None or marker.notified:
                             log.error("recovery delivery state preserved: %s", msg)
-                            return False, msg
+                            return False, "recovery delivery state preserved"
                         # A NULL marker proves the recovery send intent was never
                         # persisted, so the failure happened before Telegram I/O.
                         marker_db.execute(update(models.Event).where(
@@ -298,10 +299,10 @@ class NotificationService:
                         ).values(notify_reason="recovery dispatch pending", notify_error=msg))
                         marker_db.commit()
                     log.error("recovery dispatch remains retryable: %s", msg)
-                    return False, msg
+                    return False, "recovery dispatch pending"
                 except Exception:  # the durable marker cannot be disproved safely
                     log.error("recovery delivery state is unknown: %s", msg)
-                    return False, msg
+                    return False, "recovery delivery state unknown"
             try:
                 if db is not None:
                     event.notify_error = msg
@@ -315,7 +316,7 @@ class NotificationService:
                         log.error("notification fallback rollback failed: %s",
                                   type(rollback_exc).__name__)
             log.error("notification decision failed: %s", msg)
-            return False, msg
+            return False, "notification decision failed"
 
     def _dispatch(self, db: Session, event: models.Event) -> tuple[bool, str | None]:
         category = self.category(event)
@@ -429,7 +430,7 @@ class NotificationService:
             self._block_waiting_recoveries(db, event)
             self._record(db, event, "delivery failed or uncertain", msg)
             log.error("telegram delivery failed: %s", msg)
-            return False, msg
+            return False, "delivery failed or uncertain"
         state = db.scalar(select(models.NotificationState).where(
             models.NotificationState.scope_key == scope).with_for_update()
             .execution_options(populate_existing=True))
@@ -534,7 +535,7 @@ class NotificationService:
             state.active = True
             state.delivery_status = "uncertain"
             self._record(db, event, "recovery delivery failed or uncertain", msg)
-            return False, msg
+            return False, "recovery delivery failed or uncertain"
         state.active = False
         state.delivery_status = "recovered"
         event.notified = True
