@@ -57,14 +57,18 @@ if 'up' in sys.argv:
         override.parent.mkdir(mode=0o755)
         override.write_text(json.dumps(PILOT))
         override.chmod(0o644)
+        script = root / "compose-bound.sh"
+        script.write_text((ROOT / "scripts/compose-bound.sh").read_text().replace(
+            'Path("/root/stage-c-pilot.compose.yml")', f'Path({str(override)!r})'))
         env = os.environ | {"COMPANY_OS_RELEASE_LEDGER": str(ledger), "MAINTENANCE_TEST": str(root),
+                            "MAINTENANCE_SCRIPT": str(script),
                             "COMPANY_OS_STAGE_C_PILOT_OVERRIDE": str(override),
                             "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"]}
         yield root, env
 
 
 def command(env, *args):
-    return subprocess.run(["bash", str(ROOT / "scripts/compose-bound.sh"), *args], env=env,
+    return subprocess.run(["bash", env["MAINTENANCE_SCRIPT"], *args], env=env,
                           text=True, capture_output=True, timeout=15)
 
 
@@ -73,8 +77,9 @@ def test_profile_and_pins_are_checked_for_the_command_that_is_executed(maintenan
     result = command(env, "--profile", "stage-c", "up", "-d", "--no-deps", "--no-build", "company-egress")
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
-    assert calls[0][:5] == ["compose", "--profile", "stage-c", "config", "--format"]
-    assert calls[1][:4] == ["compose", "--profile", "stage-c", "up"]
+    prefix = ["compose", "--env-file", ".env", "-f", "docker-compose.yml", "--profile", "stage-c"]
+    assert calls[0] == [*prefix, "config", "--format", "json"]
+    assert calls[1][:8] == [*prefix, "up"]
     assert calls[1][calls[1].index("--pull") + 1] == "never"
 
 
@@ -97,7 +102,7 @@ def test_install_and_build_locks_are_held_until_compose_finishes(maintenance):
     root, env = maintenance
     block = root / "block"
     block.touch()
-    proc = subprocess.Popen(["bash", str(ROOT / "scripts/compose-bound.sh"), "up", "--no-build", "company-worker"],
+    proc = subprocess.Popen(["bash", env["MAINTENANCE_SCRIPT"], "up", "--no-build", "company-worker"],
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 10
@@ -123,7 +128,7 @@ def test_the_pilot_override_arms_code_write_and_changes_nothing_else(maintenance
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
     override = env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]
-    assert calls[-1][:6] == ["compose", "-f", "docker-compose.yml", "-f", override, "up"]
+    assert calls[-1][:8] == ["compose", "--env-file", ".env", "-f", "docker-compose.yml", "-f", override, "up"]
     assert calls[-1][calls[-1].index("--pull") + 1] == "never"
 
 
@@ -139,15 +144,14 @@ def test_an_override_that_changes_anything_else_is_refused_before_compose_runs_i
     Path(env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]).write_text(json.dumps({"services": change}))
     result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
     assert result.returncode != 0 and "pilot override" in result.stderr
-    assert not any(json.loads(line)[-1:] != ["json"] and "up" in json.loads(line)
-                   for line in (root / "calls").read_text().splitlines())
+    assert not (root / "calls").exists()
 
 
 @pytest.mark.parametrize("mode", [0o664, 0o646])
 def test_a_writable_pilot_override_is_refused_before_any_docker_call(maintenance, mode):
     root, env = maintenance
     Path(env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]).chmod(mode)
-    assert command(env, "--stage-c-pilot", "up", "company-worker").returncode != 0
+    assert command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker").returncode != 0
     assert not (root / "calls").exists()
 
 
@@ -162,4 +166,36 @@ def test_compose_environment_cannot_smuggle_another_configuration(maintenance, n
     """`env COMPOSE_FILE=… compose-bound.sh up` bypassed the "custom config files are refused" rule."""
     root, env = maintenance
     assert command(env | {name: "/tmp/other.yml"}, "up", "company-worker").returncode != 0
+    assert not (root / "calls").exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "directory", "oversized", "bad_json"])
+def test_untrusted_pilot_file_is_refused_before_any_docker_call(maintenance, kind):
+    root, env = maintenance
+    override = Path(env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"])
+    if kind in ("symlink", "hardlink"):
+        other = override.with_suffix(".other")
+        override.rename(other)
+        if kind == "symlink":
+            override.symlink_to(other)
+        else:
+            os.link(other, override)
+    elif kind == "directory":
+        override.unlink()
+        override.mkdir()
+    else:
+        override.write_text(" " * 4097 if kind == "oversized" else "{")
+    assert command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker").returncode != 0
+    assert not (root / "calls").exists()
+
+
+@pytest.mark.parametrize("args", [
+    ("up", "-d", "company-worker"),
+    ("up", "-d", "--no-deps", "company-api"),
+    ("up", "-d", "--no-deps", "company-worker", "company-api"),
+    ("--profile", "stage-c", "up", "-d", "--no-deps", "company-worker"),
+])
+def test_pilot_cannot_start_dependencies_or_other_services(maintenance, args):
+    root, env = maintenance
+    assert command(env, "--stage-c-pilot", *args).returncode != 0
     assert not (root / "calls").exists()
