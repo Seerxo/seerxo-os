@@ -320,9 +320,63 @@ read the ledger or report; now 0640 with the directory's group (regression test 
   must equal the payload digest the host computed for the new commit (the shipped tree, DEPLOY_PATHS, is the same,
   not merely the commit name); and that event must record a well-formed image ID and configuration digest for api,
   worker and reasoner. Any missing, malformed or different piece, or an unreadable history, refuses. Releases
-  applied before payload digests were recorded and the bootstrap baseline cannot be rollback targets. **Until the
-  running images can be proven to be the target's recorded image IDs, every declared rollback refuses after these
-  checks** (founder, 2026-10-20: rebuilt images get new IDs, and a rollback whose images are not the recorded ones is
-  not a verified rollback; redeploying images by recorded ID is a separate deploy-driver change). A revert that does
+  applied before payload digests were recorded and the bootstrap baseline cannot be rollback targets. A rollback
+  also requires the target's recorded four-component `bound_images` and `inputs_digest` (including file modes and
+  symlink targets), exact image equality, and no schema-head change. A target from before image binding refuses;
+  it cannot be made verifiable by rebuilding. A revert that does
   not declare `rollback_to` is an ordinary forward release judged by the reviewer and the founder on its exact diff,
   and is never reported as a verified rollback.
+
+
+## Image binding and recovery
+
+Manifest v2 binds the immutable image IDs of API, worker, reasoner and reasoner egress before signing. The host
+requires a complete ready build record for the exact input digest, local image presence and retention anchors
+before pending. Apply uses the checked installed driver and never builds or pulls. Its resolved Compose images
+and post-switch container IDs must equal the signed map. The old three-component founder statement format stays
+compatible; the separate four-component binding is retained in pending, ledger and history.
+
+The installed host is one root-owned versioned bundle: the host verifier, gateway verifier, shared identity module,
+package marker and driver are all hashed in BUNDLE.json. Runtime modules must resolve inside that bundle, and
+normal operations require it to be installed as current. Manual prepare, apply, GC and maintenance Compose calls
+share the install/build locks. Maintenance supports the existing wizard/password operations; custom global
+configuration options and rebuild/pull requests are refused.
+
+The concrete installer is scripts/install-release-bundle.py. The cutover helper must delegate to its install
+operation rather than copy flat Python files. It drains timers/services and manual commands, takes the install
+lock, requires the exact applied SHA with no pending release, stages complete bundles, retains old flat code,
+switches current and the compatibility app links, and preserves the ledger bytes. Existing service working
+directories continue to resolve app through current/app. Only previously active timers restart; failure leaves
+them stopped. Build records inherit the trusted ledger directory's gateway group, stay root-writable only, and
+the installer exercises the gateway principal's read-only access. Installation and all production commands remain
+founder actions.
+
+The first transition runs under the old verifier. Stage the reviewed candidate M0 without switching current,
+then run that staged module's prepare --founder --bootstrap M0. Only this explicit operation may use staged code;
+release steps, observe and founder ledger operations refuse it. Config inspection uses non-secret placeholders
+for required Compose credentials; the clean build context never loads the production .env. After the four
+images exist, prepare a pins-only compose commit M with the same image-input digest. Fully test/review M and sign
+its v1 bootstrap manifest under the old verifier. Its driver checks the signed pins against the root-owned ready
+bootstrap record, consumes the attempt once, and never rebuilds. Only after M is applied may the founder install
+its bundles; subsequent releases use v2. Policy/rebase/public release signatures remain separate decisions.
+
+For failed or interrupted deployment recovery, the backup contains a standard-library identity checker and a
+durable baseline: old SHA, four image IDs/configuration digests, PostgreSQL revision/schema digest and dump hash.
+The previous compose tag is retained for legacy WORKER_IMAGE provenance. Only exact restoration plus the health
+gate and a completely readable unchanged dump can yield ROLLED_BACK_VERIFIED. Live business data is retained;
+this is not a database restore claim. A changed schema, missing evidence or identity mismatch never passes.
+
+Before any schema-changing migration, a marker is fsynced with its directory. An attempted migration prevents
+automatic rollback from starting previous code against an unverified database: the journal remains PARTIAL and
+requires explicit manual database recovery evidence. No automatic downgrade or destructive database restore is
+provided. A schema-neutral release skips Alembic upgrade entirely.
+
+Release acceptance still requires a real disposable Docker/PostgreSQL recovery drill for the exact candidate
+and installed image-store behavior. The fake-host acceptance suite proves control flow; it is not this drill.
+
+The hosted CI engine rehearsal (`tests/test_release_recovery_docker.py`) executes the production prepare and
+restore helpers with four disposable test images, verifies real image/configuration restoration and service
+health, and restores the PostgreSQL dump into a separate disposable database. It also refuses schema drift and
+attempted migration. It runs only on ephemeral hosted runners, with no host mounts or public ports. This proves
+the engine mechanisms; it does not exercise the production application's provider health checks, install a
+release, or replace the final candidate-image and production-host acceptance.

@@ -41,7 +41,30 @@ def rid(tag, s):
     if tag in s["tags"]: return s["tags"][tag]
     if tag in s["images"]: return tag
     sys.stderr.write("fake docker: no such image %%s\n" %% tag); sys.exit(1)
+def where(s, name):
+    """The record of a container or a never-started anchor, or None."""
+    if name in s["containers"]: return s["containers"], name
+    if name in s["anchors"]: return s["anchors"], name
+    return None
+def image_of(s, name):
+    found = where(s, name)
+    if not found: return None
+    table, key = found
+    return table[key] if table is s["anchors"] else table[key]["image"]
+def container_info(name):
+    c = s["containers"][name]
+    info = {"Name": "/" + name, "Image": c["image"],
+            "Config": {"Env": ["COMPANY_OS_GIT_SHA=" + c["sha"]], "User": "10001"},
+            "HostConfig": {"Privileged": bool(c.get("privileged"))}, "Mounts": [],
+            "NetworkSettings": {"Networks": {"company": {}}},
+            "State": {"Running": c["status"] == "running"}}
+    if s["knobs"].get("track_configuration"):
+        ref = c.get("reference", "company-os-" + KIND[name] + ":latest")
+        info["Config"]["Image"] = ref
+        if name == "company-worker": info["Config"]["Env"].append("WORKER_IMAGE=" + ref)
+    return info
 s = load()
+s.setdefault("anchors", {})
 cmd = args[0] if args else ""
 knobs = s["knobs"]
 def maybe_crash(point):
@@ -49,11 +72,39 @@ def maybe_crash(point):
         save(s)
         os.killpg(os.getpgrp(), signal.SIGKILL)
 KIND = {"company-api": "api", "company-worker": "worker", "company-reasoner": "reasoner", "company-reasoner-egress": "egress"}
+TREE = ("app", "migrations", "scripts", "agents", "skills", "tests", "docs/PERMANENT_FACTS.md")
+
+def image_id(target, files, drift=""):
+    # `drift` models a cold cache: apt/pip/npm fetch different bytes for the same inputs.
+    return "sha256:" + hashlib.sha256((target + json.dumps(files, sort_keys=True) + drift).encode()).hexdigest()
+
+def heads_of(ctx):
+    revs, downs = set(), set()
+    vdir = os.path.join(ctx, "migrations", "versions")
+    for n in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+        text = open(os.path.join(vdir, n)).read()
+        m = re.search(r'^revision: str = "([0-9a-f]{12})"', text, re.M); d = re.search(r'^down_revision: str \| None = "([0-9a-f]{12})"', text, re.M)
+        if m: revs.add(m.group(1))
+        if d: downs.add(d.group(1))
+    return sorted(revs - downs)
+
+def service_image(name):
+    """What Compose resolves for a service: the bound reference on the environment, else company-os-<kind>:<tag>."""
+    ref = service_ref(name)
+    if ref: return rid(ref, s)
+    return rid("company-os-%%s:%%s" %% (KIND[name], os.environ.get("COMPANY_OS_IMAGE_TAG", "latest")), s)
+
+def service_ref(name):
+    legacy = os.path.isfile("docker-compose.yml") and "x-test-legacy-tags: true" in open("docker-compose.yml").read()
+    if not legacy:
+        ref = os.environ.get("COMPANY_OS_IMAGE_" + KIND[name].upper())
+        if ref: return ref
+    return "company-os-%%s:%%s" %% (KIND[name], os.environ.get("COMPANY_OS_IMAGE_TAG", "latest"))
 
 if cmd == "tag":
     s["tags"][args[2]] = rid(args[1], s); save(s); sys.exit(0)
 
-def build_image(ctx, target, tag):
+def build_image(ctx, target, tag=None):
     maybe_crash("build")
     if knobs.get("block_build"):
         open(knobs["block_build"] + ".started", "w").close()
@@ -62,7 +113,7 @@ def build_image(ctx, target, tag):
         sys.stderr.write("fake docker: build failed\n"); sys.exit(1)
     files = {}
     # As the Dockerfile copies: these trees and one docs file; other docs never enter an image.
-    for sub in ("app", "migrations", "scripts", "agents", "skills", "tests", "docs/PERMANENT_FACTS.md"):
+    for sub in TREE:
         base = os.path.join(ctx, sub)
         if os.path.isfile(base):
             files[sub] = hashlib.sha256(open(base, "rb").read()).hexdigest()
@@ -73,37 +124,87 @@ def build_image(ctx, target, tag):
     for top in ("alembic.ini", "requirements.txt"):
         if os.path.exists(os.path.join(ctx, top)):
             files[top] = hashlib.sha256(open(os.path.join(ctx, top), "rb").read()).hexdigest()
-    revs, downs = set(), set()
-    vdir = os.path.join(ctx, "migrations", "versions")
-    for n in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
-        text = open(os.path.join(vdir, n)).read()
-        m = re.search(r'^revision: str = "([0-9a-f]{12})"', text, re.M); d = re.search(r'^down_revision: str \| None = "([0-9a-f]{12})"', text, re.M)
-        if m: revs.add(m.group(1))
-        if d: downs.add(d.group(1))
-    heads = sorted(revs - downs)
-    # `drift` models a cold cache: apt/pip/npm fetch different bytes for the same inputs.
-    img = "sha256:" + hashlib.sha256((target + json.dumps(files, sort_keys=True) + knobs.get("drift", "")).encode()).hexdigest()
-    s["images"][img] = {"files": files, "target": target, "heads": heads}
-    s["tags"][tag] = img
+    img = image_id(target, files, knobs.get("drift", ""))
+    s["images"][img] = {"files": files, "target": target, "heads": heads_of(ctx)}
+    if tag: s["tags"][tag] = img
     return img
 
 if cmd == "build":
-    ctx = args[-1]; target = args[args.index("--target") + 1]; tag = args[args.index("-t") + 1]
+    ctx = args[-1]; target = args[args.index("--target") + 1]
+    tag = args[args.index("-t") + 1] if "-t" in args else None
     img = build_image(ctx, target, tag)
+    if "--iidfile" in args: open(args[args.index("--iidfile") + 1], "w").write(img)
     save(s); print(img); sys.exit(0)
 
 if args[:2] == ["image", "inspect"]:
     if fmt() == "{{.Id}}":
         print(rid(args[-1], s)); sys.exit(0)
 
+if cmd == "images":
+    for tag in sorted(s["tags"]):
+        print(tag.rsplit(":", 1)[0])
+    sys.exit(0)
+
+if cmd == "ps":
+    flt = args[args.index("--filter") + 1] if "--filter" in args else ""
+    needle = flt.split("=", 1)[1] if "=" in flt else ""
+    for name in sorted(set(s["containers"]) | set(s["anchors"])):
+        if needle not in name:
+            continue
+        if "{{.Names}}" in fmt():
+            print(name + "\t" + image_of(s, name))
+        elif "{{.Image}}" in fmt():
+            print(image_of(s, name))
+        else:
+            print(name)
+    sys.exit(0)
+
+if cmd == "create":      # a never-started anchor: --name NAME ... --pull=never IMAGE true
+    name = args[args.index("--name") + 1]
+    ref = args[args.index("--pull=never") + 1]
+    if where(s, name):
+        sys.stderr.write("fake docker: container name %%s is already in use\n" %% name); sys.exit(1)
+    s["anchors"][name] = rid(ref, s); save(s); print(name); sys.exit(0)
+
+if cmd == "rm":
+    name = args[-1]
+    if s["containers"].pop(name, None) is None and s["anchors"].pop(name, None) is None:
+        sys.stderr.write("Error: No such container: %%s\n" %% name); sys.exit(1)
+    save(s); sys.exit(0)
+
+if cmd == "rename":
+    old, new = args[1], args[2]
+    found = where(s, old)
+    if not found:
+        sys.stderr.write("Error: No such container: %%s\n" %% old); sys.exit(1)
+    if where(s, new):
+        sys.stderr.write("fake docker: name %%s is already in use\n" %% new); sys.exit(1)
+    table, key = found
+    table[new] = table.pop(key); save(s); sys.exit(0)
+
 if cmd == "inspect":
-    name = args[1]; f = fmt()
+    if "--format" not in args and all(name in s["containers"] for name in args[1:]):
+        print(json.dumps([container_info(name) for name in args[1:]])); sys.exit(0)
+    rest, expecting = [], False
+    for a in args[1:]:
+        if expecting: expecting = False; continue
+        if a in ("--format", "--type"): expecting = True; continue
+        if a.startswith("--type="): continue
+        if a.startswith("-"): continue
+        rest.append(a)
+    name = rest[-1] if rest else ""
+    f = fmt()
     if name in s["containers"]:
         c = s["containers"][name]
+        if not f:
+            print("[]"); sys.exit(0)          # existence probe (anchors below use the same shape)
         out = {"{{.Image}}": c["image"], "{{.State.Health.Status}}": c["health"], "{{.State.StartedAt}}": c["started"],
                "{{.State.Status}}": c["status"], "{{.State.Running}}": "true" if c["status"] == "running" else "false",
                '{{index .Config.Labels "com.docker.compose.project.config_files"}}': os.environ["FAKE_OPT"] + "/docker-compose.yml"}
         print(out[f]); sys.exit(0)
+    if name in s["anchors"]:
+        if not f: print("[]"); sys.exit(0)
+        if f == "{{.Image}}": print(s["anchors"][name]); sys.exit(0)
     if name.startswith("sha256:") and f == "{{index .RepoDigests 0}}":
         print("registry/img@" + name); sys.exit(0)
     sys.stderr.write("Error: No such object: %%s\n" %% name); sys.exit(1)
@@ -130,16 +231,18 @@ if cmd == "logs":
     sys.exit(0)
 
 if cmd == "compose":
-    sub = args[1]
-    tag = os.environ.get("COMPANY_OS_IMAGE_TAG", "latest")
+    sub = next((a for a in args[1:] if a in ("config", "build", "run", "up", "down", "ps", "logs", "exec", "pull",
+                                             "start", "stop", "restart", "version")), "")
     if sub == "config":
         if "-q" in args:
             sys.exit(1 if knobs.get("bad_compose") else 0)
         cwd = os.path.realpath(".")
         # As real compose prints it: a build without a dockerfile is normalized to dockerfile: Dockerfile
         # (compose-go loader/normalize.go). `compose_build` replaces the api build to model other configurations.
-        svc = {n: {"image": "company-os-%%s:%%s" %% (k, tag), "build": {"context": cwd, "dockerfile": "Dockerfile", "target": k}}
-               for n, k in KIND.items()}
+        # A bound reference comes from the four COMPANY_OS_IMAGE_* variables the driver exports per call.
+        def ref(n):
+            return service_ref(n)
+        svc = {n: {"image": ref(n), "build": {"context": cwd, "dockerfile": "Dockerfile", "target": k}} for n, k in KIND.items()}
         if knobs.get("compose_build"):
             svc["company-api"]["build"] = {"context": cwd, **knobs["compose_build"]}
         print(json.dumps({"services": svc})); sys.exit(0)
@@ -149,7 +252,7 @@ if cmd == "compose":
             build_image(os.getcwd(), KIND[name], "company-os-%%s:%%s" %% (KIND[name], tagv))
         save(s); sys.exit(0)
     if sub == "run":
-        img = rid("company-os-api:latest", s)
+        img = service_image("company-api")
         if args[-2:] == ["alembic", "heads"]:
             for h in s["images"][img]["heads"]: print(h + " (head)")
             sys.exit(0)
@@ -162,9 +265,10 @@ if cmd == "compose":
         sha = os.environ.get("COMPANY_OS_GIT_SHA", "")
         svcs = [a for a in args[2:] if a in KIND]
         for i, name in enumerate(svcs):
-            image = rid("company-os-%%s:%%s" %% (KIND[name], tag), s)
+            image = service_image(name)
             s["clock"] += 1
             s["containers"][name] = {"image": image, "sha": sha, "status": "running", "started": "t%%04d" %% s["clock"],
+                                     "reference": service_ref(name),
                                      "health": "unhealthy" if sha in knobs.get("unhealthy_for", []) else "healthy"}
             if i == 0 and knobs.get("crash") == "switch:" + sha:
                 save(s); os.killpg(os.getpgrp(), signal.SIGKILL)
@@ -264,6 +368,7 @@ def base_files(**over):
         "migrations/versions/aaaaaaaaaaaa_init.py": (migration("aaaaaaaaaaaa", None), 0o644),
         "scripts/companyctl": (cli, 0o755), "scripts/stage-c-host-facts.py": ("", 0o644),
         "scripts/deploy-health-gate.sh": (GATE, 0o755),
+        "app/release_identity.py": ((ROOT / "app/release_identity.py").read_bytes(), 0o644),
         "scripts/install-host-cli.sh": (INSTALL_CLI, 0o755),
         "scripts/verify-release-permissions.py": (VERIFY_PERMS, 0o755),
         "scripts/company-os.cron": ("# schedule v1\n30 3 * * *   root  /opt/company-os/scripts/backup.sh\n", 0o644),
@@ -286,6 +391,7 @@ class Host:
         self.cron = parent / "etc-cron.d-company-os"
         self.cli_link = parent / "usr-local-bin" / "companyctl"
         self.ledger = parent / "var" / "lib" / "release-host" / "ledger" / "ledger.json"   # absent: not bootstrapped
+        self.builds = parent / "var" / "lib" / "release-host" / "builds"                   # release_host.BUILDS
         self.run_root = parent / "run" / "company-os-deploy"                                # release_host's staged copies
         self.state = parent / "docker-state.json"
         self.log = parent / "docker.log"
@@ -313,10 +419,15 @@ class Host:
         text = REMOTE
         for old, new in (("/opt/company-os", str(self.opt)), ("/var/lock/company-os-deploy.lock", str(self.var / "lock" / "deploy.lock")),
                          ("/var/log/company-os-deploy", str(self.var / "log" / "company-os-deploy")),
-                         ("/var/lib/release-host/ledger/ledger.json", str(self.ledger)), ("/run/company-os-deploy", str(self.run_root))):
+                         ("/var/lib/release-host/ledger/ledger.json", str(self.ledger)),
+                         ("/var/lib/release-host/builds", str(self.builds)), ("/run/company-os-deploy", str(self.run_root))):
             text = text.replace(old, new)
         assert "REL=/tmp\n" in text
-        return text
+        # Only the sandbox's owner stands in for root when the bootstrap record is checked.
+        text = text.replace("directory.st_uid != 0", "directory.st_uid != " + str(ME))
+        text = text.replace("info.st_uid != 0", "info.st_uid != " + str(ME))
+        # Fake container transitions are synchronous; polling delays belong to the real Docker drill.
+        return text.replace("seq 1 30", "seq 1 2").replace("sleep 3", "sleep 0")
 
     # -- state ---------------------------------------------------------------------------------------------
     def init_docker(self, current: Release, **knobs):
@@ -334,8 +445,56 @@ class Host:
         for name in ("company-postgres", "company-cloudflared"):
             containers[name] = {"image": "sha256:" + sha(name.encode()), "sha": "", "status": "running", "started": "t0000", "health": "healthy"}
         self.state.write_text(json.dumps({"rev": "aaaaaaaaaaaa", "images": images, "tags": tags, "containers": containers,
-                                          "clock": 0, "knobs": knobs}))
+                                          "anchors": {}, "clock": 0, "knobs": knobs}))
         self.log.write_text("")
+
+    def build_image_id(self, release: Release, kind: str, drift: str = "") -> str:
+        """The ID the fake builder yields for one component of `release` (same hashing as FAKE_DOCKER)."""
+        files = {}
+        for path, (content, _mode) in release.files.items():
+            if path.split("/")[0] in ("app", "migrations", "scripts", "agents", "skills", "tests") \
+                    or path in ("alembic.ini", "requirements.txt", "docs/PERMANENT_FACTS.md"):
+                files[path] = sha(content)
+        return "sha256:" + sha((kind + json.dumps(files, sort_keys=True) + drift).encode())
+
+    def bind(self, release: Release, *, attempt=1, drift=""):
+        """What `prepare` leaves behind for `release`: four local images and one never-started anchor each.
+        Returns the four bound IDs in release_gateway shape."""
+        state = self.docker_state()
+        revs, downs = set(), set()
+        for path, (content, _mode) in release.files.items():
+            if not path.startswith("migrations/versions/"):
+                continue
+            text = content.decode()
+            rev = re.search(r'^revision: str = "([0-9a-f]{12})"', text, re.M)
+            down = re.search(r'^down_revision: str \| None = "([0-9a-f]{12})"', text, re.M)
+            if rev: revs.add(rev.group(1))
+            if down: downs.add(down.group(1))
+        heads = sorted(revs - downs) or ["aaaaaaaaaaaa"]
+        ids = {}
+        for kind in ("api", "worker", "reasoner", "egress"):
+            image = self.build_image_id(release, kind, drift)
+            state["images"].setdefault(image, {"files": {}, "target": kind, "heads": heads})
+            state["anchors"][f"company-os-bound-{sha(release.sha.encode())[:12]}-a{attempt}-{kind}"] = image
+            ids[kind] = image
+        self.state.write_text(json.dumps(state))
+        return ids
+
+    def prepare(self, release: Release, *, attempt=1):
+        """Run the REAL driver's PREPARE=1 branch against a staged copy: builds four images and anchors them."""
+        self.releases += 1
+        self._next_second()
+        d = self.run_root / f"{release.sha}.prep{self.releases:04d}"
+        rel = self.sandboxed(release).write(d)
+        script = self.script.replace("REL=/tmp\n", f"REL={rel}\n", 1)
+        path = self.parent / f"prepare-{self.releases}.sh"
+        path.write_text(script)
+        env = self.env(SHA=release.sha, PREPARE="1", ATTEMPT=str(attempt), RELEASE_DIR=str(rel), APPLY="", AUTOMATIC="false")
+        proc = subprocess.run(["bash", str(path)], cwd=str(self.parent), env=env, capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        line = next(l for l in reversed(proc.stdout.splitlines()) if l.startswith("BOUND "))
+        fields = dict(f.split("=", 1) for f in line.split()[1:])
+        return {name: fields[name] for name in ("api", "worker", "reasoner", "egress")}
 
     def docker_state(self):
         return json.loads(self.state.read_text())

@@ -2,6 +2,7 @@
 main becomes a signed manifest the host verifier accepts; anything else stops with a recorded reason, and no
 check or model call is repeated for the same content."""
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -16,10 +17,16 @@ pytestmark = pytest.mark.skipif(not (shutil.which("ssh-keygen") and shutil.which
 
 ROOT = Path(__file__).parents[1]
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+DRIVER = "ef" * 32
 
 
 def sh(cwd, *args):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def bound(sha: str) -> dict:
+    """The four bound image IDs a build of `sha` produces, one per component, content addressed."""
+    return {c: "sha256:" + hashlib.sha256(f"{sha}:{c}".encode()).hexdigest() for c in rg.BOUND}
 
 
 def keypair(d: Path, name: str):
@@ -39,7 +46,11 @@ class World:
         (self.work / "app").mkdir()
         (self.work / "docs/HANDOFF.md").write_text("old\n")
         (self.work / "app/main.py").write_text("x = 1\n")
+        self.builds = tmp / "builds"
+        self.builds.mkdir()
         self.base = self.commit("base")
+        self.base_inputs = self.inputs_of(self.base)
+        self.bound = bound(self.base_inputs)      # images are addressed by the inputs they were built from
         self.origin = tmp / "origin.git"
         sh(tmp, "git", "clone", "-q", "--bare", str(self.work), str(self.origin))
         sh(self.work, "git", "remote", "add", "origin", str(self.origin))
@@ -52,7 +63,9 @@ class World:
         (tmp / "policy.sig").write_text(rg.sign(raw, self.keys["founder"][0], rg.NS_POLICY))
         (tmp / "founder.pub").write_text(self.keys["founder"][1])
         (tmp / "ledger.json").write_text(json.dumps({"last_sha": self.base, "last_sequence": 6, "seen": [],
-                                                     "min_policy_version": 1}))
+                                                     "min_policy_version": 1, "bound_images": self.bound,
+                                                     "bound_inputs": self.base_inputs,
+                                                     "bound_driver_sha256": DRIVER}))
         self.report(self.base)
         self.cfg = svc.Config({
             "repository": "seerxo/os", "branch": "main", "clone": str(self.clone), "fetch_url": str(self.origin),
@@ -60,6 +73,7 @@ class World:
             "founder_key": str(tmp / "founder.pub"), "gateway_key": str(self.keys["gateway"][0]),
             "ledger": str(tmp / "ledger.json"), "state": str(tmp / "state.json"), "outbox": str(tmp / "outbox"),
             "founder_queue": str(tmp / "queue"), "review_signer_socket": str(tmp / "signer.sock"),
+            "builds": str(self.builds),
             "checks_command": ["true"], "identity_report": str(tmp / "identity.json")})
         self.check_calls, self.review_calls = [], []
         self.checks_pass, self.verdict, self.review_key, self.review_error = True, "APPROVE", "reviewer", None
@@ -77,7 +91,25 @@ class World:
             p.write_text(text)
         sh(self.work, "git", "add", "-A")
         sh(self.work, "git", "commit", "-qm", message)
-        return sh(self.work, "git", "rev-parse", "HEAD")
+        sha = sh(self.work, "git", "rev-parse", "HEAD")
+        self.prepare(sha)                     # the host built images for this commit before the gateway looked
+        return sha
+
+    def inputs_of(self, sha, repo=None):
+        return rg.inputs_digest(rg.release_archive(repo or self.work, sha))
+
+    def prepare(self, sha, repo=None):
+        """What root's `prepare` writes: a ready build record for exactly this commit's image inputs. Image IDs are
+        addressed by those inputs, so two commits with the same tree name the same four images (as production does)."""
+        try:
+            digest = self.inputs_of(sha, repo)
+        except (rg.Refused, subprocess.CalledProcessError):
+            return None                       # an archive that would ship other bytes: no record, and no release
+        (self.builds / f"{digest}.json").write_text(json.dumps({
+            "inputs_digest": digest, "built_from_sha": sha, "repository": "seerxo/os", "recipe": "fixture",
+            "bootstrap": False, "attempt": 1, "built_at": NOW.isoformat(), "status": "ready",
+            "images": bound(digest)}))
+        return digest
 
     def push(self, force=False):
         sh(self.work, "git", "push", "-q", *(["--force"] if force else []), "origin", "main")
@@ -104,10 +136,14 @@ class World:
         m = json.loads(raw)
         ledger = json.loads(self.cfg.ledger.read_text())
         policy = rg.load_policy(self.cfg.policy.read_bytes(), self.cfg.policy_sig.read_text(), self.keys["founder"][1])
+        digest = self.inputs_of(m["sha"])
+        record, _ = svc.read_build_record(self.builds, digest)
         facts = {"repository": "seerxo/os", "branch": "main", "sha": m["sha"],
                  "payload_digest": rg.payload_digest(rg.payload_listing(self.work, m["sha"])),
                  "changed_paths": rg.git_changed_paths(self.work, ledger["last_sha"], m["sha"]),
-                 "ancestor_of_parent": True, "diff": rg.git_release_diff(self.work, ledger["last_sha"], m["sha"])}
+                 "ancestor_of_parent": True, "diff": rg.git_release_diff(self.work, ledger["last_sha"], m["sha"]),
+                 "inputs_digest": digest, "build_record": record, "driver_bound": True, "driver_sha256": DRIVER,
+                 "images_present": True, "anchored_images": True}
         return rg.verify_release(raw, sig, policy=policy, founder_key=self.keys["founder"][1], host_facts=facts,
                                  state=ledger, now=NOW)
 

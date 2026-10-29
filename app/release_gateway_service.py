@@ -18,6 +18,7 @@ import json
 import socket
 import os
 import secrets
+import stat
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ MAX_ATTEMPTS = 3                     # per candidate commit, for infrastructure 
 IDENTITY_MAX_AGE = timedelta(minutes=15)
 MANIFEST_LIFETIME = timedelta(hours=2)
 REVIEW_TIMEOUT_S = 900
+MAX_BUILD_RECORD = 1 << 20           # a build record is a few KiB; the gateway reads nothing bigger
 
 
 class Config:
@@ -38,12 +40,14 @@ class Config:
         need = {"repository", "branch", "clone", "fetch_url", "policy", "policy_sig", "founder_key", "gateway_key",
                 "ledger", "state", "outbox", "founder_queue", "review_signer_socket", "checks_command",
                 "identity_report"}
-        if not isinstance(raw, dict) or set(raw) != need:
-            raise rg.Refused(f"gateway config must have exactly {sorted(need)}")
+        # `builds` is optional: by default it is the root-written build-record directory next to the ledger's.
+        if not isinstance(raw, dict) or not need <= set(raw) or set(raw) - need - {"builds"}:
+            raise rg.Refused(f"gateway config must have exactly {sorted(need)} and optionally 'builds'")
         self.__dict__.update(raw)
         for key in ("clone", "policy", "policy_sig", "founder_key", "gateway_key", "ledger", "state", "outbox",
                     "founder_queue", "identity_report"):
             setattr(self, key, Path(raw[key]))
+        self.builds = Path(raw["builds"]) if "builds" in raw else Path(raw["ledger"]).parent.parent / "builds"
         if not isinstance(self.checks_command, list) or not all(isinstance(a, str) and a for a in self.checks_command):
             raise rg.Refused("checks_command must be a non-empty argv list")
 
@@ -82,6 +86,59 @@ def _read_state(path: Path) -> dict:
                                               for k in ("attempts", "done", "rejected_on")):
         raise rg.Refused("gateway state is malformed; the founder must restore it")
     return state
+
+
+def read_build_record(builds: Path, digest: str) -> tuple[dict | None, str | None]:
+    """The root-written record for exactly these image inputs (design §3/§4.1), or (None, None) when there is none.
+    Read as the unprivileged gateway user: never through a symlink, never a hard link or a device, bounded, and only
+    from a file that user cannot write (root, or this process's own test user). Anything else is a problem, never
+    silently "no record": a copied or planted record must not become a signed image."""
+    path = builds / f"{digest}.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        return None, f"the build record is unreadable ({type(error).__name__})"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BUILD_RECORD or info.st_nlink != 1:
+            return None, "the build record is not a regular file with one name"
+        if info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022:
+            return None, "the build record is not a root-written, unwritable file"
+        raw = os.read(fd, MAX_BUILD_RECORD + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_BUILD_RECORD:
+        return None, "the build record is too large"
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None, "the build record is not valid JSON"
+    if not isinstance(record, dict):
+        return None, "the build record is not an object"
+    if record.get("inputs_digest") != digest:
+        return record, "the build record is for different image inputs"
+    return record, None
+
+
+def release_images(cfg: Config, ledger: dict, digest: str) -> tuple[dict | None, str | None]:
+    """The four image IDs a manifest for this `inputs_digest` must name (§4.1), or a reason to WAIT.
+    Unchanged inputs reuse the running bound set; changed inputs need a ready root-written build record. Neither
+    the checks nor the reviewer run, and no attempt is counted, when this returns nothing."""
+    bound, bound_inputs = ledger.get("bound_images"), ledger.get("bound_inputs")
+    if rg.images_ok(bound) and digest == bound_inputs:
+        return bound, None
+    record, problem = read_build_record(cfg.builds, digest)
+    if problem:
+        return None, f"the build record cannot be trusted: {problem}"
+    if not isinstance(record, dict):
+        return None, "images not prepared by this host: the founder must run prepare"
+    if record.get("status") != "ready":
+        return None, f"the host is still preparing these images (build record status {record.get('status')!r})"
+    if not rg.images_ok(record.get("images")):
+        return None, "the build record names no usable image IDs: the founder must run prepare"
+    return record["images"], None
 
 
 def default_checks(cfg: Config, sha: str) -> dict:
@@ -205,7 +262,7 @@ def _tick(cfg: Config, *, now, clock, checks, review, fetch) -> dict:
     except subprocess.CalledProcessError:      # e.g. a submodule entry: counted, bounded, never silent
         return _infra(cfg, state, sha, attempts, "could not compute the release content", now)
     try:
-        rg.release_archive(cfg.clone, sha)      # never sign bytes that would ship differently from those reviewed
+        tar = rg.release_archive(cfg.clone, sha)  # never sign bytes that would ship differently from those reviewed
     except rg.Refused as refused:
         return _decide(cfg, state, sha, "REFUSED", str(refused), now)
     except subprocess.CalledProcessError:
@@ -217,6 +274,23 @@ def _tick(cfg: Config, *, now, clock, checks, review, fetch) -> dict:
     # After the reviewer rejected a candidate on this release base, later candidates on the same base go to the
     # founder: a trivial new commit must not buy a fresh roll of the reviewer.
     reviewer_already_rejected = state.get("rejected_on", {}).get(parent, 0) > 0
+
+    # §4.1: what may run is decided by the image inputs, BEFORE any check or model call. A gateway release may only
+    # reuse the running bound set when nothing it builds from changed; anything else needs the host's pre-sign build
+    # record. Without usable images the tick waits: the attempt is not counted and the reviewer is not asked.
+    try:
+        inputs = rg.inputs_digest(tar)
+    except rg.Refused as refused:
+        return _decide(cfg, state, sha, "REFUSED", str(refused), now)
+    gateway_ok = (risk == "low" and not migration and policy["auto_release"] and not reviewer_already_rejected
+                  and not ledger.get("chain_base") and rg.images_ok(ledger.get("bound_images"))
+                  and inputs == ledger.get("bound_inputs"))
+    if gateway_ok:
+        images = ledger["bound_images"]
+    else:
+        images, wait = release_images(cfg, ledger, inputs)
+        if images is None:
+            return record("WAITING", sha=sha, reason=wait)
 
     # The attempt is recorded durably BEFORE the checks and the reviewer run: whatever fails afterwards (the
     # founder-queue or outbox write, signing, a crash) has already been counted, so the model is asked at most
@@ -254,7 +328,7 @@ def _tick(cfg: Config, *, now, clock, checks, review, fetch) -> dict:
         return _decide(cfg, state, sha, "REVIEW_REFUSED", str(refused), now)
 
     base = {"version": rg.MANIFEST_VERSION, "repository": cfg.repository, "branch": cfg.branch, "sha": sha,
-            "parent_sha": parent, "payload_digest": digest, "changed_paths": paths,
+            "parent_sha": parent, "payload_digest": digest, "changed_paths": paths, "images": images,
             "sequence": ledger.get("last_sequence", 0) + 1, "issued_at": now.isoformat(),
             "expires_at": (now + MANIFEST_LIFETIME).isoformat(), "policy_version": policy["version"],
             "migration_to": ""}

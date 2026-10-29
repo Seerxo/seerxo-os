@@ -125,12 +125,18 @@ def test_the_reasoner_image_carries_only_stdlib_modules_it_copies():
     # Break caught: a model CLI back in the container that holds DATABASE_URL and GH_TOKEN.
     assert "claude-code" not in worker and "@openai/codex" not in worker
     rsn = yaml.safe_load((root / "docker-compose.yml").read_text())["services"]["company-reasoner"]
-    assert rsn["build"]["target"] == "reasoner" and rsn["image"].startswith("company-os-reasoner:")
+    assert rsn["build"]["target"] == "reasoner"
+    assert rsn["image"] == "${COMPANY_OS_IMAGE_REASONER:?bound image ID required}"
 
 
-def test_every_company_os_image_runs_the_release_tag():
+def test_release_components_require_bound_ids_and_auxiliary_images_keep_the_release_tag():
     services = yaml.safe_load((Path(__file__).resolve().parent.parent / "docker-compose.yml")
                               .read_text())["services"]
-    ours = {n: s["image"] for n, s in services.items() if s.get("image", "").startswith("company-os-")}
-    # Break caught: the egress boundary stays on a mutable :latest while the app rolls back.
-    assert len(ours) >= 5 and all(i.endswith(":${COMPANY_OS_IMAGE_TAG:-latest}") for i in ours.values()), ours
+    bound = {"company-api": "API", "company-worker": "WORKER", "company-reasoner": "REASONER",
+             "company-reasoner-egress": "EGRESS"}
+    for service, component in bound.items():
+        assert services[service]["image"] == "${COMPANY_OS_IMAGE_" + component + ":?bound image ID required}"
+    assert services["company-worker"]["environment"]["WORKER_IMAGE"] == "${COMPANY_OS_IMAGE_WORKER}"
+    auxiliary = {n: s["image"] for n, s in services.items() if s.get("image", "").startswith("company-os-")}
+    assert set(auxiliary) == {"company-egress", "company-review-signer"}
+    assert all(i.endswith(":${COMPANY_OS_IMAGE_TAG:-latest}") for i in auxiliary.values()), auxiliary

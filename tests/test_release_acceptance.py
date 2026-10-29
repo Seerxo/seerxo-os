@@ -334,6 +334,12 @@ def test_an_interrupted_deploy_is_visible_blocks_the_next_one_and_recovers_deter
     refused = host.deploy(release_v2())
     assert refused.returncode != 0 and "did not finish cleanly" in refused.stdout and len(host.backups()) == 1
     rec = host.recover(backup)
+    if crash != "build":
+        assert rec.returncode != 0 and "RECOVERY PARTIAL" in rec.stdout, rec.stdout
+        assert "RECOVERY VERIFIED" not in rec.stdout and host.phase(backup) == "ROLLED_BACK_PARTIAL"
+        assert "refusing to start previous code" in rec.stdout
+        assert host.deploy(release_v2()).returncode != 0
+        return
     assert rec.returncode == 0 and "RECOVERY VERIFIED: " + V1 in rec.stdout, rec.stdout
     assert host.phase(backup) == "ROLLED_BACK_VERIFIED"
     assert host.tree() == before[0]                                                       # bytes and modes; added files gone
@@ -349,7 +355,7 @@ def test_the_runbook_recovery_command_needs_no_deploy_mode(host):
     # Break caught (release review of 59789aa): `sudo RECOVER_DIR=... bash deploy-driver.sh` runs without AUTOMATIC
     # (sudo drops the environment) and aborted with "deploy mode unknown"; the harness pre-set AUTOMATIC and hid it.
     running(host)
-    host.set_knobs(crash="migrate")
+    host.set_knobs(crash="build")
     assert host.deploy(with_schema_change(release_v2()), allow_migration="bbbbbbbbbbbb").returncode < 0
     backup = host.backups()[-1]
     host.set_knobs()
@@ -417,9 +423,9 @@ def test_two_deploys_cannot_overlap_and_the_second_changes_nothing(host):
     host.set_knobs(block_build=str(gate))
     first = host.deploy(release_v2(), detach=True)
     assert first.returncode == 0 and "detached" in first.stdout
-    deadline = time.time() + 30
+    deadline = time.monotonic() + 30
     while not Path(str(gate) + ".started").exists():
-        assert time.time() < deadline, "the first deploy never reached the build"
+        assert time.monotonic() < deadline, "the first deploy never reached the build"
         time.sleep(0.05)
     during = (host.tree(), host.containers())
     second = host.deploy(Release(V3, release_v1().files), detach=True)
@@ -427,9 +433,9 @@ def test_two_deploys_cannot_overlap_and_the_second_changes_nothing(host):
     assert len(host.backups()) == 1                                                       # the loser created nothing
     gate.unlink()                                                                         # let the first one finish
     log = host.var / "log" / "company-os-deploy-latest.log"
-    deadline = time.time() + 60
+    deadline = time.monotonic() + 60
     while "EXIT " not in (log.read_text() if log.exists() else ""):
-        assert time.time() < deadline, "the first deploy never finished"
+        assert time.monotonic() < deadline, "the first deploy never finished"
         time.sleep(0.1)
     assert log.read_text().rstrip().endswith("EXIT 0") and host.phase() == "VERIFIED"
     assert {c[0] for c in host.containers().values()} == {V2}
@@ -513,13 +519,15 @@ def test_an_unreadable_ledger_refuses(host):
 
 def test_the_release_the_verifier_marked_pending_applies(host):
     running(host)
-    bootstrapped(host, pending(V2, next_dir(host, V2)))
+    ids = host.prepare(release_v2())
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids))
     out = host.deploy(release_v2(), staged=True, automatic="true")
     assert out.returncode == 0 and "RELEASE VERIFIED: " + V2 in out.stdout and REFUSED not in out.stdout, out.stdout
     assert host.phase() == "VERIFIED" and {c[0] for c in host.containers().values()} == {V2}
+    assert running_binding(host) == ids      # exactly the bound IDs, never a tag
 
 
-# --- #192 F4: a gateway (LOW) release may not change what the images contain ------------------------------------
+# --- bound releases: the driver starts prebuilt IDs and never builds (IMAGE_BINDING_DESIGN.md §3–§5) -----------
 
 def docs_release(base: Release, sha: str, text: str) -> Release:
     """`base` plus one docs file that no image copies: the shape policy v3 lets the gateway release."""
@@ -532,62 +540,127 @@ def release_tags(state) -> dict:
 
 
 def gateway_host(host: Host) -> Release:
-    """V1 deployed by the real driver (its images are what a rebuild of V1 yields), then bootstrapped."""
+    """V1 deployed by the real driver, then (as release_host's bootstrap did) recorded as the running binding."""
     v1 = running(host)
     assert host.deploy(v1).returncode == 0
     return v1
 
 
-def test_a_gateway_release_that_rebuilds_the_running_images_applies(host):
+def v1_binding(host: Host) -> dict:
+    """The four IDs the legacy deploy left running, in release_gateway shape."""
+    return running_binding(host)
+
+
+KINDS = {"company-api": "api", "company-worker": "worker", "company-reasoner": "reasoner",
+         "company-reasoner-egress": "egress"}
+
+
+def running_binding(host: Host) -> dict:
+    """Component -> the image ID its container runs now (release_gateway shape)."""
+    return {KINDS[name]: container[1] for name, container in host.containers().items() if name in KINDS}
+
+
+def test_a_gateway_release_binds_the_prebuilt_images_and_applies(host):
     v1 = gateway_host(host)
-    bootstrapped(host, pending(V2, next_dir(host, V2), last_sha=V1, pending_approver="gateway"))
+    running_ids = v1_binding(host)
+    ids = host.prepare(docs_release(v1, V2, "notes\n"))          # a docs-only release has the same image inputs
+    assert ids == running_ids                                     # nothing was rebuilt for unreviewed bytes
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids, bound_images=running_ids,
+                               pending_approver="gateway"))
     out = host.deploy(docs_release(v1, V2, "notes\n"), staged=True, automatic="true")
     assert out.returncode == 0 and "RELEASE VERIFIED: " + V2 in out.stdout, out.stdout
+    assert running_binding(host) == ids
 
 
-@pytest.mark.parametrize("approver", ["gateway", None, "someone"], ids=["gateway", "older-verifier", "malformed"])
-def test_a_non_founder_release_whose_build_drifts_aborts_before_migration(host, approver):
-    # Break caught: a cold build cache re-ran apt/pip/npm and a docs-only LOW release shipped unreviewed bytes.
-    v1 = gateway_host(host)
-    host.set_knobs(drift="cold-cache")
-    ledger = pending(V2, next_dir(host, V2), pending_approver=approver)
-    bootstrapped(host, {k: v for k, v in ledger.items() if v is not None})
-    containers = {n: c[0] for n, c in host.containers().items()}
-    release_tags_before = release_tags(host.docker_state())
+def test_a_bound_apply_never_builds_anything(host):
+    gateway_host(host)
+    v2 = release_v2()                                             # different app bytes: four new images
+    ids = host.prepare(v2)
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids))
     host.log.write_text("")
-    out = host.deploy(docs_release(v1, V2, "notes\n"), staged=True, automatic="true")
-    assert out.returncode != 0 and "a founder-signed release is required" in out.stdout, out.stdout
-    assert "ABORT:" in out.stdout and "nothing migrated" in out.stdout
-    assert {n: c[0] for n, c in host.containers().items()} == containers       # nothing switched
-    assert "alembic upgrade" not in host.log.read_text()
-    assert release_tags(host.docker_state()) == release_tags_before          # every image tag restored
-    assert not list(host.parent.rglob("build-context"))                        # the build context is gone
+    out = host.deploy(v2, staged=True, automatic="true")
+    assert out.returncode == 0, out.stdout
+    assert " build " not in " " + host.log.read_text() + " "      # no docker build was reachable from apply
+    assert running_binding(host) == ids
 
 
-@pytest.mark.parametrize("egress", ["absent", "exited"])
-def test_a_held_release_with_a_service_not_running_aborts_before_any_build(host, egress):
-    # Break caught: with egress absent nothing could be compared and its rebuilt tag had no previous value to
-    # restore; a stopped egress still reports an image, which is not what production runs.
+def test_a_pending_release_without_images_is_not_the_bootstrap_release(host):
     v1 = gateway_host(host)
+    running_ids = v1_binding(host)
+    before = snapshot(host)
+    bootstrapped(host, pending(V2, next_dir(host, V2), bound_images=running_ids))
+    out = host.deploy(docs_release(v1, V2, "notes\n"), staged=True, automatic="true")
+    assert out.returncode != 0 and "this pending release names none" in out.stdout, out.stdout
+    assert snapshot(host) == before
+
+
+def test_a_bound_apply_refuses_an_image_it_cannot_anchor(host):
+    v1 = gateway_host(host)
+    v2 = release_v2()
+    ids = host.prepare(v2)
     state = host.docker_state()
-    if egress == "absent":
-        del state["containers"]["company-reasoner-egress"]
-    else:
-        state["containers"]["company-reasoner-egress"]["status"] = "exited"
+    state["anchors"].pop(next(n for n in state["anchors"] if n.startswith("company-os-bound-") and n.endswith("-worker")))
     host.state.write_text(json.dumps(state))
-    bootstrapped(host, pending(V2, next_dir(host, V2), pending_approver="gateway"))
+    before = snapshot(host)
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids))
     host.log.write_text("")
-    out = host.deploy(docs_release(v1, V2, "notes\n"), staged=True, automatic="true")
-    assert out.returncode != 0 and "needs company-reasoner-egress running" in out.stdout, out.stdout
-    assert " build " not in " " + host.log.read_text() and release_tags(host.docker_state()) == release_tags(state)
+    out = host.deploy(v2, staged=True, automatic="true")
+    assert out.returncode != 0 and "not anchored" in out.stdout, out.stdout
+    assert snapshot(host) == before and " upgrade " not in " " + host.log.read_text() + " "
 
 
-def test_a_founder_release_may_change_the_images(host):
+def test_a_bound_apply_refuses_an_image_that_is_not_present(host):
     v1 = gateway_host(host)
-    host.set_knobs(drift="cold-cache")
-    bootstrapped(host, pending(V2, next_dir(host, V2)))                            # pending_approver: founder
-    out = host.deploy(docs_release(v1, V2, "notes\n"), staged=True, automatic="true")
-    assert out.returncode == 0 and "RELEASE VERIFIED: " + V2 in out.stdout, out.stdout
+    v2 = release_v2()
+    ids = host.prepare(v2)
+    state = host.docker_state()
+    state["images"].pop(ids["reasoner"])
+    host.state.write_text(json.dumps(state))
+    before = snapshot(host)
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids))
+    out = host.deploy(v2, staged=True, automatic="true")
+    assert out.returncode != 0 and "is not present on this host" in out.stdout, out.stdout
+    assert snapshot(host) == before
+
+
+def test_a_bound_host_must_run_all_four_services(host):
+    v1 = gateway_host(host)
+    v2 = release_v2()
+    ids = host.prepare(v2)
+    state = host.docker_state()
+    del state["containers"]["company-reasoner-egress"]
+    host.state.write_text(json.dumps(state))
+    before = snapshot(host)
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids))
+    host.log.write_text("")
+    out = host.deploy(v2, staged=True, automatic="true")
+    assert out.returncode != 0 and "must run all four services" in out.stdout, out.stdout
+    assert snapshot(host) == before and " upgrade " not in " " + host.log.read_text() + " "
+
+
+def test_a_failed_bound_release_rolls_back_to_the_previous_four_images(host):
+    v1 = gateway_host(host)
+    running_ids = v1_binding(host)
+    v2 = release_v2()
+    ids = host.prepare(v2)
+    host.set_knobs(unhealthy_for=[V2])
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids, bound_images=running_ids))
+    out = host.deploy(v2, staged=True, automatic="true")
+    assert out.returncode != 0 and "ROLLBACK VERIFIED" in out.stdout, out.stdout
+    assert host.phase() == "ROLLED_BACK_VERIFIED"
+    assert running_binding(host) == running_ids
+
+
+def test_the_prepare_branch_builds_anchors_and_changes_nothing_else(host):
+    running(host)
+    host.log.write_text("")
+    ids = host.prepare(release_v2())
+    log = host.log.read_text()
+    assert set(ids) == {"api", "worker", "reasoner", "egress"} and all(i.startswith("sha256:") for i in ids.values())
+    assert len(re.findall(r"^build ", log, re.M)) == 4
+    assert log.count("create --name company-os-bound-") == 4
+    assert not re.search(r"^(tag|rename|rm|compose up|compose run)", log, re.M)   # no tag, no container, no migration
+    assert {n: c[0] for n, c in host.containers().items()} == {n: V1 for n in host.containers()}
 
 
 def test_without_a_ledger_the_attended_legacy_deploy_is_unchanged(host):
@@ -606,7 +679,7 @@ def test_a_read_only_run_on_a_bootstrapped_host_is_unchanged(host):
 
 def test_recovery_on_a_bootstrapped_host_is_unchanged(host):
     running(host)
-    host.set_knobs(crash="migrate")
+    host.set_knobs(crash="build")
     assert host.deploy(with_schema_change(release_v2()), allow_migration="bbbbbbbbbbbb").returncode < 0
     backup = host.backups()[-1]
     host.set_knobs()
@@ -645,3 +718,53 @@ def test_nothing_sourced_after_the_gate_can_change_what_it_decided(host):
     out = host.deploy(release_v2(), staged=True, automatic="true")
     assert out.returncode != 0 and "RELEASE VERIFIED" not in out.stdout, out.stdout
     assert {c[0] for c in host.containers().values()} == {before[1][n] for n in before[1]}
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_first_bound_bootstrap_recovers_old_tag_shaped_compose_and_exact_configuration(host, interrupted):
+    import gzip
+    from app import release_gateway as rg
+    v1 = running(host, release_v1(**{"docker-compose.yml": ("x-test-legacy-tags: true\nservices: {}\n", 0o644)}))
+    v2 = release_v2()
+    ids = host.prepare(v2)
+    payload = host.sandboxed(v2).write(host.parent / "inputs-for-bootstrap")
+    digest = rg.inputs_digest(gzip.decompress((payload / "src.tgz").read_bytes()))
+    host.builds.mkdir(parents=True, exist_ok=True)
+    record = {"status": "ready", "inputs_digest": digest, "bootstrap": True, "images": ids, "attempt": 1}
+    (host.builds / (digest + ".json")).write_text(json.dumps(record))
+    pins = {"inputs_sha256": digest, **ids}
+    compose = "x-bound-images: {" + ", ".join(k + ": '" + v + "'" for k, v in pins.items()) + "}\nservices: {}\n"
+    v2 = Release(V2, v2.files | {"docker-compose.yml": (compose, 0o644)})
+    before = running_binding(host)
+    knobs = {"track_configuration": True}
+    knobs.update({"crash": "switch:" + V2} if interrupted else {"unhealthy_for": [V2]})
+    host.set_knobs(**knobs)
+    bootstrapped(host, pending(V2, next_dir(host, V2)))
+    result = host.deploy(v2, staged=True, automatic="true",
+                         ACK_COMPOSE=__import__("hashlib").sha256(v1.files["docker-compose.yml"][0]).hexdigest()[:12])
+    if interrupted:
+        assert result.returncode < 0, result.stdout
+        host.set_knobs(track_configuration=True)
+        result = host.recover(host.backups()[-1])
+        assert result.returncode == 0, result.stdout
+    else:
+        assert result.returncode != 0, result.stdout
+    assert host.backups(), result.stdout
+    assert host.phase() == "ROLLED_BACK_VERIFIED", result.stdout
+    assert running_binding(host) == before
+    journal = json.loads((host.backups()[-1] / "recovery-identity.json").read_bytes())
+    assert journal["compose_tag"] == "latest"
+
+
+def test_dotenv_cannot_replace_bound_image_authority(host):
+    gateway_host(host)
+    v2 = release_v2()
+    ids = host.prepare(v2)
+    env = host.opt / ".env"
+    env.write_text(env.read_text() + "BOUND=no\nBOOTSTRAP=yes\nBOUND_API=sha256:" + "f" * 64 + "\n")
+    bootstrapped(host, pending(V2, next_dir(host, V2), pending_images=ids))
+    host.log.write_text("")
+    result = host.deploy(v2, staged=True, automatic="true")
+    assert result.returncode == 0, result.stdout
+    assert running_binding(host) == ids
+    assert not re.search(r"^build ", host.log.read_text(), re.M)

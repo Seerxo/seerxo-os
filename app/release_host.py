@@ -8,25 +8,35 @@ Each step takes the next manifest (gateway outbox: low risk, gateway-signed; fou
 fetches the named commit into the host's own clone with a read-only credential, computes every fact itself
 (commit, payload digest, changed paths, release diff, ancestry), and runs release_gateway.release_transaction.
 Apply builds the same three artifacts the staged deploy transport ships (src.tgz, main.sha256 and the deploy
-driver's root-side script) from that clone and runs the existing driver synchronously: its exit code decides.
+driver's root-side script) from that clone and runs the installed driver synchronously: its exit code decides.
 A failure leaves the ledger `pending`, and no later release is applied until the founder reconciles the host.
 No GitHub workflow, runner or SSH key is involved, so none of them can change production.
+
+Images are built BEFORE a manifest is signed (`prepare`) and bound by content-addressed ID in the manifest; apply
+never builds (`IMAGE_BINDING_DESIGN.md` §3–§5). The verifier and the driver are one installed bundle, self-checked
+before every command, so a half-copied install can never run an old driver under a new verifier.
 """
+import fcntl
 import gzip
 import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
-from datetime import datetime, timezone
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import release_gateway as rg
+from app.release_identity import security_config, SET_LIKE, VOLATILE_CONFIG, VOLATILE_HOST_CONFIG, _normalise
 
 REMOTE_START, REMOTE_END = "<<'REMOTE'\n", "\nREMOTE\n"
 # The deploy driver accepts only RELEASE_DIR =~ ^/run/company-os-deploy/[0-9a-f]{40}\.[A-Za-z0-9]{8}$ (F3).
@@ -37,6 +47,18 @@ HOST_COMPOSE = Path("/opt/company-os/docker-compose.yml")
 # The ledger path the deploy driver reads to recognise a bootstrapped host (verify-release-manifest, B6 step 8).
 LEDGER_PRODUCTION = Path("/var/lib/release-host/ledger/ledger.json")
 LEDGER = LEDGER_PRODUCTION                           # tests point this elsewhere; the config must name it exactly
+# Pre-sign build records (design §3): root-written, one per image-inputs digest.
+BUILDS_PRODUCTION = Path("/var/lib/release-host/builds")
+BUILDS = BUILDS_PRODUCTION                           # tests point this elsewhere
+# Drained at install (design §4.1): every release command takes it shared; the installer exclusive.
+INSTALL_LOCK_PRODUCTION = Path("/var/lib/release-host/install.lock")
+INSTALL_LOCK = INSTALL_LOCK_PRODUCTION               # tests point this elsewhere
+# The installed verifier+driver bundle (`current` is the symlink the systemd units work from).
+BUNDLE_PRODUCTION = Path("/usr/local/lib/release-host/current")
+BUNDLE = Path(__file__).resolve().parents[1]         # a staged bundle may only prepare a founder bootstrap
+DRIVER_BOUND_IMAGES = "DRIVER_BOUND_IMAGES=1"
+KEEP_APPLIED = 3                                     # bound `applied` sets whose anchors GC keeps
+BUILD_TTL = timedelta(days=7)                        # an unapplied build record keeps its anchors this long
 
 
 class RetryLater(RuntimeError):
@@ -87,24 +109,33 @@ def _git(cfg: Config, *args: str, text=True):
 
 
 MAX_INBOX_FILE = 1 << 20     # a manifest or signature is a few KiB; nothing bigger is read by root
+MAX_BUILD_RECORD = 1 << 20   # a build record is smaller still
 
 
-def _read_inbox(path: Path) -> bytes:
-    """Read a file the gateway (or anyone with inbox access) can write, as root: never through a symlink, never a
-    FIFO or device, and bounded, so a planted link cannot make root read /dev/zero or a root-only file."""
+def _bounded_read(path: Path, limit: int, *, trusted_file: bool = False) -> bytes:
+    """Read a file someone else may have written, as root: never through a symlink, never a FIFO or device, and
+    bounded, so a planted link cannot make root read /dev/zero or a root-only file. `trusted_file` additionally
+    requires a root (or this process's user) owner and no group/world write bit: a build record or bundle file."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_INBOX_FILE:
-            raise rg.Refused(f"{path.name} is not a regular file of at most {MAX_INBOX_FILE} bytes")
+        trusted = {0, os.geteuid()}
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise rg.Refused(f"{path.name} is not a regular file of at most {limit} bytes")
         if info.st_nlink != 1:
             raise rg.Refused(f"{path.name} has another hard link; root reads only a file with one name")
-        data = os.read(fd, MAX_INBOX_FILE + 1)
+        if trusted_file and (info.st_uid not in trusted or info.st_mode & 0o022):
+            raise rg.Refused(f"{path.name} is not a root-owned, unwritable file")
+        data = os.read(fd, limit + 1)
     finally:
         os.close(fd)
-    if len(data) > MAX_INBOX_FILE:
-        raise rg.Refused(f"{path.name} is not a regular file of at most {MAX_INBOX_FILE} bytes")
+    if len(data) > limit:
+        raise rg.Refused(f"{path.name} is not a regular file of at most {limit} bytes")
     return data
+
+
+def _read_inbox(path: Path) -> bytes:
+    return _bounded_read(path, MAX_INBOX_FILE)
 
 
 def untrusted_path(path: Path, *, writable_leaf: bool = False) -> str | None:
@@ -143,9 +174,11 @@ def _regular(path: Path) -> bool:
 
 def untrusted_layout(cfg: Config) -> str | None:
     """Every directory root reads, moves or writes in, checked before anything is touched: the ledger's and the
-    identity report's (strict), rejected/ and run_root (strict), each inbox (may be gateway-writable itself)."""
+    identity report's (strict), rejected/ and run_root (strict), the build records and the install lock (strict),
+    each inbox (may be gateway-writable itself)."""
     checks = [(cfg.ledger.parent, False), (cfg.identity_report.parent, False), (cfg.rejected, False),
-              (cfg.run_root, False), *[(box, True) for box in cfg.inboxes]]
+              (cfg.run_root, False), (BUILDS, False), (INSTALL_LOCK.parent, False),
+              *[(box, True) for box in cfg.inboxes]]
     for path, writable in checks:
         problem = untrusted_path(path, writable_leaf=writable)
         if problem:
@@ -168,12 +201,156 @@ def candidates(cfg: Config) -> list[tuple[int, Path]]:
     return sorted(found)
 
 
-# The driver line that enforces #192 F4; a candidate whose driver lacks it never gets a gateway apply.
-DRIVER_HOLDS_IMAGES = '[ "${PENDING_APPROVER:-founder}" = founder ] || HOLD_IMAGES=yes'
+# --------------------------------------------------------------------------- installed bundle
+
+BUNDLE_FIELDS = {"bundle_version", "source_sha", "files"}
+BUNDLE_FILES = {"app/__init__.py", "app/release_gateway.py", "app/release_host.py", "app/release_identity.py",
+                "scripts/deploy-company-os.sh"}
+DRIVER_BUNDLE_VERSION = re.compile(r"^DRIVER_BUNDLE_VERSION=(\d+)$", re.M)
 
 
-def host_facts(cfg: Config, manifest: dict, ledger: dict) -> dict:
-    """Everything verify_release compares, computed here from the host's own clone."""
+def bundle_problem(*, allow_staged: bool = False) -> str | None:
+    """Why the installed verifier+driver bundle must not run, or None. A half-copied install (one file's digest
+    differs), a missing BUNDLE.json, a non-root-owned or group-writable directory, a driver without bound mode or a
+    version mismatch would otherwise let an old driver run under a new verifier. Called first in every command."""
+    try:
+        root = BUNDLE.resolve(strict=True)
+    except OSError:
+        return f"release bundle inconsistent: {BUNDLE} is missing"
+    problem = untrusted_path(BUNDLE.parent) or untrusted_path(root)
+    if problem:
+        return f"release bundle inconsistent: {problem}"
+    if not allow_staged and root != BUNDLE_PRODUCTION.resolve():
+        return "release bundle inconsistent: staged code cannot operate the installed release host"
+    try:
+        doc = json.loads(_bounded_read(root / "BUNDLE.json", MAX_BUILD_RECORD, trusted_file=True))
+    except (OSError, ValueError, rg.Refused) as error:
+        return f"release bundle inconsistent: BUNDLE.json is unreadable ({type(error).__name__})"
+    if not isinstance(doc, dict) or set(doc) != BUNDLE_FIELDS:
+        return "release bundle inconsistent: BUNDLE.json has the wrong shape"
+    if not rg._int(doc.get("bundle_version")) or doc["bundle_version"] != rg.BUNDLE_VERSION:
+        return "release bundle inconsistent: BUNDLE.json names another bundle version"
+    files = doc.get("files")
+    if not isinstance(doc.get("source_sha"), str) or not rg.SHA.fullmatch(doc["source_sha"]):
+        return "release bundle inconsistent: BUNDLE.json has no valid source SHA"
+    if not isinstance(files, dict) or set(files) != BUNDLE_FILES:
+        return "release bundle inconsistent: BUNDLE.json must list the complete verifier and driver"
+    from app import release_identity
+    if any(Path(module.__file__).resolve() != root / name for module, name in (
+            (sys.modules[__name__], "app/release_host.py"), (rg, "app/release_gateway.py"),
+            (release_identity, "app/release_identity.py"))):
+        return "release bundle inconsistent: the running verifier is outside the checked bundle"
+    for name, want in files.items():
+        if not isinstance(name, str) or not isinstance(want, str) or not rg.DIGEST.fullmatch(want) \
+                or not rg.SAFE_PATH.fullmatch(name):
+            return f"release bundle inconsistent: BUNDLE.json has a malformed entry ({name!r})"
+        path = root / name
+        try:
+            data = _bounded_read(path, 64 << 20, trusted_file=True)
+        except (OSError, rg.Refused) as error:
+            return f"release bundle inconsistent: {name} is unreadable ({type(error).__name__})"
+        if hashlib.sha256(data).hexdigest() != want:
+            return f"release bundle inconsistent: {name} differs from BUNDLE.json"
+    if "scripts/deploy-company-os.sh" not in files:
+        return "release bundle inconsistent: the deploy driver is not in the bundle"
+    driver = _bounded_read(root / "scripts/deploy-company-os.sh", 64 << 20, trusted_file=True).decode(
+        "utf-8", "surrogateescape")
+    if DRIVER_BOUND_IMAGES not in driver:
+        return "release bundle inconsistent: the driver does not speak bound mode"
+    version = DRIVER_BUNDLE_VERSION.search(driver)
+    if not version or int(version.group(1)) != rg.BUNDLE_VERSION:
+        return "release bundle inconsistent: the driver's bundle version differs from the verifier's"
+    return None
+
+
+# --------------------------------------------------------------------------- facts
+
+def _build_record_path(digest: str) -> Path:
+    return BUILDS / f"{digest}.json"
+
+
+def read_build_record(digest: str) -> tuple[dict | None, str | None]:
+    """The root-written record for exactly these image inputs, or (None, None) when there is none. A symlink, a
+    second hard link, another owner, a group-writable directory or a record whose inner digest differs is a problem,
+    never silently "no record": a copied record must not authorise another tree's images."""
+    problem = untrusted_path(BUILDS)
+    if problem:
+        return None, problem
+    try:
+        raw = _bounded_read(_build_record_path(digest), MAX_BUILD_RECORD, trusted_file=True)
+    except FileNotFoundError:
+        return None, None
+    except (OSError, rg.Refused) as error:
+        return None, f"the build record is unreadable ({type(error).__name__})"
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None, "the build record is not valid JSON"
+    if not isinstance(record, dict):
+        return None, "the build record is not an object"
+    if record.get("inputs_digest") != digest:
+        return record, "the build record is for different image inputs"
+    if record.get("status") not in ("building", "ready", "failed"):
+        return record, "the build record has an unknown status"
+    if not rg._int(record.get("attempt")) or record["attempt"] < 1:
+        return record, "the build record has no valid attempt number"
+    return record, None
+
+
+def _bounded_call(docker, args: list[str]) -> subprocess.CompletedProcess:
+    """Run a Docker read as root. A transport error is infrastructure (retry), never a verdict."""
+    try:
+        return docker(["docker", *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RetryLater(f"docker {args[0]} failed: {type(error).__name__}") from None
+
+
+def image_present(image_id: str, docker=subprocess.run) -> bool:
+    """`docker image inspect --format {{.Id}} ID` answers exactly the ID (never a tag resolution)."""
+    result = _bounded_call(docker, ["image", "inspect", "--format", "{{.Id}}", image_id])
+    return result.returncode == 0 and result.stdout.strip() == image_id
+
+
+def anchored_images(docker=subprocess.run) -> set[str]:
+    """The image IDs held by every `company-os-bound-*` anchor container (never started; Coolify's cleanup only
+    removes tagged images no container uses). A failing listing is infrastructure: GC and verify retry later."""
+    result = _bounded_call(docker, ["ps", "-a", "--filter", "name=company-os-bound-", "--format",
+                                    "{{.Names}}\t{{.Image}}"])
+    if result.returncode != 0:
+        raise RetryLater("docker ps failed while reading the release anchors")
+    held = set()
+    for line in result.stdout.splitlines():
+        name, sep, image = line.partition("\t")
+        if sep and name.startswith("company-os-bound-") and image:
+            held.add(image)
+    return held
+
+
+def observe_bound(docker=subprocess.run) -> dict | None:
+    """The four bound image IDs as containers run them now, or None when any is unavailable. Egress is bound in the
+    manifest but stays outside the three-component identity (design §3)."""
+    observed = {}
+    for name in rg.BOUND:
+        result = _bounded_call(docker, ["inspect", "--type", "container", "--format", "{{.Image}}",
+                                        CONTAINERS[name]])
+        if result.returncode != 0:
+            return None
+        observed[name] = result.stdout.strip()
+    return observed if rg.images_ok(observed) else None
+
+
+def images_present(ids: dict, docker=subprocess.run) -> bool:
+    return rg.images_ok(ids) and all(image_present(ids[name], docker) for name in rg.BOUND)
+
+
+def images_anchored(ids: dict, docker=subprocess.run) -> bool:
+    return rg.images_ok(ids) and set(ids.values()) <= anchored_images(docker)
+
+
+def host_facts(cfg: Config, manifest: dict, ledger: dict, docker=subprocess.run) -> dict:
+    """Everything verify_release compares, computed here from the host's own clone. Also what apply needs to know
+    about images before `pending`: their inputs digest, the build record for it, local presence, anchors, and the
+    candidate driver's bound-mode marker."""
     sha, parent = manifest.get("sha"), manifest.get("parent_sha")
     if not (isinstance(sha, str) and rg.SHA.fullmatch(sha) and isinstance(parent, str) and rg.SHA.fullmatch(parent)):
         raise rg.Refused("manifest names no valid commit")
@@ -192,24 +369,36 @@ def host_facts(cfg: Config, manifest: dict, ledger: dict) -> dict:
     # What changes is computed from what RUNS (ledger last_sha), never from the manifest's word; after a rebase the
     # running commit comes from the other history (fetched into this clone by the cutover) and only the payload counts.
     running, scope = ledger.get("last_sha") or parent, rg.diff_scope(ledger)
-    rg.release_archive(cfg.clone, sha)                 # shipped bytes == hashed bytes, refused BEFORE pending
+    tar = rg.release_archive(cfg.clone, sha)           # shipped bytes == hashed bytes, refused BEFORE pending
+    digest = rg.inputs_digest(tar)
     try:
         host_compose = hashlib.sha256(HOST_COMPOSE.read_bytes()).hexdigest()
     except OSError:
         host_compose = None
-    try:                                               # #192 F4: does this release's own driver hold gateway images?
-        holds = DRIVER_HOLDS_IMAGES in _git(cfg, "show", f"{sha}:scripts/deploy-company-os.sh")
+    try:                                               # a v2 manifest must never reach a pre-binding driver
+        driver = _git(cfg, "show", f"{sha}:scripts/deploy-company-os.sh")
+        bound = DRIVER_BOUND_IMAGES in driver
     except (OSError, subprocess.CalledProcessError):
-        holds = False
-    return {"repository": cfg.repository if on_branch else None, "branch": cfg.branch if on_branch else None,
-            "sha": sha, "payload_digest": rg.payload_digest(rg.payload_listing(cfg.clone, sha)),
-            "changed_paths": rg.git_changed_paths(cfg.clone, running, sha, scope), "ancestor_of_parent": descends,
-            "diff": rg.git_release_diff(cfg.clone, running, sha, scope),
-            "compose": {"host": host_compose, "parent": rg.git_blob_sha256(cfg.clone, running, "docker-compose.yml"),
-                        "release": rg.git_blob_sha256(cfg.clone, sha, "docker-compose.yml")},
-            "migration_heads": sorted(rg.alembic_heads(cfg.clone, sha)),
-            "parent_migration_heads": sorted(rg.alembic_heads(cfg.clone, running)),
-            "nonregular_paths": rg.git_nonregular_paths(cfg.clone, running, sha, scope), "driver_holds_images": holds}
+        bound = False
+    wanted = manifest.get("images") if rg.images_ok(manifest.get("images")) else ledger.get("bound_images")
+    if not rg.images_ok(wanted):
+        record, _ = read_build_record(digest)
+        wanted = record.get("images") if isinstance(record, dict) else None
+    record, record_problem = read_build_record(digest)
+    facts = {"repository": cfg.repository if on_branch else None, "branch": cfg.branch if on_branch else None,
+             "sha": sha, "payload_digest": rg.payload_digest(rg.payload_listing(cfg.clone, sha)),
+             "changed_paths": rg.git_changed_paths(cfg.clone, running, sha, scope), "ancestor_of_parent": descends,
+             "diff": rg.git_release_diff(cfg.clone, running, sha, scope),
+             "compose": {"host": host_compose, "parent": rg.git_blob_sha256(cfg.clone, running, "docker-compose.yml"),
+                         "release": rg.git_blob_sha256(cfg.clone, sha, "docker-compose.yml")},
+             "migration_heads": sorted(rg.alembic_heads(cfg.clone, sha)),
+             "parent_migration_heads": sorted(rg.alembic_heads(cfg.clone, running)),
+             "nonregular_paths": rg.git_nonregular_paths(cfg.clone, running, sha, scope),
+             "inputs_digest": digest, "build_record": record, "build_record_problem": record_problem,
+             "driver_bound": bound, "driver_sha256": rg.git_blob_sha256(cfg.clone, sha, "scripts/deploy-company-os.sh"),
+             "images_present": images_present(wanted, docker) if rg.images_ok(wanted) else False,
+             "anchored_images": images_anchored(wanted, docker) if rg.images_ok(wanted) else False}
+    return facts
 
 
 def deploy_acknowledgements(manifest: dict, facts: dict) -> str:
@@ -222,10 +411,6 @@ def deploy_acknowledgements(manifest: dict, facts: dict) -> str:
     - A symlink or submodule entry anywhere in the diff needs the founder's signature, whatever its path.
     - A release that moves the Alembic head must name, in migration_to, the single head the host reads at that
       commit; a migration_to that is not that head is refused too (the driver would abort after `pending`)."""
-    if manifest.get("approver") != "founder" and facts.get("driver_holds_images") is not True:
-        # A candidate whose own driver predates the hold would rebuild and ship whatever a cold cache fetches.
-        raise rg.Refused("this release's deploy driver does not hold a gateway release to the running images "
-                         "(#192 F4): a founder-signed release is required")
     if facts["nonregular_paths"] and manifest.get("approver") != "founder":
         raise rg.Refused("a symlink or submodule change needs the founder's signature: "
                          + ", ".join(facts["nonregular_paths"])[:200])
@@ -247,7 +432,8 @@ def deploy_acknowledgements(manifest: dict, facts: dict) -> str:
 
 
 def build_release(cfg: Config, sha: str, directory: Path) -> None:
-    """The staged transport's three files, from the host clone at exactly `sha` (same commands as the driver)."""
+    """The staged transport's three files, from the host clone at exactly `sha` (same commands as the driver).
+    After install the root-side driver comes from the installed bundle, never from the candidate's tree."""
     try:
         tar = rg.release_archive(cfg.clone, sha)      # checked in host_facts already; again here, after pending
     except rg.Refused as error:
@@ -258,55 +444,21 @@ def build_release(cfg: Config, sha: str, directory: Path) -> None:
         gz.write(tar)
     (directory / "src.tgz").write_bytes(buf.getvalue())
     (directory / "main.sha256").write_text(listing)
-    driver = _git(cfg, "show", f"{sha}:scripts/deploy-company-os.sh")
+    try:
+        driver = _bounded_read(BUNDLE.resolve(strict=True) / "scripts" / "deploy-company-os.sh", 64 << 20,
+                               trusted_file=True).decode("utf-8", "surrogateescape")
+    except (OSError, rg.Refused) as error:
+        raise RuntimeError(f"the installed deploy driver is unreadable ({type(error).__name__})") from None
     if REMOTE_START not in driver or REMOTE_END not in driver:
-        raise rg.Refused("the deploy driver at this commit has no root-side script")
+        raise rg.Refused("the installed deploy driver has no root-side script")
     remote = driver[driver.index(REMOTE_START) + len(REMOTE_START):driver.index(REMOTE_END)]
     (directory / "company-os-deploy.sh").write_text(remote + "\n")
     for name in ("src.tgz", "main.sha256", "company-os-deploy.sh"):
         os.chmod(directory / name, 0o600)
 
 
-CONTAINERS = {"api": "company-api", "worker": "company-worker", "reasoner": "company-reasoner"}
-# What may differ between two runs of the same container without changing what it can do. Everything else in
-# Config and HostConfig is identity. Hostname is the container ID, Image is a tag name (the ID is identity already),
-# Labels are compose bookkeeping, Attach*/Tty/OpenStdin are console wiring. Env is identity but only as a digest.
-VOLATILE_CONFIG = ("Hostname", "Image", "Labels", "Env", "AttachStdin", "AttachStdout", "AttachStderr", "Tty",
-                   "OpenStdin", "StdinOnce")
-VOLATILE_HOST_CONFIG = ("ContainerIDFile",)
-# Lists whose order carries no meaning: sorted before hashing so a reordering never blocks a release.
-SET_LIKE = {"Binds", "CapAdd", "CapDrop", "SecurityOpt", "Dns", "DnsOptions", "DnsSearch", "ExtraHosts", "GroupAdd",
-            "Devices", "DeviceCgroupRules", "DeviceRequests", "VolumesFrom", "MaskedPaths", "ReadonlyPaths", "Links",
-            "Ulimits", "Env"}
-
-
-def _normalise(key, value):
-    """None, [], {} and "" are the same absence; set-like lists are sorted; dict keys are canonical anyway."""
-    if value in (None, [], {}, ""):
-        return None
-    if isinstance(value, dict):
-        return {k: v for k, v in ((k, _normalise(k, v)) for k, v in value.items()) if v is not None} or None
-    if isinstance(value, list):
-        items = [_normalise(None, v) for v in value]
-        return sorted(items, key=lambda v: rg.canonical(v)) if key in SET_LIKE else items
-    return value
-
-
-def security_config(info: dict) -> str:
-    """Digest of everything that decides what a container can do: all of Config and HostConfig except the short
-    VOLATILE lists above, every mount (all fields), the names of the networks it is attached to (addresses are
-    volatile), and the environment as a digest of the sorted NAME=value list (LD_PRELOAD, PYTHONPATH...). Values
-    are never stored; only this combined digest is. A change of .env therefore changes identity (founder recovery)."""
-    config, host_config = info.get("Config") or {}, info.get("HostConfig") or {}
-    env = sorted(e for e in config.get("Env") or [] if isinstance(e, str))
-    doc = {"Config": _normalise(None, {k: v for k, v in config.items() if k not in VOLATILE_CONFIG}),
-           "HostConfig": _normalise(None, {k: v for k, v in host_config.items() if k not in VOLATILE_HOST_CONFIG}),
-           "Mounts": sorted((_normalise(None, m) for m in info.get("Mounts") or [] if isinstance(m, dict)),
-                            key=lambda m: rg.canonical(m)),
-           "Networks": sorted(((info.get("NetworkSettings") or {}).get("Networks") or {})),
-           "Env": hashlib.sha256(rg.canonical(env)).hexdigest()}
-    return hashlib.sha256(rg.canonical(doc)).hexdigest()
-
+CONTAINERS = {"api": "company-api", "worker": "company-worker", "reasoner": "company-reasoner",
+              "egress": "company-reasoner-egress"}
 
 def observe_production(run=subprocess.run) -> dict:
     """What actually runs, read by root from Docker on this host: per component the content-addressed image ID
@@ -358,10 +510,292 @@ def default_run(env: dict, script: Path) -> int:
     return subprocess.run(["bash", str(script)], env={**os.environ, **env}).returncode
 
 
-def step(cfg: Config, *, now: datetime | None = None, run=default_run, observe=observe_production) -> dict:
-    """Apply at most one release. Returns {"outcome": ...}. A refused manifest is moved to `rejected` with its
-    reason, so it is never retried; an apply failure leaves it in place and the ledger pending."""
+def default_spawn(env: dict, script: Path) -> tuple[int, str]:
+    """Run a release command and capture its output (prepare needs the driver's BOUND line)."""
+    result = subprocess.run(["bash", str(script)], env={**os.environ, **env}, capture_output=True, text=True)
+    return result.returncode, result.stdout
+
+
+# --------------------------------------------------------------------------- file locks
+
+def _ensure_builds(cfg: Config) -> None:
+    problem = untrusted_path(BUILDS)
+    if problem:
+        raise rg.Refused(f"BLOCKED: {problem}")
+    try:
+        BUILDS.mkdir(mode=0o750, parents=True, exist_ok=True)
+        os.chown(BUILDS, os.geteuid(), cfg.ledger.parent.stat().st_gid)
+        os.chmod(BUILDS, 0o2750)
+    except OSError as error:
+        raise RetryLater(f"could not create the build record directory: {type(error).__name__}") from None
+    problem = untrusted_path(BUILDS)
+    if problem:
+        raise rg.Refused(f"BLOCKED: {problem}")
+
+
+@contextmanager
+def _lock(path: Path, *, shared: bool = False):
+    """A root-only lock file. `shared` for every release command (the installer takes it exclusive), exclusive for
+    the build records and the ledger-like serialisation. Waiting is bounded by rg.LOCK_TIMEOUT_S; on timeout nothing
+    has been read or written and the caller gets LockBusy."""
+    trusted = {0, os.geteuid()}
+    directory = os.stat(path.parent)
+    if directory.st_uid not in trusted or directory.st_mode & 0o022:
+        raise rg.Refused(f"BLOCKED: lock directory {path.parent} is not root-only")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in trusted:
+            raise rg.Refused("BLOCKED: lock is not a root-owned regular file with one name")
+        os.fchmod(fd, 0o600)
+        mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+        deadline = time.monotonic() + rg.LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, mode)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise rg.LockBusy("a release command holds the lock: nothing was done; retry later") from None
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------- prepare (pre-sign builds)
+
+def _recipe_changed(cfg: Config, running: str, sha: str) -> bool:
+    """The timer builds only when the RUN steps are the reviewed recipe production runs: Dockerfile and
+    requirements.txt byte-identical between the running release and the candidate (design §4.2)."""
+    for path in ("Dockerfile", "requirements.txt"):
+        if rg.git_blob_sha256(cfg.clone, running, path) != rg.git_blob_sha256(cfg.clone, sha, path):
+            return True
+    return False
+
+
+def _bounds_line(output: str) -> dict | None:
+    """The driver's PREPARE result line: `BOUND inputs=<64 hex> api=<ID> worker=<ID> reasoner=<ID> egress=<ID>`."""
+    for line in reversed(output.splitlines()):
+        fields = line.strip().split()
+        if not fields or fields[0] != "BOUND":
+            continue
+        values = {}
+        for field in fields[1:]:
+            key, sep, value = field.partition("=")
+            if not sep or key in values:
+                return None
+            values[key] = value
+        return values if set(values) == {"inputs", *rg.BOUND} else None
+    return None
+
+
+def prepare(cfg: Config, sha: str, *, founder: bool = False, retry: bool = False, bootstrap: bool = False,
+            now: datetime | None = None, run=default_spawn, docker=subprocess.run) -> dict:
+    """Build the four images for one commit's image inputs and write the one build record for them. The timer calls
+    this only for an unchanged recipe; `--retry` and `--bootstrap` are founder-only. Write-once per attempt: a
+    crashed `building` record is never continued by the timer, only moved aside by `--retry`."""
+    if (retry or bootstrap) and not founder:
+        raise rg.Refused("--retry and --bootstrap are founder-only (run as root with --founder)")
     now = now or datetime.now(timezone.utc)
+    problem = untrusted_layout(cfg)
+    if problem:
+        raise rg.Refused(f"BLOCKED: {problem}")
+    try:
+        with _lock(INSTALL_LOCK, shared=True):
+            _ensure_builds(cfg)
+            with _lock(BUILDS / ".lock"):
+                out = _prepare_locked(cfg, sha, founder=founder, retry=retry, bootstrap=bootstrap, now=now, run=run,
+                                      docker=docker)
+                gc_anchors(cfg, rg.read_ledger(cfg.ledger), now=now, docker=docker)
+        return out
+    except rg.LockBusy:
+        raise
+
+
+def _prepare_locked(cfg: Config, sha: str, *, founder: bool, retry: bool, bootstrap: bool, now: datetime,
+                    run=default_spawn, docker=subprocess.run) -> dict:
+    problem = bundle_problem(allow_staged=founder and bootstrap)
+    if problem:
+        raise rg.Refused(f"BLOCKED: {problem}")
+    if not isinstance(sha, str) or not rg.SHA.fullmatch(sha):
+        raise rg.Refused("prepare needs a 40-hex commit")
+    state = rg.read_ledger(cfg.ledger)
+    if state.get("pending"):
+        raise rg.Refused("a release is pending: the founder must reconcile it before prepare")
+    if not state.get("last_sha"):
+        raise rg.Refused("host is not bootstrapped: the founder must sign the production baseline first")
+    if not founder and _recipe_changed(cfg, state["last_sha"], sha):
+        raise rg.Refused("this commit changes Dockerfile or requirements.txt: only the founder may build it "
+                         "(`python3 -m app.release_host prepare --founder <sha>`)")
+    try:
+        _git(cfg, "fetch", "--no-tags", "--quiet", cfg.fetch_url,
+             f"+refs/heads/{cfg.branch}:refs/remotes/origin/{cfg.branch}")
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RetryLater(f"fetch failed: {type(error).__name__}") from None
+    if subprocess.run(["git", "-C", str(cfg.clone), "merge-base", "--is-ancestor", sha,
+                       f"refs/remotes/origin/{cfg.branch}"], capture_output=True).returncode != 0:
+        raise rg.Refused(f"commit {sha} is not on {cfg.branch}: nothing is built")
+    parent = rg.chain_parent(state)
+    if parent and subprocess.run(["git", "-C", str(cfg.clone), "merge-base", "--is-ancestor", parent, sha],
+                                 capture_output=True).returncode != 0:
+        raise rg.Refused("the commit does not descend from the release currently applied: nothing is built")
+    tar = rg.release_archive(cfg.clone, sha)          # P2-5: the shipped bytes are refused before a build
+    digest = rg.inputs_digest(tar)
+    path = _build_record_path(digest)
+    attempt = 1
+    if path.exists():
+        previous, previous_problem = read_build_record(digest)
+        if previous_problem or not isinstance(previous, dict):
+            raise rg.Refused(f"BLOCKED: {previous_problem or 'the existing build record is unreadable'}")
+        if not retry:
+            raise rg.Refused(f"a build record already exists for these image inputs (attempt {previous['attempt']}); "
+                             "the founder may run prepare --retry")
+        attempt = previous["attempt"] + 1
+        attempts = BUILDS / "attempts"
+        attempts.mkdir(mode=0o750, parents=True, exist_ok=True)
+        os.chmod(attempts, 0o750)
+        # Kept for audit, never deleted: the attempt number is never reused and its anchors never collide.
+        os.replace(path, attempts / f"{digest}.{previous['attempt']}.json")
+    else:
+        if retry:
+            attempt = 1
+    base = {"inputs_digest": digest, "built_from_sha": sha, "repository": cfg.repository,
+            "recipe": "founder" if founder else "auto", "bootstrap": bool(bootstrap), "attempt": attempt,
+            "built_at": now.isoformat(), "status": "building"}
+    rg._write_atomic(path, base)                      # published BEFORE the first build command
+    cfg.run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    d = cfg.run_root / _release_dir_name(sha)
+    d.mkdir(mode=0o700)
+    try:
+        build_release(cfg, sha, d)
+        code, output = run({"SHA": sha, "PREPARE": "1", "ATTEMPT": str(attempt), "AUTOMATIC": "false",
+                            "ALLOW_MIGRATION": "", "ACK_OVERRIDES": "", "ACK_COMPOSE": "", "RELEASE_DIR": str(d)},
+                           d / "company-os-deploy.sh")
+    except BaseException:
+        # No clean result: the record stays `building` (a crash may have left anchors this attempt alone may name).
+        raise
+    finally:
+        if d.exists():
+            shutil.rmtree(d)
+    if code != 0:
+        rg._write_atomic(path, {**base, "status": "failed"})
+        raise rg.Refused(f"the pre-sign build failed (driver exited {code})")
+    bounds = _bounds_line(output or "")
+    if not bounds or bounds["inputs"] != digest or not rg.images_ok({name: bounds[name] for name in rg.BOUND}):
+        rg._write_atomic(path, {**base, "status": "failed"})
+        raise rg.Refused("the pre-sign build printed no usable image binding")
+    images = {name: bounds[name] for name in rg.BOUND}
+    if not images_present(images, docker):
+        rg._write_atomic(path, {**base, "status": "failed"})
+        raise rg.Refused("a built image is not present locally")
+    ready = {**base, "status": "ready", "images": images}
+    rg._write_atomic(path, ready)
+    return {"outcome": "PREPARED", "inputs_digest": digest, "images": images, "attempt": attempt}
+
+
+def _auto_prepare(cfg: Config, *, now: datetime, run, docker) -> None:
+    """Best-effort, silent: build origin/main before it is signed, but only for an unchanged recipe and only while
+    nothing is pending or queued. The timer never builds a recipe change and never rebuilds a recorded attempt."""
+    try:
+        state = rg.read_ledger(cfg.ledger)
+        if not state.get("last_sha") or state.get("pending"):
+            return
+        _git(cfg, "fetch", "--no-tags", "--quiet", cfg.fetch_url,
+             f"+refs/heads/{cfg.branch}:refs/remotes/origin/{cfg.branch}")
+        sha = _git(cfg, "rev-parse", f"refs/remotes/origin/{cfg.branch}^{{commit}}").strip()
+        if sha == rg.chain_parent(state) or _recipe_changed(cfg, state["last_sha"], sha):
+            return
+        _prepare_locked(cfg, sha, founder=False, retry=False, bootstrap=False, now=now, run=run, docker=docker)
+    except (rg.Refused, RetryLater, OSError, subprocess.SubprocessError, ValueError):
+        return
+
+
+# --------------------------------------------------------------------------- retention
+
+def _young_record_images(now: datetime) -> set[str]:
+    keep = set()
+    problem = untrusted_path(BUILDS)
+    if problem:
+        return keep
+    for path in BUILDS.glob("*.json"):
+        if not rg.DIGEST.fullmatch(path.stem):
+            continue
+        record, record_problem = read_build_record(path.stem)
+        if record_problem or not isinstance(record, dict) or not rg.images_ok(record.get("images")):
+            continue
+        try:
+            built = datetime.fromisoformat(record["built_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if built.tzinfo is None:
+            built = built.replace(tzinfo=timezone.utc)
+        if now - built <= BUILD_TTL:
+            keep.update(record["images"].values())
+    return keep
+
+
+def gc_anchors(cfg: Config, ledger: dict, *, now: datetime, docker=subprocess.run) -> None:
+    """Drop anchor containers whose image is in no kept set. Never removes an image (`docker rmi` is never called);
+    Coolify's cleanup does that once nothing holds it. Kept: the four images running now, the ledger's bound set,
+    pending_images, the last KEEP_APPLIED effective-applied bound sets, and every unexpired build record."""
+    keep = set()
+    try:
+        running = observe_bound(docker)
+    except RetryLater:
+        return                                         # cannot tell what runs: touch nothing this step
+    if running:
+        keep.update(running.values())
+    for key in ("bound_images", "pending_images"):
+        value = ledger.get(key)
+        if rg.images_ok(value):
+            keep.update(value.values())
+    try:
+        applied = [e.get("bound_images") for e in rg.effective_applied(rg.read_history(cfg.ledger))]
+    except rg.Refused:
+        return
+    for bound in [b for b in applied if rg.images_ok(b)][-KEEP_APPLIED:]:
+        keep.update(bound.values())
+    keep.update(_young_record_images(now))
+    result = _bounded_call(docker, ["ps", "-a", "--filter", "name=company-os-bound-", "--format",
+                                    "{{.Names}}\t{{.Image}}"])
+    if result.returncode != 0:
+        return
+    for line in result.stdout.splitlines():
+        name, sep, image = line.partition("\t")
+        if not sep or not name.startswith("company-os-bound-"):
+            continue
+        if image and image not in keep:
+            _bounded_call(docker, ["rm", "-f", name])
+
+
+# --------------------------------------------------------------------------- the step
+
+def step(cfg: Config, *, now: datetime | None = None, run=default_run, observe=observe_production,
+         docker=subprocess.run, spawn=default_spawn) -> dict:
+    """Apply at most one release. Returns {"outcome": ...}. A refused manifest is moved to `rejected` with its
+    reason, so it is never retried; an apply failure leaves it in place and the ledger pending. When idle, prepare
+    origin/main (an unchanged recipe only) and drop unkept anchors. Holds the install lock shared and the build lock
+    exclusive for the whole step: prepare, GC and apply never overlap."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        with _lock(INSTALL_LOCK, shared=True):
+            _ensure_builds(cfg)
+            with _lock(BUILDS / ".lock"):
+                return _step(cfg, now=now, run=run, observe=observe, docker=docker, spawn=spawn)
+    except rg.LockBusy as error:
+        return {"outcome": "RETRY_LATER", "reason": str(error)}
+    except rg.Refused as error:
+        return {"outcome": "BLOCKED", "reason": f"{error}"}
+
+
+def _step(cfg: Config, *, now: datetime, run, observe, docker, spawn) -> dict:
+    problem = bundle_problem()
+    if problem:
+        return {"outcome": "BLOCKED", "reason": problem}
     founder_key = cfg.founder_key.read_text().strip()
     problem = untrusted_layout(cfg)
     if problem:
@@ -378,6 +812,8 @@ def step(cfg: Config, *, now: datetime | None = None, run=default_run, observe=o
         return {"outcome": "WAITING_FOR_FOUNDER", "reason": "a previous release is pending reconciliation"}
     queue = candidates(cfg)
     if not queue:
+        _auto_prepare(cfg, now=now, run=spawn, docker=docker)
+        gc_anchors(cfg, rg.read_ledger(cfg.ledger), now=now, docker=docker)
         return {"outcome": "IDLE"}
     _, path = queue[0]
     sig_path = path.with_suffix(".sig")
@@ -392,7 +828,7 @@ def step(cfg: Config, *, now: datetime | None = None, run=default_run, observe=o
         if not isinstance(manifest, dict):
             raise rg.Refused("manifest is not an object")
         ledger = rg.read_ledger(cfg.ledger)
-        facts = host_facts(cfg, manifest, ledger)
+        facts = host_facts(cfg, manifest, ledger, docker)
         ack_compose = deploy_acknowledgements(manifest, facts)
         try:
             policy_bytes, policy_sig = cfg.policy.read_bytes(), cfg.policy_sig.read_text()
@@ -438,6 +874,7 @@ def step(cfg: Config, *, now: datetime | None = None, run=default_run, observe=o
         # Infrastructure before pending (fetch, git, policy file, anything unexpected): retried, nothing moved.
         return {"outcome": "RETRY_LATER", "manifest": path.name, "reason": f"{type(error).__name__}: {error}"[:500]}
     os.replace(path, path.with_suffix(".applied"))
+    gc_anchors(cfg, rg.read_ledger(cfg.ledger), now=now, docker=docker)
     write_identity_report(cfg, now, observe())
     return {"outcome": "APPLIED", "sha": m["sha"], "sequence": m["sequence"], "approver": m["approver"]}
 
@@ -463,19 +900,28 @@ def _reject(cfg: Config, path: Path, sig_path: Path, error: Exception) -> dict:
     return {"outcome": "REJECTED", "manifest": path.name, "reason": reason}
 
 
+def _founder_common(cfg: Config) -> None:
+    problem = bundle_problem()
+    if problem:
+        raise rg.Refused(f"BLOCKED: {problem}")
+    problem = untrusted_layout(cfg)
+    if problem:
+        raise rg.Refused(problem)
+
+
 def founder_statement(cfg: Config, kind: str, statement: Path, signature: Path, *, now=None,
                       observe=observe_production, machine_id=None) -> dict:
     """`bootstrap`, `recover` or `reconcile`, each with its own founder signature namespace; never run by a timer.
     After a reconcile, the pending manifest is renamed .applied or .failed (abandoned counts as failed)."""
     action = {"bootstrap": rg.bootstrap, "recover": rg.recover, "reconcile": rg.reconcile}[kind]
-    problem = untrusted_layout(cfg)
-    if problem:
-        raise rg.Refused(problem)
-    pending = rg.read_ledger(cfg.ledger).get("pending") if kind == "reconcile" else None
-    state = action(cfg.ledger, statement.read_bytes(), signature.read_text(),
-                   founder_key=cfg.founder_key.read_text().strip(), policy_bytes=cfg.policy.read_bytes(),
-                   policy_sig=cfg.policy_sig.read_text(), host_id=host_id() if machine_id is None else machine_id,
-                   observe=observe, now=now or datetime.now(timezone.utc))
+    now = now or datetime.now(timezone.utc)
+    with _lock(INSTALL_LOCK, shared=True):
+        _founder_common(cfg)
+        pending = rg.read_ledger(cfg.ledger).get("pending") if kind == "reconcile" else None
+        state = action(cfg.ledger, statement.read_bytes(), signature.read_text(),
+                       founder_key=cfg.founder_key.read_text().strip(), policy_bytes=cfg.policy.read_bytes(),
+                       policy_sig=cfg.policy_sig.read_text(), host_id=host_id() if machine_id is None else machine_id,
+                       observe=observe, now=now)
     if pending:
         outcome = json.loads(statement.read_bytes())["outcome"]
         for box in cfg.inboxes:
@@ -486,7 +932,7 @@ def founder_statement(cfg: Config, kind: str, statement: Path, signature: Path, 
                     match = False
                 if match:
                     os.replace(path, path.with_suffix(".applied" if outcome == "applied" else ".failed"))
-    write_identity_report(cfg, now or datetime.now(timezone.utc), observe())
+    write_identity_report(cfg, now, observe())
     return {"outcome": kind.upper() + "_DONE", "last_sha": state["last_sha"]}
 
 
@@ -521,18 +967,32 @@ def rebase_statement(cfg: Config, old: Config, statement: Path, signature: Path,
                      observe=observe_production, machine_id=None) -> dict:
     """`rebase STATEMENT SIG OLD_CONFIG`: run after this config (and its new policy) names the new repository; the
     old config still names the old clone. Never run by a timer. Nothing is deployed."""
-    problem = untrusted_layout(cfg) or untrusted_path(old.clone) or untrusted_path(cfg.clone)
-    if problem:
-        raise rg.Refused(problem)
-    if old.ledger != cfg.ledger:
-        raise rg.Refused("the old and new host configs must name the same ledger")
     now = now or datetime.now(timezone.utc)
-    state = rg.rebase(cfg.ledger, statement.read_bytes(), signature.read_text(),
-                      founder_key=cfg.founder_key.read_text().strip(), policy_bytes=cfg.policy.read_bytes(),
-                      policy_sig=cfg.policy_sig.read_text(), host_id=host_id() if machine_id is None else machine_id,
-                      observe=observe, provenance=rebase_provenance(cfg, old), now=now)
+    with _lock(INSTALL_LOCK, shared=True):
+        _founder_common(cfg)
+        problem = untrusted_path(old.clone) or untrusted_path(cfg.clone)
+        if problem:
+            raise rg.Refused(problem)
+        if old.ledger != cfg.ledger:
+            raise rg.Refused("the old and new host configs must name the same ledger")
+        state = rg.rebase(cfg.ledger, statement.read_bytes(), signature.read_text(),
+                          founder_key=cfg.founder_key.read_text().strip(), policy_bytes=cfg.policy.read_bytes(),
+                          policy_sig=cfg.policy_sig.read_text(), host_id=host_id() if machine_id is None else machine_id,
+                          observe=observe, provenance=rebase_provenance(cfg, old), now=now)
     write_identity_report(cfg, now, observe())
     return {"outcome": "REBASE_DONE", "last_sha": state["last_sha"], "chain_base": state["chain_base"]}
+
+
+def _prepare_args(argv: list[str]) -> tuple[str, bool, bool, bool]:
+    flags, rest = {a for a in argv if a.startswith("--")}, [a for a in argv if not a.startswith("--")]
+    unknown = flags - {"--founder", "--retry", "--bootstrap"}
+    if unknown or len(rest) != 1:
+        raise rg.Refused("usage: prepare [--founder] [--retry] [--bootstrap] <sha>")
+    retry, bootstrap = "--retry" in flags, "--bootstrap" in flags
+    founder = "--founder" in flags
+    if (retry or bootstrap) and not founder:
+        raise rg.Refused("--retry and --bootstrap are founder-only")
+    return rest[0], founder, retry, bootstrap
 
 
 def main() -> int:
@@ -540,7 +1000,11 @@ def main() -> int:
     try:
         cfg = Config(json.loads(path.read_text()))
         if sys.argv[1:] == ["observe"]:                # read-only: what a founder statement must name
-            print(json.dumps(observe_production(), sort_keys=True))
+            with _lock(INSTALL_LOCK, shared=True):
+                problem = bundle_problem()
+                if problem:
+                    raise rg.Refused(f"BLOCKED: {problem}")
+                print(json.dumps(observe_production(), sort_keys=True))
             return 0
         if len(sys.argv) == 5 and sys.argv[1] == "rebase":
             old = Config(json.loads(Path(sys.argv[4]).read_text()))
@@ -548,6 +1012,11 @@ def main() -> int:
             return 0
         if len(sys.argv) == 4 and sys.argv[1] in ("bootstrap", "recover", "reconcile"):
             out = founder_statement(cfg, sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]))
+            print(json.dumps(out, sort_keys=True))
+            return 0
+        if len(sys.argv) >= 2 and sys.argv[1] == "prepare":
+            sha, founder, retry, bootstrap = _prepare_args(sys.argv[2:])
+            out = prepare(cfg, sha, founder=founder, retry=retry, bootstrap=bootstrap)
             print(json.dumps(out, sort_keys=True))
             return 0
         out = step(cfg)

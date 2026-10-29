@@ -20,6 +20,8 @@ DIGEST = rg.payload_digest("aa  docs/HANDOFF.md\nbb  docs/runbooks/x.md\n")
 LOW = ["docs/HANDOFF.md", "docs/runbooks/x.md"]
 DIFF = "diff --git a/docs/HANDOFF.md b/docs/HANDOFF.md\n--- a/docs/HANDOFF.md\n+++ b/docs/HANDOFF.md\n@@ -1 +1 @@\n-old\n+new\n"
 NONCE = "ab" * 16
+INPUTS = "cd" * 32                      # what this release's image build consumes (rg.inputs_digest)
+DRIVER = "ef" * 32                      # sha256 of the deploy driver the host holds for the release
 KEYS = {}
 
 
@@ -67,10 +69,10 @@ def policy(keys):
 
 
 def manifest(**over):
-    m = {"version": 1, "repository": "seerxo/os", "branch": "main", "sha": SHA, "parent_sha": PARENT,
-         "payload_digest": DIGEST, "changed_paths": LOW, "sequence": 7, "issued_at": NOW.isoformat(),
-         "expires_at": (NOW + timedelta(hours=2)).isoformat(), "policy_version": 1, "migration_to": "",
-         "approver": "gateway",
+    m = {"version": rg.MANIFEST_VERSION, "repository": "seerxo/os", "branch": "main", "sha": SHA,
+         "parent_sha": PARENT, "payload_digest": DIGEST, "changed_paths": LOW, "sequence": 7,
+         "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=2)).isoformat(), "policy_version": 1,
+         "migration_to": "", "approver": "gateway", "images": bound(PARENT),
          "evidence": {"trusted_checks": {"runner": "gateway", "sha": SHA, "payload_digest": DIGEST, "passed": True},
                       "review": signed_review()}}
     return m | over
@@ -78,7 +80,9 @@ def manifest(**over):
 
 def facts(**over):
     return {"repository": "seerxo/os", "branch": "main", "sha": SHA, "payload_digest": DIGEST, "changed_paths": LOW,
-            "ancestor_of_parent": True, "diff": DIFF} | over
+            "ancestor_of_parent": True, "diff": DIFF, "inputs_digest": INPUTS, "driver_bound": True,
+            "driver_sha256": DRIVER, "images_present": True, "anchored_images": True,
+            "migration_heads": {"abc123def456"}, "parent_migration_heads": {"abc123def456"}} | over
 
 
 def image(component: str, sha: str) -> str:
@@ -86,7 +90,13 @@ def image(component: str, sha: str) -> str:
 
 
 def images(sha: str) -> dict:
+    """The three-component identity, as every bootstrap, recovery and reconcile statement carries it."""
     return {c: image(c, sha) for c in rg.COMPONENTS}
+
+
+def bound(sha: str) -> dict:
+    """The four bound image IDs the driver builds, starts and verifies (identity stays three-component)."""
+    return {c: image(c, sha) for c in rg.BOUND}
 
 
 def config(component: str) -> str:
@@ -101,16 +111,32 @@ class Production:
     """What root reads from Docker on the host: per component, the content-addressed image ID and the running SHA."""
 
     def __init__(self, sha=PARENT):
-        self.running = {c: {"image": image(c, sha), "config": config(c), "git_sha": sha} for c in rg.COMPONENTS}
+        self.running = {c: {"image": image(c, sha), "config": config(c), "git_sha": sha} for c in rg.BOUND}
 
     def observe(self):
         return json.loads(json.dumps(self.running))
 
-    def deploy(self, sha):
-        self.running = {c: {"image": image(c, sha), "config": config(c), "git_sha": sha} for c in rg.COMPONENTS}
+    def deploy(self, sha, images=None):
+        """Put a release on production: its source SHA, its configuration, and exactly the image IDs it bound (a
+        release that changes no image input keeps the images that already run, so the SHA alone cannot name them)."""
+        ids = images or bound(sha)
+        self.running = {c: {"image": ids[c], "config": config(c), "git_sha": sha} for c in rg.BOUND}
+
+    @classmethod
+    def from_state(cls, state):
+        """Production as the ledger says it should be: the images it recorded, its configuration and its source SHA."""
+        prod = cls(PARENT)
+        if not isinstance(state, dict) or not state.get("last_sha"):
+            return prod
+        ids = state.get("bound_images") or bound(state["last_sha"])
+        recorded = state.get("configs") or configs()
+        for c in rg.BOUND:
+            prod.running[c] = {"image": ids[c], "config": recorded.get(c, config(c)), "git_sha": state["last_sha"]}
+        return prod
 
 
-STATE = {"last_sequence": 6, "last_sha": PARENT, "seen": [], "images": images(PARENT), "configs": configs()}
+STATE = {"last_sequence": 6, "last_sha": PARENT, "seen": [], "images": images(PARENT), "configs": configs(),
+         "bound_images": bound(PARENT), "bound_inputs": INPUTS, "bound_driver_sha256": DRIVER}
 
 
 def seed(ledger: Path, state: dict) -> None:
@@ -127,12 +153,12 @@ def transact(keys, ledger, m, signer="gateway", *, policy_over=None, min_version
              host=None, prod=None):
     raw = rg.canonical(m)
     praw, psig = signed_policy(keys, **(policy_over or {}))
-    prod = prod or Production(json.loads(ledger.read_text()).get("last_sha", PARENT) if ledger.exists()
-                              and ledger.read_text().startswith("{\"") else PARENT)
+    prod = prod or Production.from_state(
+        json.loads(ledger.read_text()) if ledger.exists() and ledger.read_text().startswith("{\"") else {})
 
     def deploy(manifest):
         apply(manifest)                    # the driver; raising leaves production unchanged and the ledger pending
-        prod.deploy(manifest["sha"])
+        prod.deploy(manifest["sha"], manifest["images"])
     return rg.release_transaction(ledger, raw, rg.sign(raw, keys[signer][0], rg.NS_RELEASE), policy_bytes=praw,
                                   policy_sig=psig, founder_key=keys["founder"][1], host_facts=host or facts(),
                                   now=NOW, apply=deploy, observe=prod.observe)
@@ -372,7 +398,7 @@ def test_the_gateway_key_cannot_be_the_founder_key(keys):
 
 @pytest.mark.parametrize("over, why", [
     ({"sha": "ABC"}, "40 lowercase"), ({"migration_to": "zz"}, "12 lowercase"), ({"sequence": 0}, "positive"),
-    ({"approver": "agent"}, "approver"), ({"version": 2}, "version"), ({"payload_digest": "x"}, "sha256"),
+    ({"approver": "agent"}, "approver"), ({"version": 3}, "version"), ({"payload_digest": "x"}, "sha256"),
     ({"sequence": True}, "positive"), ({"policy_version": True}, "integer"), ({"repository": ["seerxo/os"]}, "strings"),
     ({"issued_at": 5}, "ISO-8601"), ({"issued_at": "yesterday"}, "ISO-8601"), ({"evidence": ["x"]}, "object"),
 ])
@@ -537,7 +563,8 @@ def test_an_applied_release_records_the_new_image_identity(keys, tmp_path):
     ledger, prod = bootstrapped(tmp_path), Production(PARENT)
     transact(keys, ledger, manifest(), prod=prod)
     state = json.loads(ledger.read_text())
-    assert state["last_sha"] == SHA and state["images"] == images(SHA)
+    assert state["last_sha"] == SHA and state["images"] == images(PARENT)      # no image input changed
+    assert state["bound_images"] == bound(PARENT) and state["bound_inputs"] == INPUTS
     assert [e["event"] for e in rg.read_history(ledger)] == ["bootstrap", "applied"]
 
 
@@ -568,8 +595,17 @@ def test_a_founder_signed_bootstrap_matching_production_establishes_the_baseline
     ledger = tmp_path / "ledger.json"
     state = do_bootstrap(keys, ledger, statement(keys))
     assert state["last_sha"] == PARENT and state["images"] == images(PARENT) and state["last_sequence"] == 0
+    assert "bound_images" not in state                                   # the old verifier never bound an image
     assert [e["event"] for e in rg.read_history(ledger)] == ["bootstrap"]
-    assert transact(keys, ledger, manifest(sequence=1))["sha"] == SHA               # the gateway may now release
+    refused("no bound release runs on this host", transact, keys, ledger, manifest(sequence=1))
+    record = {"status": "ready", "inputs_digest": INPUTS, "images": bound(PARENT)}
+    assert transact(keys, ledger, manifest(sequence=1, approver="founder"), "founder",
+                    host=facts(build_record=record))["sha"] == SHA      # the first release binds the images
+    after = manifest(sequence=2, parent_sha=SHA,
+                     evidence={"trusted_checks": {"runner": "gateway", "sha": SHA, "payload_digest": DIGEST,
+                                                  "passed": True},
+                               "review": signed_review(base=SHA)})
+    assert transact(keys, ledger, after)["sha"] == SHA                  # the gateway may now release
 
 
 @pytest.mark.parametrize("make, why", [
@@ -612,17 +648,19 @@ def test_bootstrap_cannot_run_twice_or_reset_a_ledger(keys, tmp_path):
 def lose_ledger_after_one_release(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
     do_bootstrap(keys, ledger, statement(keys))
-    m = manifest(sequence=1)
+    m = manifest(sequence=1, approver="founder")
     prod = Production(PARENT)
-    transact(keys, ledger, m, prod=prod)
+    record = {"status": "ready", "inputs_digest": INPUTS, "images": bound(PARENT)}
+    transact(keys, ledger, m, "founder", host=facts(build_record=record), prod=prod)
     ledger.unlink()
     return ledger, m, prod
 
 
 def recovery(keys, ledger, prod, **over):
     digest = __import__("hashlib").sha256(rg.history_path(ledger).read_bytes()).hexdigest()
+    running = {c: prod.running[c]["image"] for c in rg.COMPONENTS}       # what production runs now
     raw_sig = statement(keys, "recovery", **({"history_sha256": digest, "last_sha": SHA, "last_sequence": 1,
-                                              "images": images(SHA)} | over))
+                                              "images": running} | over))
     praw, psig = signed_policy(keys)
     return raw_sig, lambda: rg.recover(ledger, raw_sig[0], raw_sig[1], founder_key=keys["founder"][1],
                                        policy_bytes=praw, policy_sig=psig, host_id=HOST, observe=prod.observe,
@@ -633,15 +671,16 @@ def test_recovery_rebuilds_seen_and_the_sequence_floor_so_nothing_replays(keys, 
     ledger, m, prod = lose_ledger_after_one_release(keys, tmp_path)
     _, run = recovery(keys, ledger, prod)
     state = run()
-    assert state["last_sha"] == SHA and state["last_sequence"] == 1 and state["images"] == images(SHA)
-    refused("replay", transact, keys, ledger, m, prod=prod)                          # the applied manifest stays used
+    assert state["last_sha"] == SHA and state["last_sequence"] == 1 and state["images"] == images(PARENT)
+    assert state["bound_images"] == bound(PARENT) and state["bound_inputs"] == INPUTS
+    refused("replay", transact, keys, ledger, m, "founder", prod=prod)                # the applied manifest stays used
     assert [e["event"] for e in rg.read_history(ledger)] == ["bootstrap", "applied", "recovery"]
 
 
 @pytest.mark.parametrize("over, why", [
     ({"history_sha256": "0" * 64}, "different release history"),
     ({"last_sequence": 0}, "lower the release sequence"),
-    ({"last_sha": PARENT, "images": images(PARENT)}, "does not match the recovery"),   # production runs SHA
+    ({"last_sha": PARENT}, "does not match the recovery"),   # production runs SHA
     ({"host_id": "ffff" * 8}, "another host"),
 ])
 def test_an_invalid_recovery_is_refused(keys, tmp_path, over, why):
@@ -654,7 +693,8 @@ def test_an_invalid_recovery_is_refused(keys, tmp_path, over, why):
 def test_recovery_needs_its_own_founder_authorization_and_is_single_use(keys, tmp_path):
     ledger, _, prod = lose_ledger_after_one_release(keys, tmp_path)
     digest = __import__("hashlib").sha256(rg.history_path(ledger).read_bytes()).hexdigest()
-    body = {"history_sha256": digest, "last_sha": SHA, "last_sequence": 1, "images": images(SHA)}
+    body = {"history_sha256": digest, "last_sha": SHA, "last_sequence": 1,
+            "images": {c: prod.running[c]["image"] for c in rg.COMPONENTS}}
     raw, sig = statement(keys, "recovery", namespace=rg.NS_BOOTSTRAP, **body)       # bootstrap authority is not enough
     praw, psig = signed_policy(keys)
     args = dict(founder_key=keys["founder"][1], policy_bytes=praw, policy_sig=psig, host_id=HOST,
@@ -910,7 +950,7 @@ def test_history_takes_the_shared_mode_and_the_directory_group(tmp_path):
 
 def pending_after_failed_apply(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
-    do_bootstrap(keys, ledger, statement(keys))
+    seed(ledger, {**STATE, "last_sequence": 0, "seen": []})              # a bound release already runs
     m = manifest(sequence=1)
     prod = Production(PARENT)
 
@@ -949,9 +989,11 @@ def test_reconcile_a_failed_release_keeps_the_old_release_and_burns_the_manifest
 
 def test_reconcile_an_applied_release_records_what_runs(keys, tmp_path):
     ledger, m, digest, prod = pending_after_failed_apply(keys, tmp_path)
-    prod.deploy(SHA)                                                      # it did switch, the record failed
-    state = do_reconcile(keys, ledger, reconcile_statement(keys, digest, outcome="applied", release_sha=SHA), prod)
-    assert state["last_sha"] == SHA and state["last_sequence"] == 1 and state["images"] == images(SHA)
+    prod.deploy(SHA, bound(PARENT))                                       # it did switch, the record failed
+    state = do_reconcile(keys, ledger, reconcile_statement(keys, digest, outcome="applied", release_sha=SHA,
+                                                           images=images(PARENT)), prod)
+    assert state["last_sha"] == SHA and state["last_sequence"] == 1 and state["images"] == images(PARENT)
+    assert state["bound_images"] == bound(PARENT) and state["bound_inputs"] == INPUTS
 
 
 @pytest.mark.parametrize("make, why", [
@@ -988,13 +1030,13 @@ def test_applied_reconcile_keeps_the_verified_pending_policy_floor(keys, tmp_pat
     m = manifest(sequence=7, policy_version=2, approver="founder")
 
     def switch_then_fail(_):
-        prod.deploy(SHA)
+        prod.deploy(SHA, bound(PARENT))
         raise RuntimeError("record failed after switch")
     with pytest.raises(RuntimeError):
         transact(keys, ledger, m, "founder", policy_over={"version": 2, "auto_release": False},
                  prod=prod, apply=switch_then_fail)
     digest = __import__("hashlib").sha256(rg.canonical(m)).hexdigest()
-    raw, signature = reconcile_statement(keys, digest, outcome="applied", release_sha=SHA)
+    raw, signature = reconcile_statement(keys, digest, outcome="applied", release_sha=SHA, images=images(PARENT))
     policy_raw, policy_signature = signed_policy(keys, version=current_policy_version, auto_release=False)
     state = rg.reconcile(ledger, raw, signature, founder_key=keys["founder"][1], policy_bytes=policy_raw,
                          policy_sig=policy_signature, host_id=HOST, observe=prod.observe, now=NOW)
@@ -1012,9 +1054,9 @@ def test_applied_reconcile_refuses_an_unknown_pending_policy_floor(keys, tmp_pat
     state["pending_policy_version"] = missing
     ledger.write_text(json.dumps(state))
     before = ledger.read_bytes()
-    prod.deploy(SHA)
+    prod.deploy(SHA, bound(PARENT))
     refused("pending policy", do_reconcile, keys, ledger,
-            reconcile_statement(keys, digest, outcome="applied", release_sha=SHA), prod)
+            reconcile_statement(keys, digest, outcome="applied", release_sha=SHA, images=images(PARENT)), prod)
     assert ledger.read_bytes() == before
 
 
@@ -1095,21 +1137,23 @@ def test_a_held_lock_is_a_bounded_clean_refusal_with_nothing_written(keys, tmp_p
 def applied_event(sha=OTHER, **over):
     """What release_transaction records for an applied release: the trusted evidence a rollback is checked against."""
     return {"event": "applied", "digest": "d" * 64, "sha": sha, "sequence": 3, "payload_digest": DIGEST,
-            "images": images(sha), "configs": configs(), "policy_version": 1, "at": NOW.isoformat()} | over
+            "images": images(sha), "configs": configs(), "bound_images": bound(sha), "inputs_digest": INPUTS,
+            "driver_sha256": DRIVER, "policy_version": 1, "at": NOW.isoformat()} | over
 
 
-def rollback(keys, policy, history, signer="founder", **over):
-    m = manifest(approver=signer, rollback_to=OTHER) | over
+def rollback(keys, policy, history, signer="founder", images=None, host=None, **over):
+    m = manifest(approver=signer, rollback_to=OTHER, images=bound(OTHER) if images is None else images) | over
     raw = rg.canonical(m)
     return rg.verify_release(raw, rg.sign(raw, keys[signer][0], rg.NS_RELEASE), policy=policy,
-                             founder_key=keys["founder"][1], host_facts=facts(), state=STATE, now=NOW,
+                             founder_key=keys["founder"][1], host_facts=host or facts(), state=STATE, now=NOW,
                              history=history)
 
 
-def test_a_declared_rollback_with_full_evidence_still_refuses_until_images_are_proven(keys, policy):
-    # Every evidence check passes; it refuses at the last step because rebuilt images cannot equal the recorded ones.
+def test_a_declared_rollback_with_full_evidence_is_accepted(keys, policy):
+    # The target's own applied record names the four bound IDs, its image-input digest and its payload; what runs
+    # now is that release, and this commit is a schema-neutral change to it, so the rollback is exactly provable.
     events = [applied_event(), applied_event(PARENT, payload_digest="e" * 64)]
-    refused("running images cannot yet be proven", rollback, keys, policy, lambda: events)
+    assert rollback(keys, policy, lambda: events)["sha"] == SHA
 
 
 def test_a_rollback_needs_the_founder_and_the_reviewer(keys, policy):
@@ -1126,16 +1170,27 @@ def test_a_rollback_needs_the_founder_and_the_reviewer(keys, policy):
     ("not a previously applied release", lambda: [applied_event(PARENT)]),
     ("not a previously applied release", lambda: [applied_event(event="bootstrap")]),       # baseline, not applied
     ("not a previously applied release", lambda: [applied_event(event="reconcile")]),
+    ("not a previously applied release", lambda: [applied_event(event="reconcile", outcome="applied")]),
     ("payload differs", lambda: [applied_event(payload_digest="e" * 64)]),                  # same name, other tree
     ("no recorded payload", lambda: [{k: v for k, v in applied_event().items() if k != "payload_digest"}]),
-    ("no recorded image", lambda: [{k: v for k, v in applied_event().items() if k != "images"}]),
-    ("no recorded image", lambda: [applied_event(images={"api": images(OTHER)["api"]})]),
-    ("no recorded image", lambda: [applied_event(images={c: "company-os-api:latest" for c in rg.COMPONENTS})]),
-    ("no recorded image", lambda: [applied_event(configs={c: "x" for c in rg.COMPONENTS})]),
+    ("no bound image", lambda: [{k: v for k, v in applied_event().items() if k != "bound_images"}]),
+    ("no bound image", lambda: [applied_event(bound_images={"api": bound(OTHER)["api"]})]),
+    ("no bound image", lambda: [applied_event(bound_images={c: "company-os-api:latest" for c in rg.BOUND})]),
+    ("no image-input digest", lambda: [{k: v for k, v in applied_event().items() if k != "inputs_digest"}]),
+    ("no image-input digest", lambda: [applied_event(inputs_digest="x")]),
     ("history is unavailable", None),
 ])
 def test_a_rollback_without_matching_trusted_evidence_is_refused(keys, policy, why, history):
     refused(why, rollback, keys, policy, history)
+
+
+def test_a_rollback_needs_exactly_the_targets_images_inputs_and_schema(keys, policy):
+    refused("images differ from the target release", rollback, keys, policy, lambda: [applied_event()],
+            images=bound(PARENT))
+    refused("image inputs differ", rollback, keys, policy, lambda: [applied_event()],
+            host=facts(inputs_digest="1" * 64))
+    refused("changes the Alembic schema", rollback, keys, policy, lambda: [applied_event()],
+            host=facts(migration_heads={"def456abc123"}))
 
 
 def test_a_rollback_uses_the_latest_applied_record_of_its_target(keys, policy):
@@ -1155,12 +1210,14 @@ def test_an_unreadable_history_refuses_a_rollback(keys, policy):
     refused("history is unreadable", rollback, keys, policy, broken)
 
 
-def test_an_applied_release_records_its_payload_digest_for_later_rollbacks(keys, tmp_path):
+def test_an_applied_release_records_its_bound_images_for_later_rollbacks(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
     seed(ledger, STATE)
     transact(keys, ledger, manifest())
     _, event = rg.read_history(ledger)
     assert event["event"] == "applied" and event["sha"] == SHA and event["payload_digest"] == DIGEST
+    assert event["bound_images"] == bound(PARENT) and event["inputs_digest"] == INPUTS
+    assert event["driver_sha256"] == DRIVER
 
 
 # --------------------------------------------------------------------------- founder rebase onto a new repository
@@ -1176,7 +1233,9 @@ def applied_once(keys, tmp_path):
     ledger = tmp_path / "ledger.json"
     do_bootstrap(keys, ledger, statement(keys))
     prod = Production(PARENT)
-    transact(keys, ledger, manifest(sequence=1), prod=prod)       # production runs SHA (payload DIGEST), sequence 1
+    record = {"status": "ready", "inputs_digest": INPUTS, "images": bound(PARENT)}
+    transact(keys, ledger, manifest(sequence=1, approver="founder"), "founder", host=facts(build_record=record),
+             prod=prod)                                          # production runs SHA (payload DIGEST), sequence 1
     return ledger, prod
 
 
@@ -1192,7 +1251,7 @@ def rebase_statement(keys, ledger, *, signer="founder", namespace=rg.NS_REBASE, 
             "old_repository": "seerxo/os", "old_last_sha": SHA, "old_last_sequence": 1, "old_payload_digest": DIGEST,
             "history_sha256": __import__("hashlib").sha256(history.read_bytes()).hexdigest(), "base_sha": BASE,
             "policy_sha256": __import__("hashlib").sha256(praw).hexdigest(),
-            "images": images(SHA), "configs": configs(), "issued_at": NOW.isoformat(),
+            "images": images(PARENT), "configs": configs(), "issued_at": NOW.isoformat(),
             "expires_at": (NOW + timedelta(hours=1)).isoformat()} | over
     raw = rg.canonical(body)
     return raw, rg.sign(raw, keys[signer][0], namespace)
@@ -1219,7 +1278,7 @@ def new_chain_manifest(keys, sha=OTHER, approver="founder"):
 
 def test_a_rebase_moves_the_chain_without_deploying_and_only_the_founder_continues_it(keys, tmp_path):
     ledger, prod = applied_once(keys, tmp_path)
-    before = json.loads(ledger.read_text())
+    before, snapshot = json.loads(ledger.read_text()), prod.observe()
     state = do_rebase(keys, ledger, prod, rebase_statement(keys, ledger))
     assert state["last_sha"] == SHA and state["last_sequence"] == 1 and state["chain_base"] == BASE
     assert state["min_policy_version"] == 2 and set(before["seen"]) < set(state["seen"])
@@ -1227,7 +1286,7 @@ def test_a_rebase_moves_the_chain_without_deploying_and_only_the_founder_continu
     assert json.loads(copy.read_text()) == before
     event = rg.read_history(ledger)[-1]
     assert event["event"] == "rebase" and event["old_payload_digest"] == DIGEST and event["base_sha"] == BASE
-    assert prod.observe() == Production(SHA).observe()                                  # nothing deployed
+    assert prod.observe() == snapshot                                                     # nothing deployed
 
     v2 = {"version": 2, "repository": NEW_REPO}
     old = manifest(sequence=2, parent_sha=SHA, sha=OTHER)
@@ -1257,7 +1316,7 @@ def test_a_rebase_moves_the_chain_without_deploying_and_only_the_founder_continu
     (lambda k, l: rebase_statement(k, l, old_last_sequence=0), "another applied release"),
     (lambda k, l: rebase_statement(k, l, old_last_sequence=True), "another applied release"),
     (lambda k, l: rebase_statement(k, l, history_sha256="0" * 64), "different release history"),
-    (lambda k, l: rebase_statement(k, l, images=images(PARENT)), "does not match the rebase"),
+    (lambda k, l: rebase_statement(k, l, images=images(OTHER)), "does not match the rebase"),
     (lambda k, l: rebase_statement(k, l, old_payload_digest="0" * 64), "payload the host recorded"),
     (lambda k, l: rebase_statement(k, l, old_repository="evil/os"), "another old repository"),
     (lambda k, l: rebase_statement(k, l, base_sha="main"), "40-hex"),
@@ -1292,7 +1351,7 @@ def test_a_rebase_needs_a_newer_policy_a_settled_ledger_and_matching_production(
             policy=same)                                                     # same policy version: no new authority
     refused("different policy", do_rebase, keys, ledger, prod, rebase_statement(keys, ledger),
             policy=rebase_policy(keys, version=3))                          # signed for v2, host holds v3
-    drifted = Production(SHA)
+    drifted = Production(PARENT)
     drifted.running["api"]["image"] = image("api", OTHER)
     refused("does not match the rebase", do_rebase, keys, ledger, drifted, rebase_statement(keys, ledger))
     state = json.loads(ledger.read_text())
@@ -1329,7 +1388,7 @@ def test_a_failed_first_release_after_a_rebase_keeps_the_new_chain(keys, tmp_pat
                                           "pending_policy_version": 2}))
     praw, psig = rebase_policy(keys)
     body = {"kind": "reconcile", "host_id": HOST, "repository": NEW_REPO, "branch": "main", "nonce": "dd" * 16,
-            "pending_digest": "ab" * 32, "outcome": "failed", "release_sha": SHA, "images": images(SHA),
+            "pending_digest": "ab" * 32, "outcome": "failed", "release_sha": SHA, "images": images(PARENT),
             "configs": configs(), "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
     raw = rg.canonical(body)
     new = rg.reconcile(ledger, raw, rg.sign(raw, keys["founder"][0], rg.NS_RECONCILE), founder_key=keys["founder"][1],
@@ -1342,7 +1401,7 @@ def test_recovering_a_lost_ledger_right_after_a_rebase_keeps_the_new_chain(keys,
     do_rebase(keys, ledger, prod, rebase_statement(keys, ledger))
     ledger.unlink()
     digest = __import__("hashlib").sha256(rg.history_path(ledger).read_bytes()).hexdigest()
-    raw, sig = statement(keys, "recovery", history_sha256=digest, last_sha=SHA, last_sequence=1, images=images(SHA),
+    raw, sig = statement(keys, "recovery", history_sha256=digest, last_sha=SHA, last_sequence=1, images=images(PARENT),
                          repository=NEW_REPO)
     praw, psig = rebase_policy(keys)
     state = rg.recover(ledger, raw, sig, founder_key=keys["founder"][1], policy_bytes=praw, policy_sig=psig,
@@ -1384,7 +1443,7 @@ def test_a_release_recorded_by_an_applied_reconcile_can_still_be_rebased(keys, t
                                "signature": rg.sign(rg.canonical(att), keys["reviewer"][0], rg.NS_REVIEW)}
 
     def record_fails(manifest):
-        prod.deploy(manifest["sha"])
+        prod.deploy(manifest["sha"], manifest["images"])
         raise RuntimeError("the record failed after the switch")
     with pytest.raises(RuntimeError):
         transact(keys, ledger, m, "founder", prod=prod, apply=lambda x: record_fails(x),
@@ -1394,13 +1453,13 @@ def test_a_release_recorded_by_an_applied_reconcile_can_still_be_rebased(keys, t
     praw, psig = signed_policy(keys)
     body = {"kind": "reconcile", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "dd" * 16,
             "pending_digest": pending["pending"], "outcome": "applied", "release_sha": OTHER,
-            "images": images(OTHER), "configs": configs(), "issued_at": NOW.isoformat(),
+            "images": images(PARENT), "configs": configs(), "issued_at": NOW.isoformat(),
             "expires_at": (NOW + timedelta(hours=1)).isoformat()}
     raw = rg.canonical(body)
     rg.reconcile(ledger, raw, rg.sign(raw, keys["founder"][0], rg.NS_RECONCILE), founder_key=keys["founder"][1],
                  policy_bytes=praw, policy_sig=psig, host_id=HOST, observe=prod.observe, now=NOW)
     assert rg.read_history(ledger)[-1]["payload_digest"] == DIGEST
-    st = rebase_statement(keys, ledger, old_last_sha=OTHER, old_last_sequence=2, images=images(OTHER))
+    st = rebase_statement(keys, ledger, old_last_sha=OTHER, old_last_sequence=2, images=images(PARENT))
     assert do_rebase(keys, ledger, prod, st)["chain_base"] == BASE
 
 
@@ -1436,7 +1495,7 @@ def test_a_reconcile_statement_already_in_history_is_refused_even_if_the_ledger_
     ledger.write_text(json.dumps(pending))
     praw, psig = signed_policy(keys)
     body = {"kind": "reconcile", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "dd" * 16,
-            "pending_digest": "ab" * 32, "outcome": "failed", "release_sha": SHA, "images": images(SHA),
+            "pending_digest": "ab" * 32, "outcome": "failed", "release_sha": SHA, "images": images(PARENT),
             "configs": configs(), "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
     raw = rg.canonical(body)
     sig = rg.sign(raw, keys["founder"][0], rg.NS_RECONCILE)

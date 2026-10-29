@@ -211,7 +211,9 @@ do_cmd() {
   local rc=0; "$@" || rc=$?
   ev "exit=$rc: $*"; return $rc
 }
-tag()  { docker inspect company-worker --format '{{.Config.Image}}' | sed 's/.*://'; }
+# The release SHA: the forward deploy tags company-os-*:$SHA and names it in COMPANY_OS_GIT_SHA. The
+# container's Config.Image is an image ID under binding, which is not a tag name.
+tag()  { docker exec company-worker printenv COMPANY_OS_GIT_SHA; }
 sha_of() { docker exec "$1" printenv COMPANY_OS_GIT_SHA; }
 # Coolify's nightly cleanup `docker rmi`s every tagged image no container uses: its coolify.managed label check is
 # a broken Go template (beta.469), so the label protects nothing. A never-started container holding the image makes
@@ -256,10 +258,10 @@ pause
 stage "Start the coder egress proxy (allowlist: api.anthropic.com, chatgpt.com, auth.openai.com)"
 say "Starts ONLY company-egress and creates the internal network company-coder-net."
 say "Risk: one 128 MB container; touches no running service (--no-deps). Rollback:"
-note "docker compose --profile stage-c rm -sf company-egress"
+note "sudo scripts/compose-bound.sh --profile stage-c rm -sf company-egress"
 T=$(tag)
 do_cmd "Start it with the exact tag the worker runs." sudo env COMPANY_OS_IMAGE_TAG="$T" COMPANY_OS_GIT_SHA="$T" \
-  docker compose --profile stage-c up -d --no-deps --no-build company-egress || true
+  scripts/compose-bound.sh --profile stage-c up -d --no-deps --no-build company-egress || true
 say "running: $(docker inspect -f '{{.State.Running}}' company-egress 2>/dev/null || echo no)   internal network: $(docker network inspect -f '{{.Internal}}' company-coder-net 2>/dev/null || echo no)"
 pause
 
@@ -342,8 +344,8 @@ say "Risk: a worker tick in flight is interrupted; recover_stale requeues it. AP
 say "Rollback: remove COMPANY_STAGE_C_GITHUB_TOKEN from $ENV_FILE and run the same command again."
 say "open tasks IN_PROGRESS: $(docker exec company-postgres psql -U "${POSTGRES_USER:-company}" -d "${POSTGRES_DB:-company}" -Atc "select count(*) from tasks where status='IN_PROGRESS'" 2>/dev/null || echo unknown)"
 T=$(tag)
-if do_cmd "Recreate the worker with the token." sudo env COMPANY_OS_IMAGE_TAG="$T" COMPANY_OS_GIT_SHA="$T" \
-     docker compose up -d --no-deps --no-build company-worker; then
+if do_cmd "Recreate the worker with the token." sudo env COMPANY_OS_GIT_SHA="$T" \
+     scripts/compose-bound.sh up -d --no-deps --no-build company-worker; then
   sleep 8
   say "worker SHA : $(sha_of company-worker)  (must still be $T)"
   docker exec company-worker sh -c 'test -n "$GH_TOKEN"' && say "GH_TOKEN present in worker (value never shown)" || warn "GH_TOKEN still absent"

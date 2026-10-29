@@ -229,9 +229,8 @@ def test_the_root_script_reads_release_files_only_through_rel():
     lines = [l for l in REMOTE.splitlines() if "/tmp/src.tgz" in l or "/tmp/main.sha256" in l]
     assert lines == ['  if [ "$REL" = /tmp ]; then rm -f /tmp/src.tgz /tmp/main.sha256; else rm -rf -- "$REL"; fi']
     assert REMOTE.index("cleanup() {\n" + lines[0]) >= 0   # still the first statement of the EXIT cleanup
-    # +1 manifest read: install_cron; +1 src.tgz and +3 manifest reads: the clean build context (extract, verify,
-    # compare); +1 manifest read: the executable bit is set on the release's own scripts only
-    assert REMOTE.count('"$REL/src.tgz"') == 4 and REMOTE.count('"$REL/main.sha256"') == 11
+    # The bound path also hashes inputs, validates compose and retains the recovery verifier from this archive.
+    assert REMOTE.count('"$REL/src.tgz"') == 7 and REMOTE.count('"$REL/main.sha256"') == 11
 
 
 def rel_block(release_dir):
