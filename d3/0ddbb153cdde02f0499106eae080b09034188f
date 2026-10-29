@@ -17,6 +17,8 @@ tests/test_compose_bound.py
   s_559925a9845184::t_3eb8864b3a25c7 16-18,36-47,56-59
 scripts/compose-bound.sh
   s_559925a9845184::t_6ef7775d9688a9 46-64,93-97
+  s_7236fe8a19f823::t_a71da0637c5b11 5,72
+  s_7236fe8a19f823::t_9d5782d6f58897 44-45
 tests/test_stage_c_ci.py
   s_559925a9845184::t_fe7443d474ceea 198-242
 tests/test_host_cli_release_sync.py
@@ -36,6 +38,14 @@ scripts/deploy-company-os.sh
         "tool": "codex",
         "id": "01a189bb-c994-7f10-8587-48df9fbb7795",
         "model": "gpt-6.1-sol"
+      },
+      "human_author": "seerxo-agent <info@seerxo.com>"
+    },
+    "s_7236fe8a19f823": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "69ef6012-c0fd-4ec5-92e7-6d6df8e3e572",
+        "model": "claude-opus-5-5"
       },
       "human_author": "seerxo-agent <info@seerxo.com>"
     }
