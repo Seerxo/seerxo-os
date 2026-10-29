@@ -195,6 +195,29 @@ def test_a_fork_run_awaiting_workflow_approval_waits_and_is_never_a_repair():
     assert out["outcome"] == "REPAIR" and out["failed"] == [REQUIRED[0]]
 
 
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "neutral", "stale"])
+def test_a_run_that_ended_without_a_result_waits_a_bounded_time_then_blocks(conclusion):
+    """A required run that finished cancelled/skipped/neutral/stale proves nothing. A re-run may still come, so it
+    waits, but only ENDED_GRACE after CI began: an unattended task must not hang forever. Never a repair."""
+    db, t = _task()
+    ended = {"name": "test", "status": "completed", "conclusion": conclusion}
+    out = _ingest(db, t, facts(ended))
+    assert out["outcome"] == "WAITING" and f"test {conclusion}" in out["reason"]
+    assert _ingest(db, t, facts(OK))["outcome"] == "READY_TO_MERGE"   # re-run inside the grace: recovered
+    db, t = _task()
+    _ingest(db, t, facts(ended))
+    imp = deepcopy(t.context["improvement"])
+    late = (datetime.now(timezone.utc) - stage_c_ci.ENDED_GRACE - timedelta(minutes=1)).isoformat()
+    imp["history"] = [h | {"at": late} if h["stage"] == "CI" else h for h in imp["history"]]
+    t.context = {**t.context, "improvement": imp}
+    out = _ingest(db, t, facts(ended))
+    assert out == {"outcome": "BLOCKED", "ended_without_result": ["test"]}
+    assert t.status == enums.TaskStatus.BLOCKED and conclusion in t.error
+    assert stage(t) == "CI" and stage_c_ci.repairs_used(t) == 0
+    db, t = _task()   # a real failure beside it is still a repair
+    assert _ingest(db, t, facts(ended, BAD | {"name": "lint"}))["outcome"] == "REPAIR"
+
+
 MERGE = "c" * 40
 FOUNDER = "semihbugrasezer"
 

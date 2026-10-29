@@ -13,6 +13,9 @@ Called by the worker control loop for merged tasks. Deterministic, no model call
 A task names its metric in context.improvement.measure:
   {"selector": {"subject": "youtube:…", "metric": "views", "window": "", "source": "…"},
    "direction": "up" | "down", "window_hours": 24}
+A task opened for a goal that names no metric is measured on the goal's own metric (measure_source "goal"):
+direction from baseline to target, window at least the series' own window. That number is goal-wide, so a change
+in it is recorded next to the task, never claimed as the task's effect.
 Unknown is never success: missing CI, an unknown live SHA or a missing reading means wait.
 """
 import json
@@ -28,6 +31,7 @@ from app import audit, commit_statuses, enums, goals, models, stage_c
 
 ACTOR = "stage-c-verify"
 SHA = re.compile(r"[0-9a-f]{40}")
+SERIES_WINDOW = re.compile(r"([1-9][0-9]{0,3})([hd])")
 
 
 def _imp(task: models.Task) -> dict:
@@ -37,6 +41,20 @@ def _imp(task: models.Task) -> dict:
 def _evidence(task: models.Task, stage: str) -> dict:
     return next((h.get("evidence") or {} for h in reversed(_imp(task).get("history", []))
                  if h["stage"] == stage), {})
+
+
+def _goal_measure(db: Session, task: models.Task) -> dict | None:
+    goal = db.get(models.Goal, task.goal_id) if task.goal_id else None
+    if goal is None or goals.config_issues(goal):
+        return None   # an unevaluable goal is not measured; the outcome stays NOT_MEASURABLE
+    window = goal.metric_selector.get("window", "")
+    match = SERIES_WINDOW.fullmatch(window)
+    if window and not match:
+        return None
+    hours = int(match[1]) * (24 if match[2] == "d" else 1) if match else 0
+    up = goals.number(goal.target) > goals.number(goal.baseline)
+    return {"selector": goal.metric_selector, "direction": "up" if up else "down",
+            "window_hours": max(24, hours), "measure_source": "goal", "goal_id": goal.id}
 
 
 def _reading(db: Session, selector: dict | None, now: datetime, after: datetime | None = None):
@@ -74,13 +92,15 @@ def step(db: Session, task: models.Task, facts: dict, now: datetime | None = Non
             return {"outcome": "MAIN_CI_FAILED"}
         if facts.get("main_ci") != "success" or facts.get("live_contains_merge") is not True:
             return {"outcome": "WAITING", "reason": "main CI or deploy of the merge commit not confirmed"}
-        baseline = _reading(db, measure.get("selector"), now) if measure else None
+        derived = None if measure else _goal_measure(db, task)
+        baseline = _reading(db, (measure or derived or {}).get("selector"), now) if measure or derived else None
         stage_c.advance(db, task, "VERIFYING", ACTOR, {"merge_commit": merge, "main_ci": "success",
                                                        "live": True, "verified_at": now.isoformat(),
-                                                       "baseline": baseline})
+                                                       "baseline": baseline, **({"measure": derived} if derived else {})})
         return {"outcome": "VERIFIED"}
 
     if stage == "VERIFYING":
+        measure = measure or _evidence(task, "VERIFYING").get("measure") or {}
         if not measure:
             stage_c.advance(db, task, "MEASURED", ACTOR, {"outcome": "NOT_MEASURABLE",
                                                           "reason": "the task names no metric"})
