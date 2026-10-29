@@ -49,7 +49,8 @@ if 'config' in sys.argv:
     files = [sys.argv[i+1] for i, a in enumerate(sys.argv) if a == '-f']
     for extra in files[1:]:          # JSON is YAML: each later file merges per service, environment per key
         if extra.endswith('company-coder-pause.compose.yml'):   # the reviewed YAML overlay: the API's fence only
-            services['company-api']['environment']['CODER_PAUSE_FENCE_ENABLED'] = 'true'
+            if not (root/'fence-config-dropped').exists():
+                services['company-api']['environment']['CODER_PAUSE_FENCE_ENABLED'] = 'true'
             continue
         for name, svc in json.loads(Path(extra).read_text()).get('services', {}).items():
             merged = services.setdefault(name, {})
@@ -144,11 +145,13 @@ def test_the_pilot_override_arms_code_write_and_changes_nothing_else(maintenance
     """A Stage C pilot recreates the worker with exactly one change: ENABLE_AUTONOMOUS_CODE_WRITE "true". The bound
     images are still checked on the configuration that is executed."""
     root, env = maintenance
+    (root / "api-fence").write_text("true")   # production: the founder's pause fence is live
     result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
     override = env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]
-    assert calls[-1][:8] == ["compose", "--env-file", ".env", "-f", "docker-compose.yml", "-f", override, "up"]
+    assert calls[-1][:10] == ["compose", "--env-file", ".env", "-f", "docker-compose.yml",
+                              "-f", "ops/company-coder-pause.compose.yml", "-f", override, "up"]
     assert calls[-1][calls[-1].index("--pull") + 1] == "never"
 
 
@@ -292,3 +295,22 @@ def test_a_fence_that_is_not_live_after_up_fails_the_command(maintenance):
     (root / "api-fence-after").write_text("")
     result = command(env, "up", "-d", "--no-deps", "--no-build", "company-api")
     assert result.returncode != 0 and "pause fence" in result.stderr
+
+
+def test_the_pilot_is_never_armed_without_a_live_pause_fence(maintenance):
+    """Arming lets an agent write code unattended; without the fence the founder's pause cannot stop it."""
+    root, env = maintenance
+    result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
+    assert result.returncode != 0 and "pause fence is not live" in result.stderr
+    assert not (root / "calls").exists() or all("up" not in json.loads(line)
+                                                 for line in (root / "calls").read_text().splitlines())
+
+
+def test_up_never_runs_when_the_effective_config_would_drop_the_fence(maintenance):
+    """Checked before up, not only after: a config without the fence never reaches Compose's up."""
+    root, env = maintenance
+    (root / "api-fence").write_text("true")
+    (root / "fence-config-dropped").touch()
+    result = command(env, "up", "-d", "--no-deps", "--no-build", "company-api")
+    assert result.returncode != 0 and "without its pause fence" in result.stderr
+    assert all("up" not in json.loads(line) for line in (root / "calls").read_text().splitlines())

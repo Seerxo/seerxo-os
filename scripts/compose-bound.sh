@@ -131,6 +131,9 @@ try:
         env |= {"COMPOSE_PROFILES": "", "COMPOSE_ENV_FILES": ""}
         compose = ["docker", "compose", "--env-file", ".env", "-f", "docker-compose.yml", *profiles]
         fence = args[0] in ("up", "config") and api_fence_live()
+        if pilot and not fence:
+            # Arming lets an agent write code unattended; the founder's pause must be able to stop it.
+            raise ValueError("refusing to arm the Stage C pilot: the pause fence is not live on company-api")
         if fence:
             try:
                 verified = fence_overlay_verified()
@@ -144,6 +147,9 @@ try:
             compose += ["-f", str(override)]
         config = json.loads(subprocess.check_output([*compose, "config", "--format", "json"], env=env))
         services = config.get("services") or {}
+        if fence and ((services.get("company-api") or {}).get("environment") or {}).get(
+                "CODER_PAUSE_FENCE_ENABLED") != "true":
+            raise ValueError("the effective Compose configuration would start company-api without its pause fence")
         for c, name in zip(components, ("company-api", "company-worker", "company-reasoner", "company-reasoner-egress")):
             if (services.get(name) or {}).get("image") != images[c]:
                 raise ValueError("the effective Compose configuration differs from the bound images")
