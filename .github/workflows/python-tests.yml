@@ -92,3 +92,7 @@ jobs:
           python -u -m pytest -vv -n 4 --durations=20 \
             tests/test_stage_c_crash_recovery_postgres.py \
             tests/test_worker_crash_recovery_postgres.py
+      - name: Real bound-image and PostgreSQL recovery rehearsal
+        env:
+          SEERXO_REAL_RECOVERY: "1"
+        run: python -u -m pytest -q -s tests/test_release_recovery_docker.py

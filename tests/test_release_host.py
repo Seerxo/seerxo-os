@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import re
+import subprocess
 import tarfile
 from datetime import timedelta
 from pathlib import Path
@@ -15,14 +16,23 @@ import pytest
 
 from app import release_gateway as rg, release_host as host
 from tests.test_release_gateway import Production, configs, images, seed
-from tests.test_release_gateway_service import NOW, World, sh
+from tests.test_release_gateway_service import NOW, World, bound as bound_for_inputs, sh
 
 # World is a class, never None: the old `World is None` guard never skipped, so the Stage C checks image (no
 # ssh-keygen) errored 53 tests (L2 pilot re-measurement, 2026-10-19). Same guard as test_release_gateway_service.
 pytestmark = pytest.mark.skipif(not (shutil.which("ssh-keygen") and shutil.which("git")), reason="needs git, ssh-keygen")
 
+# The candidate driver ships inside the release payload; the installed bundle (`BUNDLED_DRIVER`) is what root runs.
 DRIVER = ("#!/usr/bin/env bash\nset -e\ncat > x <<'REMOTE'\necho root-side deploy\n"
-          + host.DRIVER_HOLDS_IMAGES + "\nREMOTE\necho uploaded\n")
+          + host.DRIVER_BOUND_IMAGES + "\nDRIVER_BUNDLE_VERSION=1\nREMOTE\necho uploaded\n")
+BUNDLED_DRIVER = DRIVER
+
+
+def identity(prod):
+    """The three-component image IDs and configuration digests a founder statement must name (egress is bound only)."""
+    observed = prod.observe()
+    return ({c: observed[c]["image"] for c in rg.COMPONENTS},
+            {c: observed[c]["config"] for c in rg.COMPONENTS})
 
 
 @pytest.fixture
@@ -33,7 +43,10 @@ def tmp_path(tmp_path_factory):
     import tempfile
     for parent in (Path.home() / ".cache", Path.home(), Path.cwd()):
         if parent.is_dir() and host.untrusted_path(parent.resolve()) is None:
-            base = Path(tempfile.mkdtemp(prefix="release-host-", dir=parent.resolve()))
+            try:
+                base = Path(tempfile.mkdtemp(prefix="release-host-", dir=parent.resolve()))
+            except PermissionError:
+                continue
             yield base
             shutil.rmtree(base, ignore_errors=True)
             return
@@ -48,17 +61,44 @@ def hw(tmp_path, monkeypatch):
     monkeypatch.setattr(host, "PIN_REMOTE", False)                         # local repositories, not GitHub remotes
     (tmp_path / "opt-docker-compose.yml").write_text("\n")                 # the base release's compose, untouched
     w = World(tmp_path)
+    # The installed verifier+driver bundle (design §4.1): root runs this driver, never the candidate's tree.
+    monkeypatch.setattr(host, "BUILDS", w.builds)                          # production: /var/lib/release-host/builds
+    monkeypatch.setattr(host, "INSTALL_LOCK", tmp_path / "install.lock")   # production: release-host/install.lock
+    bundle = tmp_path / "bundle"
+    (bundle / "scripts").mkdir(parents=True)
+    (bundle / "scripts" / "deploy-company-os.sh").write_text(BUNDLED_DRIVER)
+    from app import release_identity
+    members = {"scripts/deploy-company-os.sh": BUNDLED_DRIVER}
+    for module, name in ((host, "app/release_host.py"), (rg, "app/release_gateway.py"),
+                         (release_identity, "app/release_identity.py")):
+        members[name] = Path(module.__file__).read_text()
+        monkeypatch.setattr(module, "__file__", str(bundle / name))
+    members["app/__init__.py"] = ""
+    for name, text in members.items():
+        target = bundle / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    (bundle / "BUNDLE.json").write_text(json.dumps({
+        "bundle_version": rg.BUNDLE_VERSION, "source_sha": w.base,
+        "files": {name: hashlib.sha256(text.encode()).hexdigest() for name, text in members.items()}}))
+    monkeypatch.setattr(host, "BUNDLE", bundle)
+    monkeypatch.setattr(host, "BUNDLE_PRODUCTION", bundle)
     # The deploy driver ships with the code; the base release already contains it.
     # Every path the driver packs exists in a real release (git archive refuses a missing one, as the driver does).
     shipped = {"scripts/deploy-company-os.sh": DRIVER, "migrations/env.py": "\n", "agents/registry.yaml": "\n",
                "skills/x/SKILL.md": "\n", "tests/test_x.py": "\n", "alembic.ini": "\n", "requirements.txt": "\n",
                "Dockerfile": "\n", "docker-compose.yml": "\n", "docs/PERMANENT_FACTS.md": "\n"}
     w.base = w.commit("driver", **shipped)
+    w.base_inputs = w.inputs_of(w.base)                  # the base image inputs are theirs, not the first commit's
+    w.bound = bound_for_inputs(w.base_inputs)
     w.push()
-    seed(w.cfg.ledger, {"last_sha": w.base, "last_sequence": 6, "seen": [], "min_policy_version": 1,
-                        "images": images(w.base), "configs": configs()})
+    state = {"last_sha": w.base, "last_sequence": 6, "seen": [], "min_policy_version": 1,
+             "images": {c: w.bound[c] for c in rg.COMPONENTS}, "configs": configs(),
+             "bound_images": w.bound, "bound_inputs": w.base_inputs,
+             "bound_driver_sha256": hashlib.sha256(DRIVER.encode()).hexdigest()}
+    seed(w.cfg.ledger, state)
     w.report(w.base)
-    w.prod = Production(w.base)
+    w.prod = Production.from_state(state)
     host_clone = tmp_path / "host-clone"
     sh(tmp_path, "git", "clone", "-q", str(w.origin), str(host_clone))
     w.hcfg = host.Config({
@@ -67,8 +107,49 @@ def hw(tmp_path, monkeypatch):
         "ledger": str(w.cfg.ledger), "inboxes": [str(w.cfg.outbox), str(tmp_path / "founder-inbox")],
         "rejected": str(tmp_path / "rejected"), "run_root": str(tmp_path / "run"),
         "identity_report": str(tmp_path / "identity.json")})
-    w.runs = []
+    w.runs, w.spawns, w.anchors_removed = [], [], set()
     w.driver_exit = 0
+
+    def records():
+        """Every ready build record root has written so far (what a build made present and anchored)."""
+        found = []
+        for path in sorted(w.builds.glob("*.json")):
+            try:
+                record = json.loads(path.read_text())
+            except ValueError:
+                continue
+            if isinstance(record, dict) and rg.images_ok(record.get("images")) \
+                    and rg.DIGEST.fullmatch(path.stem):
+                found.append(record)
+        return found
+
+    def anchors():
+        held = {f"company-os-bound-{r['inputs_digest'][:12]}-a{r.get('attempt', 1)}-{c}": img
+                for r in records() for c, img in r["images"].items()}
+        for component in rg.BOUND:
+            image_id = w.prod.running[component]["image"]
+            held.setdefault(f"company-os-bound-run-{component}", image_id)
+        return {name: img for name, img in held.items() if name not in w.anchors_removed}
+
+    def docker(argv, **kw):
+        """The four reads release_host makes (`image inspect`, `ps`, container `inspect`, `rm`) over the fixture."""
+        def done(code, out=""):
+            return subprocess.CompletedProcess(argv, code, stdout=out, stderr="")
+        if argv[:2] == ["docker", "image"]:
+            known = {i for r in records() for i in r["images"].values()} \
+                | {c["image"] for c in w.prod.running.values()}
+            return done(0, argv[-1] + "\n") if argv[-1] in known else done(1)
+        if argv[:2] == ["docker", "ps"]:
+            return done(0, "".join(f"{name}\t{img}\n" for name, img in sorted(anchors().items())))
+        if argv[:2] == ["docker", "inspect"]:
+            key = {v: k for k, v in host.CONTAINERS.items()}[argv[-1]]
+            image_id = w.prod.running.get(key, {}).get("image")
+            return done(0, image_id + "\n") if image_id else done(1)
+        if argv[:2] == ["docker", "rm"]:
+            w.anchors_removed.update(argv[2:])
+            return done(0)
+        return done(1)
+    w.docker = docker
 
     def run(env, script):
         d = script.parent
@@ -76,14 +157,21 @@ def hw(tmp_path, monkeypatch):
                        "src": sorted(tarfile.open(fileobj=io.BytesIO(gzip.decompress((d / "src.tgz").read_bytes())))
                                      .getnames())})
         if w.driver_exit == 0:
-            w.prod.deploy(env["SHA"])          # the driver really switched api, worker and reasoner
+            ledger = json.loads(w.hcfg.ledger.read_text())
+            w.prod.deploy(env["SHA"], ledger["pending_images"])   # the driver starts exactly the signed IDs
         return w.driver_exit
     w.run = run
+
+    def spawn(env, script):
+        w.spawns.append(env)
+        return 0, ""
+    w.spawn = spawn
     return w
 
 
 def signed_docs_release(w):
-    sha = w.commit("docs", **{"docs/HANDOFF.md": "new\n", "app/main.py": "x = 1\n"})
+    """A commit that changes only a document no image copies: the gateway may sign it for the running images."""
+    sha = w.commit("docs", **{"docs/HANDOFF.md": "new\n"})
     w.push()
     out = w.tick()
     assert out["outcome"] == "SIGNED", out
@@ -91,7 +179,11 @@ def signed_docs_release(w):
 
 
 def step(w, **kw):
-    return host.step(w.hcfg, now=NOW, run=w.run, observe=w.prod.observe, **kw)
+    kw.setdefault("run", w.run)
+    kw.setdefault("observe", w.prod.observe)
+    kw.setdefault("docker", w.docker)
+    kw.setdefault("spawn", w.spawn)
+    return host.step(w.hcfg, now=NOW, **kw)
 
 
 def test_a_gateway_signed_release_is_applied_through_the_existing_driver(hw):
@@ -101,7 +193,7 @@ def test_a_gateway_signed_release_is_applied_through_the_existing_driver(hw):
     run, = hw.runs
     assert run["env"]["SHA"] == sha and run["env"]["AUTOMATIC"] == "true" and run["env"]["DETACH"] == ""
     assert run["env"]["APPLY"] == "--apply" and run["env"]["ALLOW_MIGRATION"] == ""
-    assert run["script"] == "echo root-side deploy\n" + host.DRIVER_HOLDS_IMAGES + "\n"   # its root side at that commit
+    assert run["script"] == "echo root-side deploy\n" + host.DRIVER_BOUND_IMAGES + "\nDRIVER_BUNDLE_VERSION=1\n"
     assert run["sums"] == rg.payload_listing(hw.hcfg.clone, sha)          # what the driver verifies files against
     assert "app/main.py" in run["src"] and "docs/HANDOFF.md" not in run["src"]   # only the shipped paths
     ledger = json.loads(hw.hcfg.ledger.read_text())
@@ -156,10 +248,11 @@ def test_a_stolen_gateway_key_cannot_understate_the_change_to_ship_high_risk_cod
     att = rg.attestation("codex", packet, {"verdict": "APPROVE", "fingerprint": packet["fingerprint"],
                                            "findings": []}, NOW.isoformat())
     digest = rg.payload_digest(rg.payload_listing(hw.work, sha))
-    manifest = {"version": 1, "repository": "seerxo/os", "branch": "main", "sha": sha, "parent_sha": hw.base,
+    manifest = {"version": rg.MANIFEST_VERSION, "repository": "seerxo/os", "branch": "main", "sha": sha,
+                "parent_sha": hw.base,
                 "payload_digest": digest, "changed_paths": ["docs/HANDOFF.md"], "sequence": 7,
                 "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat(),
-                "policy_version": 1, "migration_to": "", "approver": "gateway",
+                "policy_version": 1, "migration_to": "", "approver": "gateway", "images": hw.bound,
                 "evidence": {"trusted_checks": {"runner": "gateway", "sha": sha, "payload_digest": digest,
                                                 "passed": True},
                              "review": {"nonce": "ef" * 16, "attestation": att, "signature": rg.sign(
@@ -174,7 +267,8 @@ def test_a_stolen_gateway_key_cannot_understate_the_change_to_ship_high_risk_cod
 
 def test_an_expired_manifest_is_rejected(hw):
     signed_docs_release(hw)
-    out = host.step(hw.hcfg, now=NOW + timedelta(hours=3), run=hw.run, observe=hw.prod.observe)
+    out = host.step(hw.hcfg, now=NOW + timedelta(hours=3), run=hw.run, observe=hw.prod.observe,
+                    docker=hw.docker, spawn=hw.spawn)
     assert out["outcome"] == "REJECTED" and "expired" in out["reason"] and hw.runs == []
 
 
@@ -230,7 +324,7 @@ def test_identity_changing_between_the_report_and_the_lock_blocks(hw):
         if len(calls) > 1:                                                     # after the report, before the apply
             hw.prod.deploy("8" * 40)
         return hw.prod.observe()
-    out = host.step(hw.hcfg, now=NOW, run=hw.run, observe=observe)
+    out = host.step(hw.hcfg, now=NOW, run=hw.run, observe=observe, docker=hw.docker, spawn=hw.spawn)
     assert out["outcome"] == "BLOCKED" and hw.runs == []
     assert "pending" not in json.loads(hw.hcfg.ledger.read_text())
 
@@ -242,7 +336,8 @@ def test_a_driver_that_exits_0_but_did_not_switch_production_leaves_the_host_pen
     def lying_driver(env, script):
         hw.runs.append({"env": env})
         return 0                                                               # claims success, changed nothing
-    out = host.step(hw.hcfg, now=NOW, run=lying_driver, observe=hw.prod.observe)
+    out = host.step(hw.hcfg, now=NOW, run=lying_driver, observe=hw.prod.observe, docker=hw.docker,
+                    spawn=hw.spawn)
     assert out["outcome"] == "APPLY_FAILED" and "after apply" in out["reason"]
     assert json.loads(hw.hcfg.ledger.read_text())["pending"]
     assert step(hw)["outcome"] == "WAITING_FOR_FOUNDER"
@@ -255,7 +350,7 @@ def test_founder_bootstrap_and_recovery_commands_on_the_host(hw, tmp_path):
     assert step(hw)["outcome"] == "BLOCKED"                                    # no baseline: nothing at all
     praw = hw.hcfg.policy.read_bytes()
     st = {"kind": "bootstrap", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "cd" * 16,
-          "images": images(hw.base), "configs": configs(), "issued_at": NOW.isoformat(),
+          "images": identity(hw.prod)[0], "configs": identity(hw.prod)[1], "issued_at": NOW.isoformat(),
           "expires_at": (NOW + timedelta(hours=1)).isoformat(),
           "policy_sha256": __import__("hashlib").sha256(praw).hexdigest(), "release_sha": hw.base}
     raw = rg.canonical(st)
@@ -281,7 +376,7 @@ def test_the_host_reads_identity_from_docker_inspect_not_tags(monkeypatch):
         info = {"Image": img, "Config": {"Env": ["COMPANY_OS_GIT_SHA=" + "1" * 40, "X=y"],
                                          "Image": f"company-os-{name}:latest", "Cmd": [name]},
                 "State": {"Running": True}}
-        if name == "company-reasoner":
+        if name in ("company-reasoner", "company-reasoner-egress"):
             info["State"]["Running"] = False                                   # a stopped component is not identity
         infos[name] = info
         return sp.CompletedProcess(argv, 0, stdout=json.dumps(info), stderr="")
@@ -520,7 +615,8 @@ def test_a_group_writable_parent_of_the_rejected_directory_blocks(hw):
         out = step(hw)
     finally:
         parent.chmod(mode)
-    assert out["outcome"] == "BLOCKED" and "untrusted" in out["reason"] and hw.runs == []
+    assert out["outcome"] == "BLOCKED" and ("untrusted" in out["reason"] or "root-only" in out["reason"]) \
+        and hw.runs == []
 
 
 def test_the_ledger_lock_is_root_only_so_a_reader_cannot_stall_the_host(hw):
@@ -786,8 +882,9 @@ def test_the_founder_reconciles_a_failed_release_on_the_host(hw, tmp_path):
     assert step(hw)["outcome"] == "APPLY_FAILED"
     pending = json.loads(hw.hcfg.ledger.read_text())["pending"]
     st = {"kind": "reconcile", "host_id": HOST, "repository": "seerxo/os", "branch": "main", "nonce": "ab" * 16,
-          "pending_digest": pending, "outcome": "failed", "release_sha": hw.base, "images": images(hw.base),
-          "configs": configs(), "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
+          "pending_digest": pending, "outcome": "failed", "release_sha": hw.base,
+          "images": identity(hw.prod)[0], "configs": identity(hw.prod)[1],
+          "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
     raw = rg.canonical(st)
     (tmp_path / "rec.json").write_bytes(raw)
     (tmp_path / "rec.sig").write_text(rg.sign(raw, hw.keys["founder"][0], rg.NS_RECONCILE))
@@ -857,7 +954,8 @@ def test_a_rollback_is_only_a_new_reviewed_founder_signed_release(hw):
 
     _founder_inbox(hw, {**draft, "approver": "gateway"}, signer="gateway", name="gw")   # gateway-signed rollback
     out = step(hw)
-    assert out["outcome"] == "REJECTED" and "founder signature required" in out["reason"]
+    assert out["outcome"] == "REJECTED" and len(hw.runs) == 1, out       # the gateway never ships a revert
+    assert "founder" in out["reason"]
 
     rejected = dict(draft)                                              # founder-signed, reviewer REJECT
     packet = rg.review_packet("seerxo/os", bad, revert, rg.git_release_diff(hw.work, bad, revert), "cd" * 16)
@@ -916,16 +1014,30 @@ def test_a_declared_rollback_must_equal_a_release_in_the_trusted_history(hw):
     assert out["outcome"] == "REJECTED" and "no recorded payload" in out["reason"] and len(hw.runs) == 2
     path.write_bytes(original)
 
-    # Founder-signed, reviewer APPROVE, target applied before and the revert ships exactly its payload: still
-    # refused until the running images can be proven to be the target's recorded images (founder 2026-10-20).
+    # Founder-signed, reviewer APPROVE, target applied before and the revert ships exactly its payload: the
+    # recorded image identity (four IDs) and image inputs now let the host prove the rollback and apply it.
     _founder_inbox(hw, {**draft, "rollback_to": good}, name="ok")
     out = step(hw)
-    assert out["outcome"] == "REJECTED" and "running images cannot yet be proven" in out["reason"] and len(hw.runs) == 2
+    assert out == {"outcome": "APPLIED", "sha": revert, "sequence": draft["sequence"], "approver": "founder"}, out
+    ledger = json.loads(hw.hcfg.ledger.read_text())
+    assert ledger["last_sha"] == revert and ledger["bound_images"] == draft["images"]
+    assert ledger["bound_inputs"] == hw.inputs_of(revert)
 
-    # The same revert as an ordinary founder-signed forward release (no rollback_to) is applied, not as a rollback.
+
+def test_a_revert_can_also_arrive_as_an_ordinary_forward_release(hw):
+    """The same revert with no rollback_to is an ordinary founder-signed release, applied the same way."""
+    good = _founder_release(hw, "good", {"app/main.py": "x = 2\n"}, "good")
+    bad = _founder_release(hw, "bad", {"app/main.py": "x = 666\n"}, "bad")
+    sh(hw.work, "git", "revert", "--no-edit", bad)
+    revert = sh(hw.work, "git", "rev-parse", "HEAD")
+    hw.push()
+    assert hw.tick()["outcome"] == "FOUNDER_REQUIRED"
+    draft = _draft(hw)
+    assert draft["sha"] == revert and draft["images"] == bound_for_inputs(hw.inputs_of(revert))
     _founder_inbox(hw, draft, name="forward")
     out = step(hw)
-    assert out["outcome"] == "APPLIED" and out["sha"] == revert and out["approver"] == "founder"
+    assert out["outcome"] == "APPLIED" and out["sha"] == revert and out["approver"] == "founder", out
+    assert hw.prod.running["api"]["image"] == bound_for_inputs(hw.inputs_of(good))["api"]
 
 
 def test_a_declared_rollback_whose_tree_differs_from_the_target_is_refused(hw):
@@ -1218,18 +1330,19 @@ def test_the_ledger_path_is_pinned_to_the_one_the_deploy_driver_reads(hw):
 
 @pytest.fixture
 def old_driver(monkeypatch):
-    """The world's base release ships a deploy driver from before the #192 F4 image hold."""
-    monkeypatch.setitem(globals(), "DRIVER", DRIVER.replace(host.DRIVER_HOLDS_IMAGES + "\n", ""))
+    """The base release ships a deploy driver from before the image-binding marker: the candidate tree, not the
+    installed bundle (root runs the bundle), predates bound mode."""
+    monkeypatch.setitem(globals(), "DRIVER", DRIVER.replace(host.DRIVER_BOUND_IMAGES + "\n", ""))
 
 
-def test_a_gateway_release_whose_driver_predates_the_image_hold_is_refused_before_pending(old_driver, hw):
-    # Break caught (#192 F4 rollout): with the new verifier installed, a candidate still carrying the old driver
-    # would rebuild and ship whatever a cold cache fetches. Refused before `pending`; nothing is applied.
+def test_a_gateway_release_whose_driver_predates_image_binding_is_refused_before_pending(old_driver, hw):
+    # The installed verifier must never hand a release to a candidate driver that cannot carry bound image IDs.
+    # Refused before `pending`; nothing is applied.
     signed_docs_release(hw)
     calls = []
     hw.run = lambda env, script: calls.append(env) or 0
     result = step(hw)
-    assert result["outcome"] != "APPLIED" and "does not hold a gateway release" in result.get("reason", ""), result
+    assert result["outcome"] != "APPLIED" and "predates image binding" in result.get("reason", ""), result
     assert calls == [] and "pending" not in json.loads(hw.cfg.ledger.read_text())
 
 
@@ -1289,6 +1402,7 @@ def _rebase_setup(hw, tmp_path, *, fetch_old=True):
     from tests.test_release_gateway import HOST
     running = _running_release(hw)
     work, origin, base = _public_copy(hw, tmp_path, running)
+    hw.prepare(base, repo=work)                     # root built the public base's images before the cutover
     policy = json.loads(hw.cfg.policy.read_bytes()) | {"version": 2, "repository": "seerxo/seerxo-os"}
     praw = rg.canonical(policy)
     (tmp_path / "policy-v2.json").write_bytes(praw)
@@ -1308,8 +1422,9 @@ def _rebase_setup(hw, tmp_path, *, fetch_old=True):
           "old_last_sequence": ledger["last_sequence"],
           "old_payload_digest": rg.payload_digest(rg.payload_listing(hw.hcfg.clone, running)),
           "history_sha256": hashlib.sha256(rg.history_path(hw.hcfg.ledger).read_bytes()).hexdigest(),
-          "base_sha": base, "policy_sha256": hashlib.sha256(praw).hexdigest(), "images": images(running),
-          "configs": configs(), "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
+          "base_sha": base, "policy_sha256": hashlib.sha256(praw).hexdigest(), "images": ledger["images"],
+          "configs": ledger["configs"], "issued_at": NOW.isoformat(),
+          "expires_at": (NOW + timedelta(hours=1)).isoformat()}
     raw = rg.canonical(st)
     (tmp_path / "rebase.json").write_bytes(raw)
     (tmp_path / "rebase.sig").write_text(rg.sign(raw, hw.keys["founder"][0], rg.NS_REBASE))
@@ -1329,9 +1444,9 @@ def _rebase(hw, tmp_path, new, host_id):
 def test_the_host_rebases_onto_a_different_history_and_the_founder_releases_the_reviewed_payload_diff(hw, tmp_path):
     work, running, base, new, gateway, host_id = _rebase_setup(hw, tmp_path)
     before = hw.hcfg.ledger.read_text()
-    runs_before = len(hw.runs)
+    runs_before, prod_before = len(hw.runs), hw.prod.observe()
     assert _rebase(hw, tmp_path, new, host_id) == {"outcome": "REBASE_DONE", "last_sha": running, "chain_base": base}
-    assert len(hw.runs) == runs_before and hw.prod.observe() == Production(running).observe()   # nothing deployed
+    assert len(hw.runs) == runs_before and hw.prod.observe() == prod_before   # nothing deployed
     copy, = hw.hcfg.ledger.parent.glob("ledger.json.pre-rebase-*")
     assert json.loads(copy.read_text()) == json.loads(before)
     assert (hw.work / "docs/HANDOFF.md").exists()                         # the old repository keeps every file
@@ -1409,8 +1524,9 @@ def test_after_a_release_from_the_new_repository_the_founder_can_rebase_back(hw,
           "old_repository": "seerxo/seerxo-os", "old_last_sha": sha, "old_last_sequence": ledger["last_sequence"],
           "old_payload_digest": rg.payload_digest(rg.payload_listing(new.clone, sha)),
           "history_sha256": hashlib.sha256(rg.history_path(new.ledger).read_bytes()).hexdigest(),
-          "base_sha": running, "policy_sha256": hashlib.sha256(praw).hexdigest(), "images": images(sha),
-          "configs": configs(), "issued_at": NOW.isoformat(), "expires_at": (NOW + timedelta(hours=1)).isoformat()}
+          "base_sha": running, "policy_sha256": hashlib.sha256(praw).hexdigest(), "images": ledger["images"],
+          "configs": ledger["configs"], "issued_at": NOW.isoformat(),
+          "expires_at": (NOW + timedelta(hours=1)).isoformat()}
     raw = rg.canonical(st)
     (tmp_path / "back.json").write_bytes(raw)
     (tmp_path / "back.sig").write_text(rg.sign(raw, hw.keys["founder"][0], rg.NS_REBASE))
@@ -1469,6 +1585,57 @@ def test_a_config_that_fetches_another_repository_is_refused(hw, monkeypatch):
     with pytest.raises(rg.Refused, match="GitHub remote of seerxo/seerxo-os"):
         host.Config(raw)
     assert host.Config(raw | {"fetch_url": "https://github.com/Seerxo/seerxo-os.git"}).repository == "seerxo/seerxo-os"
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.update(source_sha="not-a-sha"),
+    lambda d: d["files"].pop("app/release_host.py"),
+    lambda d: d["files"].pop("app/release_gateway.py"),
+    lambda d: d["files"].pop("app/release_identity.py"),
+    lambda d: d["files"].update({"app/release_host.py": "0" * 64}),
+])
+def test_bundle_requires_the_complete_exact_verifier_inventory(hw, change):
+    assert host.bundle_problem() is None
+    path = host.BUNDLE / "BUNDLE.json"
+    doc = json.loads(path.read_bytes())
+    change(doc)
+    path.write_text(json.dumps(doc))
+    assert "bundle inconsistent" in host.bundle_problem()
+
+
+def test_bundle_refuses_a_verifier_running_outside_the_checked_bundle(hw, monkeypatch):
+    assert host.bundle_problem() is None
+    monkeypatch.setattr(host, "__file__", str(host.BUNDLE.parent / "old-host.py"))
+    assert "outside the checked bundle" in host.bundle_problem()
+
+
+def test_manual_prepare_keeps_both_locks_while_collecting_anchors(hw, monkeypatch):
+    from contextlib import contextmanager
+    held = []
+
+    @contextmanager
+    def lock(path, **kwargs):
+        held.append(path)
+        try:
+            yield
+        finally:
+            held.pop()
+
+    monkeypatch.setattr(host, "_lock", lock)
+    monkeypatch.setattr(host, "_prepare_locked", lambda *a, **k: {"outcome": "READY"})
+
+    def gc(*args, **kwargs):
+        assert held == [host.INSTALL_LOCK, host.BUILDS / ".lock"]
+
+    monkeypatch.setattr(host, "gc_anchors", gc)
+    assert host.prepare(hw.hcfg, hw.base, now=NOW)["outcome"] == "READY"
+
+
+def test_prepare_recipe_changes_require_the_explicit_founder_flag():
+    assert host._prepare_args(["a" * 40]) == ("a" * 40, False, False, False)
+    assert host._prepare_args(["--founder", "--bootstrap", "a" * 40]) == ("a" * 40, True, False, True)
+    with pytest.raises(rg.Refused, match="founder-only"):
+        host._prepare_args(["--bootstrap", "a" * 40])
 
 
 def test_a_founder_signed_first_release_off_the_rebase_base_is_refused(hw, tmp_path):

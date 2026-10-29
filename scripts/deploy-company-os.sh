@@ -79,6 +79,10 @@ git ls-tree -r "$SHA" --format='%(objectname) %(path)' -- $PATHS | while read -r
 cat > "$TMP/company-os-deploy.sh" <<'REMOTE'
 set -euo pipefail
 ANCHORED=   # set only by this run, just before it anchors; never taken from the environment
+# The verifier and this driver are one installed bundle (IMAGE_BINDING_DESIGN.md §3): release_host.bundle_problem
+# refuses when either marker is missing or the integers differ. Bound mode is never optional.
+DRIVER_BOUND_IMAGES=1
+DRIVER_BUNDLE_VERSION=1
 # Recovery (RECOVER_DIR) restores the previous release and ships nothing, and `sudo RECOVER_DIR=... bash` drops the
 # caller's environment, so it must not need a deploy mode. Only the recovery branch below ever sees this default
 # (it always exits); a normal deploy without AUTOMATIC is still refused.
@@ -115,16 +119,239 @@ fence_verified() {   # [$1 owner uid] [$2 group gid], root for both by default (
   done
   [ "$({ sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"; } | cut -c1-64)" = "$FENCE_SHA256" ]
 }
-# Recreate the release containers; the caller sets COMPANY_OS_GIT_SHA/COMPANY_OS_IMAGE_TAG. With FENCE_KEEP=yes the
-# verified pause fence goes back onto company-api (only there: the other services keep the base file alone).
-up_services() {
-  if [ "${FENCE_KEEP:-no}" = yes ]; then
-    fence_verified || { echo "pause fence overlay is no longer the verified file; refusing to apply it" >&2; return 1; }
-    docker compose -f docker-compose.yml -f "$FENCE_OVERLAY" up -d --no-deps --no-build company-api || return 1
-    docker compose up -d --no-deps --no-build company-worker company-reasoner-egress company-reasoner
+# --- compose plumbing (IMAGE_BINDING_DESIGN.md §3–§5) -----------------------------------------------------------
+# Every Compose call gets the four image references explicitly on its own command line. The driver sources .env
+# under `set -a`, so .env must not be able to inject or override them; COMPANY_OS_IMAGE_TAG is dropped for the four
+# bound services (the unbound review signer and coder proxy still read it).
+compose_env() {   # $1..$4 = api worker reasoner egress references; rest = compose arguments
+  local api=$1 worker=$2 reasoner=$3 egress=$4
+  shift 4
+  (
+    unset COMPANY_OS_IMAGE_TAG
+    export COMPANY_OS_IMAGE_API="$api" COMPANY_OS_IMAGE_WORKER="$worker"
+    export COMPANY_OS_IMAGE_REASONER="$reasoner" COMPANY_OS_IMAGE_EGRESS="$egress"
+    docker compose "$@"
+  )
+}
+compose_check() {   # the resolved config must name exactly these four references, or nothing runs
+  compose_env "$1" "$2" "$3" "$4" config --format json | python3 -c '
+import json, sys
+want = {"company-api": sys.argv[1], "company-worker": sys.argv[2],
+        "company-reasoner": sys.argv[3], "company-reasoner-egress": sys.argv[4]}
+services = (json.load(sys.stdin) or {}).get("services") or {}
+for name, image in want.items():
+    got = (services.get(name) or {}).get("image")
+    if got != image:
+        print(f"resolved {name} image is {got!r}, expected {image!r}", file=sys.stderr)
+        sys.exit(3)
+' "$1" "$2" "$3" "$4"
+}
+compose_bound() {   # $1..$4 references; optional "--"; then the compose arguments
+  local api=$1 worker=$2 reasoner=$3 egress=$4
+  shift 4
+  [ "${1:-}" != -- ] || shift
+  compose_check "$api" "$worker" "$reasoner" "$egress" || return 1
+  compose_env "$api" "$worker" "$reasoner" "$egress" "$@"
+}
+run_compose() {   # every Compose call of this run: pinned IDs when it has them, else the tag-shaped legacy file
+  if [ "${BOUND:-no}" = yes ] || [ "${BOOTSTRAP:-no}" = yes ]; then
+    compose_bound "$BOUND_API" "$BOUND_WORKER" "$BOUND_REASONER" "$BOUND_EGRESS" -- "$@"
   else
-    docker compose up -d --no-deps --no-build company-api company-worker company-reasoner-egress company-reasoner
+    ( export COMPANY_OS_IMAGE_TAG="${COMPANY_OS_IMAGE_TAG:-latest}"; docker compose "$@" )
   fi
+}
+compose_config_json() {   # the resolved config, under the same environment as the release it describes
+  run_compose config --format json
+}
+service_of() {   # component (api|worker|reasoner|egress) -> the compose service that runs it
+  case "$1" in
+    api) echo company-api ;; worker) echo company-worker ;;
+    reasoner) echo company-reasoner ;; egress) echo company-reasoner-egress ;;
+    *) return 1 ;;
+  esac
+}
+# The release's image inputs (release_gateway.inputs_digest, embedded verbatim): the same function the verifier and
+# prepare use, computed from the tar the old verifier already built root-side (§7 step 5). Never from main.sha256,
+# which carries no modes.
+inputs_digest() {   # $1 = release tar; prints the 64-hex digest
+  python3 -I - "$1" <<'PY'
+import hashlib, io, json, sys, tarfile
+
+
+class Refused(ValueError):
+    pass
+
+
+def canonical(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+BUILD_TARGETS = {"api": "api", "worker": "worker", "reasoner": "reasoner", "egress": "egress"}
+
+
+def inputs_digest(tar: bytes) -> str:
+    """What an image build consumes: every non-directory release-archive member (except docker-compose.yml, which is
+    removed from the build context) with its mode and type, plus the fixed component -> Dockerfile target map. JSON,
+    so the encoding is unambiguous. `rg.inputs_digest` is embedded verbatim in the driver's PREPARE/bootstrap snippet;
+    a test asserts both copies agree on fixtures with an executable bit, a symlink and a non-ASCII path."""
+    files = []
+    with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+        for member in archive.getmembers():
+            if member.isdir() or member.name == "docker-compose.yml":
+                continue
+            if member.isfile():
+                data, kind = archive.extractfile(member).read(), "file"
+            elif member.issym():
+                data, kind = member.linkname.encode("utf-8", "surrogateescape"), "symlink"
+            else:
+                raise Refused(f"the release archive holds an unexpected entry: {member.name}")
+            files.append([member.name, member.mode & 0o777, kind, hashlib.sha256(data).hexdigest()])
+    return hashlib.sha256(canonical({"build": BUILD_TARGETS, "files": sorted(files)})).hexdigest()
+
+
+with open(sys.argv[1], "rb") as archive:
+    print(inputs_digest(archive.read()))
+PY
+}
+# The pre-sign build (IMAGE_BINDING_DESIGN.md §3–§4.2). release_host.prepare runs the INSTALLED bundle driver with the
+# candidate's staged payload and PREPARE=1: a clean context, four untagged builds, one never-started anchor per image,
+# and one result line. No tag is written, no container is started, no migration runs.
+prepare_build() {
+  local ctx idfile c target id inputs attempt=${ATTEMPT:-}
+  local dummy=sha256:0000000000000000000000000000000000000000000000000000000000000000 ids=""
+  [[ "${SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "ABORT: prepare needs a 40-hex commit; nothing was built."; exit 1; }
+  [[ "$attempt" =~ ^[1-9][0-9]*$ ]] || { echo "ABORT: prepare needs a positive ATTEMPT; nothing was built."; exit 1; }
+  [[ "${RELEASE_DIR:-}" =~ ^/run/company-os-deploy/[0-9a-f]{40}\.[A-Za-z0-9]{8}$ ]] || { echo "ABORT: prepare needs a staged release directory; nothing was built."; exit 1; }
+  [ -f "$RELEASE_DIR/src.tgz" ] && [ ! -L "$RELEASE_DIR/src.tgz" ] || { echo "ABORT: prepare has no staged release archive; nothing was built."; exit 1; }
+  inputs=$(inputs_digest "$RELEASE_DIR/src.tgz") || { echo "ABORT: prepare could not read the release inputs."; exit 1; }
+  [[ "$inputs" =~ ^[0-9a-f]{64}$ ]] || { echo "ABORT: prepare computed no usable inputs digest."; exit 1; }
+  ctx=$(mktemp -d) || exit 1
+  trap 'rm -rf -- "${ctx:-}"' EXIT
+  tar --no-same-owner -xzf "$RELEASE_DIR/src.tgz" -C "$ctx" || { echo "ABORT: prepare could not extract a clean build context."; exit 1; }
+  # Compose may not re-map which target a service builds: the component -> target map is a constant (§3). The build
+  # sections are read under placeholder IDs because the binding does not exist yet; only those sections are used.
+  for c in api worker reasoner egress; do
+    svc=$(service_of "$c") || { echo "ABORT: $c is not a component."; exit 1; }
+    target=$(cd "$ctx" && POSTGRES_PASSWORD=prepare-config-only CLOUDFLARE_TUNNEL_TOKEN=prepare-config-only \
+      compose_env "$dummy" "$dummy" "$dummy" "$dummy" -f docker-compose.yml config --format json \
+      | python3 -I -c '
+import json, sys
+build = json.load(sys.stdin)["services"][sys.argv[1]].get("build") or {}
+if set(build) - {"context", "target", "dockerfile"} or build.get("dockerfile", "Dockerfile") != "Dockerfile":
+    sys.exit(3)
+print(build.get("target") or "")' "$svc") \
+      || { echo "ABORT: prepare could not read the $c build section; nothing was built."; exit 1; }
+    [ "$target" = "$c" ] || { echo "ABORT: compose maps $c to build target '$target', expected '$c'; nothing was built."; exit 1; }
+  done
+  rm -f -- "$ctx/docker-compose.yml"   # never part of the build context: a Dockerfile copying it cannot consume it
+  for c in api worker reasoner egress; do
+    idfile=$ctx/.iid-$c
+    docker build -q --target "$c" --iidfile "$idfile" "$ctx" >/dev/null || { echo "ABORT: docker build of $c failed."; exit 1; }
+    id=$(cat "$idfile" 2>/dev/null) || exit 1
+    [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ABORT: docker build of $c produced no image ID."; exit 1; }
+    docker image inspect --format '{{.Id}}' "$id" >/dev/null 2>&1 || { echo "ABORT: the built $c image is not present."; exit 1; }
+    # A never-started container keeps the image from Coolify's cleanup; the attempt is in the name, so a retry can
+    # never collide with (or silently reuse) an earlier attempt's anchors.
+    docker create --name "company-os-bound-${inputs:0:12}-a$attempt-$c" --label coolify.managed=false \
+      --network none --pull=never "$id" true >/dev/null 2>&1 \
+      || { echo "ABORT: could not anchor the built $c image (company-os-bound-${inputs:0:12}-a$attempt-$c)."; exit 1; }
+    ids="$ids $c=$id"
+  done
+  echo "BOUND inputs=$inputs$ids"
+}
+# Restoring the previous release starts the images it ran, never the candidate's: by content-addressed ID when they
+# are known, otherwise through the rollback tag (and the tag -> ID mapping is re-inspected before each `up`). The
+# restored compose may be tag-shaped (a release from before binding), so both shapes are accepted under one rule.
+restore_env() {   # $1..$4 references; $5 rollback tag; rest = compose arguments
+  local api=$1 worker=$2 reasoner=$3 egress=$4 tag=$5
+  shift 5
+  (
+    export COMPANY_OS_IMAGE_TAG="$tag"
+    export COMPANY_OS_IMAGE_API="$api" COMPANY_OS_IMAGE_WORKER="$worker"
+    export COMPANY_OS_IMAGE_REASONER="$reasoner" COMPANY_OS_IMAGE_EGRESS="$egress"
+    docker compose "$@"
+  )
+}
+restore_resolve() {   # $1..$4 = previous image IDs (may be empty); $5 rollback tag. Sets RESTORE_ID_*, verifies them.
+  local api=$1 worker=$2 reasoner=$3 egress=$4 tag=$5 out kind name value id var
+  RESTORE_ID_API= RESTORE_ID_WORKER= RESTORE_ID_REASONER= RESTORE_ID_EGRESS=
+  RESTORE_EXPECT_API=$api RESTORE_EXPECT_WORKER=$worker RESTORE_EXPECT_REASONER=$reasoner RESTORE_EXPECT_EGRESS=$egress
+  out=$(restore_env "$api" "$worker" "$reasoner" "$egress" "$tag" config --format json) || return 1
+  while read -r kind name value; do
+    case "$kind" in
+      bound) id=$value ;;
+      tag) id=$(docker image inspect --format '{{.Id}}' "$value" 2>/dev/null) || return 1
+           [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+    case "$name" in
+      company-api) var=RESTORE_ID_API ;;
+      company-worker) var=RESTORE_ID_WORKER ;;
+      company-reasoner) var=RESTORE_ID_REASONER ;;
+      company-reasoner-egress) var=RESTORE_ID_EGRESS ;;
+      *) return 1 ;;
+    esac
+    printf -v "$var" '%s' "$id"
+  done < <(printf '%s\n' "$out" | python3 -c '
+import json, sys
+api, worker, reasoner, egress, tag = sys.argv[1:6]
+want = [("company-api", api, "company-os-api"), ("company-worker", worker, "company-os-worker"),
+        ("company-reasoner", reasoner, "company-os-reasoner"),
+        ("company-reasoner-egress", egress, "company-os-egress")]
+services = (json.load(sys.stdin) or {}).get("services") or {}
+for name, ref, repo in want:
+    got = (services.get(name) or {}).get("image")
+    if ref and got == ref:
+        print("bound", name, got)
+    elif got == repo + ":" + tag:
+        print("tag", name, got)
+    else:
+        print(f"{name} resolves to {got!r}, expected {ref!r} or {repo}:{tag}", file=sys.stderr)
+        sys.exit(3)
+' "$api" "$worker" "$reasoner" "$egress" "$tag") || return 1
+  [ -z "${RESTORE_EXPECT_API:-}" ] || [ "$RESTORE_ID_API" = "$RESTORE_EXPECT_API" ] || return 1
+  [ -z "${RESTORE_EXPECT_WORKER:-}" ] || [ "$RESTORE_ID_WORKER" = "$RESTORE_EXPECT_WORKER" ] || return 1
+  [ -z "${RESTORE_EXPECT_REASONER:-}" ] || [ "$RESTORE_ID_REASONER" = "$RESTORE_EXPECT_REASONER" ] || return 1
+  [ -z "${RESTORE_EXPECT_EGRESS:-}" ] || [ "$RESTORE_ID_EGRESS" = "$RESTORE_EXPECT_EGRESS" ] || return 1
+}
+compose_restore() {   # the ONLY way a rollback starts containers; $1..$4 references, $5 rollback tag
+  local api=$1 worker=$2 reasoner=$3 egress=$4 tag=$5 got
+  restore_resolve "$api" "$worker" "$reasoner" "$egress" "$tag" || return 1
+  if [ "${FENCE_KEEP:-no}" = yes ]; then
+    restore_env "$api" "$worker" "$reasoner" "$egress" "$tag" -f docker-compose.yml -f "$FENCE_OVERLAY" \
+      up -d --no-deps --no-build --pull never company-api || return 1
+    restore_resolve "$api" "$worker" "$reasoner" "$egress" "$tag" || return 1
+    restore_env "$api" "$worker" "$reasoner" "$egress" "$tag" up -d --no-deps --no-build --pull never \
+      company-worker company-reasoner-egress company-reasoner || return 1
+  else
+    restore_resolve "$api" "$worker" "$reasoner" "$egress" "$tag" || return 1
+    restore_env "$api" "$worker" "$reasoner" "$egress" "$tag" up -d --no-deps --no-build --pull never \
+      company-api company-worker company-reasoner-egress company-reasoner || return 1
+  fi
+  # The containers must run exactly the previous IDs: a tag moved in the window is caught here, not claimed verified.
+  got=$(docker inspect company-api --format '{{.Image}}') && [ "$got" = "$RESTORE_ID_API" ] || return 1
+  got=$(docker inspect company-worker --format '{{.Image}}') && [ "$got" = "$RESTORE_ID_WORKER" ] || return 1
+  got=$(docker inspect company-reasoner --format '{{.Image}}') && [ "$got" = "$RESTORE_ID_REASONER" ] || return 1
+  got=$(docker inspect company-reasoner-egress --format '{{.Image}}') && [ "$got" = "$RESTORE_ID_EGRESS" ] || return 1
+}
+# Create the release containers from the images chosen before the switch. The caller sets COMPANY_OS_GIT_SHA and
+# the four BOUND_* references; with FENCE_KEEP=yes the verified pause fence goes back onto company-api (only there:
+# the other services keep the base file alone).
+up_services() {   # $1 = bound (forward) | restore (rollback)
+  case "${1:-bound}" in
+    bound)
+      # A pinless legacy apply still has a ledger-less host: run_compose resolves by tag there, as it always did.
+      if [ "${FENCE_KEEP:-no}" = yes ]; then
+        fence_verified || { echo "pause fence overlay is no longer the verified file; refusing to apply it" >&2; return 1; }
+        run_compose -f docker-compose.yml -f "$FENCE_OVERLAY" up -d --no-deps --no-build --pull never company-api || return 1
+        run_compose up -d --no-deps --no-build --pull never company-worker company-reasoner-egress company-reasoner
+      else
+        run_compose up -d --no-deps --no-build --pull never company-api company-worker company-reasoner-egress company-reasoner
+      fi ;;
+    restore) compose_restore "${PREV_IMAGE_API:-}" "${PREV_IMAGE_WORKER:-}" "${PREV_IMAGE_REASONER:-}" \
+               "${PREV_IMAGE_EGRESS:-}" "${PREV_COMPOSE_TAG:-rollback-$S}" ;;
+    *) echo "unknown up_services mode: ${1:-}" >&2; return 1 ;;
+  esac
 }
 fence_live() {   # with FENCE_KEEP=yes, the running company-api must actually carry the fence
   [ "${FENCE_KEEP:-no}" != yes ] || [ "$(docker exec company-api printenv CODER_PAUSE_FENCE_ENABLED)" = true ]
@@ -183,6 +410,10 @@ if [ -n "${RELEASE_DIR:-}" ]; then
   fi
   REL=$RELEASE_DIR
 fi
+# The pre-sign build runs the installed bundle driver against the candidate's payload and changes nothing on
+# production. It is the only build reachable from an apply path with a ledger, and it exits before the ledger,
+# the backup, the migration and every container.
+[ "${PREPARE:-}" != 1 ] || { prepare_build; exit 0; }
 # verify-release-manifest (B6 step 8): once release_host has bootstrapped this host (its ledger exists), an --apply
 # is accepted only from release_host's own transaction: the ledger is pending (a manifest digest) for exactly this SHA,
 # written after it verified the signed manifest, and RELEASE_DIR is exactly the staged directory release_host named in
@@ -192,34 +423,78 @@ fi
 # The path is fixed and release_host refuses any other (release_host.LEDGER); tests rewrite the script text, as for
 # /opt/company-os; there is deliberately no override.
 RELEASE_LEDGER=/var/lib/release-host/ledger/ledger.json
+BUILDS=/var/lib/release-host/builds   # release_host.BUILDS: root-written build records and the bootstrap-consumed marker
 if [ "${APPLY:-}" = --apply ] && [ -z "${RECOVER_DIR:-}" ] && { [ -e "$RELEASE_LEDGER" ] || [ -L "$RELEASE_LEDGER" ]; }; then
   PENDING=$(python3 -I -c '
 import json, re, sys
 s = json.load(open(sys.argv[1]))
 if not isinstance(s, dict):
     sys.exit(1)
+IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
+def ids(v):
+    if not isinstance(v, dict) or set(v) != {"api", "worker", "reasoner", "egress"}:
+        return None
+    out = [v.get(c) for c in ("api", "worker", "reasoner", "egress")]
+    if not all(isinstance(x, str) and IMAGE.fullmatch(x) for x in out):
+        return None
+    return out
 d, sha, rel = s.get("pending"), s.get("pending_sha"), s.get("pending_release_dir")
+pi, bi = s.get("pending_images"), s.get("bound_images")
+pids = ids(pi) if pi is not None else None
+bids = ids(bi) if bi is not None else None
+if (pi is not None and pids is None) or (bi is not None and bids is None):
+    sys.exit(1)                                         # named but malformed: never authority, never "absent"
 if d is None and sha is None and rel is None:
-    print("none none none"); sys.exit(0)                # bootstrapped, nothing pending
+    print("none none none", *(["-"] * 8)); sys.exit(0)  # bootstrapped, nothing pending
 ok = (isinstance(d, str) and re.fullmatch(r"[0-9a-f]{64}", d) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)
       and isinstance(rel, str) and re.fullmatch(r"/run/company-os-deploy/[0-9a-f]{40}\.[A-Za-z0-9]{8}", rel)
       and rel.rsplit("/", 1)[-1].startswith(sha + "."))            # named for this release, as release_host names it
 if not ok:
     sys.exit(1)                                         # an incomplete pending transaction is never authority
-# Who signed it. Anything but "founder" (gateway, absent from an older verifier, malformed) is held to the running images.
-print(sha, rel, "founder" if s.get("pending_approver") == "founder" else "gateway")' "$RELEASE_LEDGER" 2>/dev/null) \
-    || PENDING="<unreadable-or-incomplete-ledger> - -"
-  read -r PENDING_SHA PENDING_DIR PENDING_APPROVER <<< "$PENDING"
+# Who signed it, then what the release runs: the pending binding (v2 verifier) and the running one (for the
+# rollback/PREV comparison). Anything malformed is refused above; "-" only ever means absent.
+print(sha, rel, "founder" if s.get("pending_approver") == "founder" else "gateway",
+      *(pids or ["-"] * 4), *(bids or ["-"] * 4))' "$RELEASE_LEDGER" 2>/dev/null) \
+    || PENDING="<unreadable-or-incomplete-ledger> - - - - - - - - - -"
+  read -r PENDING_SHA PENDING_DIR PENDING_APPROVER P_API P_WORKER P_REASONER P_EGRESS B_API B_WORKER B_REASONER B_EGRESS <<< "$PENDING"
   if [[ ! "${SHA:-}" =~ ^[0-9a-f]{40}$ ]] || [ "$PENDING_SHA" != "$SHA" ] || [ "${RELEASE_DIR:-}" != "$PENDING_DIR" ]; then
     echo "ABORT: verify-release-manifest: this host is bootstrapped; it applies only the staged release the host verifier marked pending (pending_sha=${PENDING_SHA:-none}). Release by signing a manifest into the founder inbox; break-glass is a founder ledger recovery."
     exit 1
   fi
 fi
-# Only a founder-signed release may change what the images contain; unset when the host is not bootstrapped.
-HOLD_IMAGES=no
-[ "${PENDING_APPROVER:-founder}" = founder ] || HOLD_IMAGES=yes
+# What this apply starts. A ledger with pending_images is a bound release (start by ID); a ledger whose pending
+# release has no images is the one bootstrap release, which starts the IDs pinned in its own compose (§7). No
+# ledger at all is the pre-binding transport (only an old verifier reaches it): it still builds, and its images are
+# named by tag. The pins path is positively the bootstrap release: it also requires that the ledger has no running
+# binding yet, so a later candidate can never take it.
+BOUND=no
+BOOTSTRAP=no
+BOUND_API= BOUND_WORKER= BOUND_REASONER= BOUND_EGRESS=
+BUILD_MARKER=
+if [ "${APPLY:-}" = --apply ] && [ -z "${RECOVER_DIR:-}" ] && { [ -e "$RELEASE_LEDGER" ] || [ -L "$RELEASE_LEDGER" ]; }; then
+  if [[ "${P_API:-}" =~ ^sha256:[0-9a-f]{64}$ ]] && [[ "${P_WORKER:-}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+     && [[ "${P_REASONER:-}" =~ ^sha256:[0-9a-f]{64}$ ]] && [[ "${P_EGRESS:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    BOUND=yes
+    BOUND_API=$P_API BOUND_WORKER=$P_WORKER BOUND_REASONER=$P_REASONER BOUND_EGRESS=$P_EGRESS
+  elif [[ "${B_API}${B_WORKER}${B_REASONER}${B_EGRESS}" == *sha256:* ]]; then
+    echo "ABORT: the ledger already binds running images but this pending release names none; it is not the bootstrap release and cannot start by tag."
+    exit 1
+  else
+    BOOTSTRAP=yes
+  fi
+fi
+# Images are content-addressed; a tag may only live on a fixed name (company-os-<c>:<sha|rollback-…|latest>). A
+# repository literally named `sha256` would make a later tag/restore ambiguous, so it is refused before anything moves.
+# grep reads to the end (no -q): an early exit would SIGPIPE the writer and pipefail would turn the refusal into a pass.
+if [ "$BOUND" = yes ] && docker images --format '{{.Repository}}' | grep -x sha256 >/dev/null; then
+  echo "ABORT: a local image tag is named like an image ID (repository 'sha256'); tags only live on fixed names. Nothing was changed."
+  exit 1
+fi
 # Nothing sourced later (./.env runs as root under set -a) may change what the gate decided on.
-readonly APPLY SHA RELEASE_DIR REL RECOVER_DIR HOLD_IMAGES
+readonly APPLY SHA RELEASE_DIR REL RECOVER_DIR
+readonly RELEASE_LEDGER BUILDS
+declare -ar RELEASE_IMAGE_AUTHORITY=("$BOUND" "$BOOTSTRAP" "$BOUND_API" "$BOUND_WORKER" "$BOUND_REASONER" "$BOUND_EGRESS")
+readonly P_API P_WORKER P_REASONER P_EGRESS B_API B_WORKER B_REASONER B_EGRESS
 # The schedule is part of the release but the last thing it changes: a rejected, failed or interrupted deploy
 # must leave /etc/cron.d/company-os exactly as it was. It is installed only after the new release passed its
 # health gate, atomically (a dotted temp name, which cron ignores, then rename), verified byte-for-byte, and
@@ -270,9 +545,11 @@ restore_source() {   # $1 = backup dir
 }
 # The default (:latest) image tags are what a later `docker compose up` would start. A build or a refused/failed
 # migration leaves them pointing at the NEW images while the containers still run the old ones; every abort puts
-# all four back on the images that were running (tagged rollback-$S before anything changed).
+# all four back on the images that were running (tagged rollback-$S before anything changed). Bound mode never
+# retags a value taken from a compose `image:` field: a bound reference is an ID, and an ID is not a tag name.
 restore_tags() {
   [ -n "${API_IMG:-}" ] || return 0   # images not resolved yet: nothing was retagged
+  case "$API_IMG" in sha256:*) return 0 ;; esac
   docker tag "company-os-api:rollback-$S" "$API_IMG" || return 1
   docker tag "company-os-worker:rollback-$S" "$WORKER_IMG" || return 1
   [ -z "$R_OLD" ] || docker tag "company-os-reasoner:rollback-$S" "$REASONER_IMG" || return 1
@@ -358,7 +635,7 @@ read_env() {   # $1 = backup dir; sets the allow-listed variables, ignores every
   local k v
   while IFS== read -r k v; do
     case "$k" in
-      S|NEW_SHA|OLD_SHA|API_IMG|WORKER_IMG|REASONER_IMG|EGRESS_IMG|R_OLD|E_OLD|FENCE_KEEP|FENCE_BEFORE)
+      S|NEW_SHA|OLD_SHA|API_IMG|WORKER_IMG|REASONER_IMG|EGRESS_IMG|R_OLD|E_OLD|FENCE_KEEP|FENCE_BEFORE|BOUND|PREV_IMAGE_API|PREV_IMAGE_WORKER|PREV_IMAGE_REASONER|PREV_IMAGE_EGRESS|PREV_COMPOSE_TAG|REV0|TARGET_REV)
         [[ "$v" =~ ^[A-Za-z0-9_.:/@-]*$ ]] || { echo "recovery: refusing a malformed $k in deploy.env" >&2; return 1; }
         printf -v "$k" '%s' "$v" ;;
     esac
@@ -380,6 +657,9 @@ if [ "${DETACH:-}" = 1 ]; then
 fi
 cd /opt/company-os
 set -a; . ./.env; set +a
+BOUND=${RELEASE_IMAGE_AUTHORITY[0]} BOOTSTRAP=${RELEASE_IMAGE_AUTHORITY[1]}
+BOUND_API=${RELEASE_IMAGE_AUTHORITY[2]} BOUND_WORKER=${RELEASE_IMAGE_AUTHORITY[3]}
+BOUND_REASONER=${RELEASE_IMAGE_AUTHORITY[4]} BOUND_EGRESS=${RELEASE_IMAGE_AUTHORITY[5]}
 PGU=${POSTGRES_USER:-company}; PGD=${POSTGRES_DB:-company}
 q() { docker exec company-postgres psql -U "$PGU" -d "$PGD" -Atc "$1"; }
 OPEN="('READY','QUEUED','IN_PROGRESS','WAITING_EXTERNAL','WAITING_APPROVAL','BLOCKED','REVIEW')"
@@ -469,7 +749,12 @@ new_backup_dir() {
 # a running deploy and by recovery after an interruption. Returns 0 only when the containers are verified AND the
 # host CLI, source, schedule and image tags are verified restored; sets ROLLBACK_RESULT to VERIFIED, PARTIAL or FAILED.
 rollback_core() {
-  local cli_restored=yes
+  local cli_restored=yes id
+  ROLLBACK_RESULT=PARTIAL
+  if [ -e "$B/migration-attempted" ] || [ -L "$B/migration-attempted" ]; then
+    echo "database migration was attempted; refusing to start previous code against an unverified schema; manual recovery required" >&2
+    return 1
+  fi
   # The previous release goes back with the fence it had (journals older than FENCE_BEFORE: the forward decision).
   local fence_before=${FENCE_BEFORE:-${FENCE_KEEP:-no}}
   local FENCE_KEEP=no   # set below from fence_before, once the old source is back
@@ -479,10 +764,31 @@ rollback_core() {
     "$B/host-cli.sh" restore --backup "$B" --root /opt/company-os --sums "$B/cli-files-before.sha256" || cli_restored=no
   fi
   restore_cron "$B" || cli_restored=no   # the schedule is restored and verified like the CLI; unverified is reported as partial
-  docker tag "company-os-api:rollback-$S" "${API_IMG:-company-os-api:latest}" 2>/dev/null || cli_restored=no
-  docker tag "company-os-worker:rollback-$S" "${WORKER_IMG:-company-os-worker:latest}" 2>/dev/null || cli_restored=no
-  [ -z "${R_OLD:-}" ] || [ -z "${REASONER_IMG:-}" ] || docker tag "company-os-reasoner:rollback-$S" "$REASONER_IMG" || cli_restored=no
-  [ -z "${E_OLD:-}" ] || [ -z "${EGRESS_IMG:-}" ] || docker tag "company-os-egress:rollback-$S" "$EGRESS_IMG" || cli_restored=no
+  # Tags only on fixed names: a bound release's image references are IDs, and none of them was retagged.
+  case "${API_IMG:-}" in
+    sha256:*) ;;
+    "") ;;
+    *) docker tag "company-os-api:rollback-$S" "$API_IMG" 2>/dev/null || cli_restored=no
+       docker tag "company-os-worker:rollback-$S" "${WORKER_IMG:-company-os-worker:latest}" 2>/dev/null || cli_restored=no
+       [ -z "${R_OLD:-}" ] || [ -z "${REASONER_IMG:-}" ] || docker tag "company-os-reasoner:rollback-$S" "$REASONER_IMG" || cli_restored=no
+       [ -z "${E_OLD:-}" ] || [ -z "${EGRESS_IMG:-}" ] || docker tag "company-os-egress:rollback-$S" "$EGRESS_IMG" || cli_restored=no ;;
+  esac
+  if [ -n "${PREV_COMPOSE_TAG:-}" ]; then
+    [[ "$PREV_COMPOSE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || return 1
+    docker tag "$PREV_IMAGE_API" "company-os-api:$PREV_COMPOSE_TAG" || cli_restored=no
+    docker tag "$PREV_IMAGE_WORKER" "company-os-worker:$PREV_COMPOSE_TAG" || cli_restored=no
+    docker tag "$PREV_IMAGE_REASONER" "company-os-reasoner:$PREV_COMPOSE_TAG" || cli_restored=no
+    docker tag "$PREV_IMAGE_EGRESS" "company-os-egress:$PREV_COMPOSE_TAG" || cli_restored=no
+  fi
+  # A bound release starts the previous images by ID only: a journal without them cannot be rolled back by tag.
+  if [ "${BOUND:-no}" = yes ]; then
+    for id in "${PREV_IMAGE_API:-}" "${PREV_IMAGE_WORKER:-}" "${PREV_IMAGE_REASONER:-}" "${PREV_IMAGE_EGRESS:-}"; do
+      [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        echo "ROLLBACK FAILED: this bound release's journal records no previous image ID for every component; tags are not a fallback" >&2
+        return 1
+      }
+    done
+  fi
   # A fence that is not the verified file is never applied, but the old release is still recreated (from the base
   # file) so the candidate is never left running; not getting the old configuration back is PARTIAL.
   case $fence_before in
@@ -490,7 +796,8 @@ rollback_core() {
          else cli_restored=no; echo "pause fence overlay is not the verified file; previous release restored without it" >&2; fi ;;
     unverified) cli_restored=no; echo "previous release ran an unreviewed fence overlay; restored without it" >&2 ;;
   esac
-  COMPANY_OS_GIT_SHA=$OLD_SHA COMPANY_OS_IMAGE_TAG=rollback-$S up_services || true
+  COMPANY_OS_GIT_SHA=$OLD_SHA COMPANY_OS_IMAGE_TAG=rollback-$S up_services restore \
+    || { cli_restored=no; echo "the previous release could not be started from its recorded image IDs" >&2; }
   for _ in $(seq 1 30); do
     docker inspect company-api --format '{{.State.Health.Status}}' | grep -q healthy && break
     sleep 3
@@ -498,6 +805,10 @@ rollback_core() {
   fence_live || { cli_restored=no; echo "pause fence is not live on the restored company-api" >&2; }
   local gate=$B/release-health-gate.sh
   [ -x "$gate" ] || gate=scripts/deploy-health-gate.sh
+  if [ ! -f "$B/recovery-identity.py" ] || ! python3 -I "$B/recovery-identity.py" verify "$B" "$OLD_SHA" "$PGU" "$PGD"; then
+    cli_restored=no
+    echo "database or four-container recovery identity is unverified; manual recovery evidence required" >&2
+  fi
   if "$gate" "$OLD_SHA"; then
     if [ "$cli_restored" = yes ]; then ROLLBACK_RESULT=VERIFIED; else ROLLBACK_RESULT=PARTIAL; fi
   fi
@@ -515,9 +826,145 @@ if [ -n "${RECOVER_DIR:-}" ]; then
   [[ "${OLD_SHA:-}" =~ ^[0-9a-f]{40}$ && "${S:-}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo "ABORT: deploy.env lacks a valid S/OLD_SHA"; exit 1; }
   echo "== recovering interrupted deploy $B (phase $P) -> $OLD_SHA"
   if rollback_core; then phase ROLLED_BACK_VERIFIED; echo "RECOVERY VERIFIED: $OLD_SHA"; exit 0; fi
-  if [ "$ROLLBACK_RESULT" = PARTIAL ]; then phase ROLLED_BACK_PARTIAL; echo "RECOVERY PARTIAL: containers verified at $OLD_SHA but host CLI/source/schedule/image tags unverified; check against $B" >&2; exit 1; fi
+  if [ "$ROLLBACK_RESULT" = PARTIAL ]; then phase ROLLED_BACK_PARTIAL; echo "RECOVERY PARTIAL: restoration of $OLD_SHA is unverified; database/container identity or host artifacts require manual recovery; check $B" >&2; exit 1; fi
   phase ROLLBACK_FAILED; echo "RECOVERY FAILED: manual recovery required; backup is $B" >&2; exit 1
 fi
+
+# --- bound releases (IMAGE_BINDING_DESIGN.md §3, §4.1, §7) ------------------------------------------------------
+# Every bound ID must already exist locally and be held by a never-started anchor: an apply with a ledger never
+# builds, and an unanchored ID could be removed by Coolify's cleanup before a rollback needs it.
+prebind_images() {
+  local c id
+  for c in api worker reasoner egress; do
+    case "$c" in
+      api) id=$BOUND_API ;; worker) id=$BOUND_WORKER ;; reasoner) id=$BOUND_REASONER ;; egress) id=$BOUND_EGRESS ;;
+    esac
+    [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ABORT: no valid $c image ID is bound; nothing was changed."; return 1; }
+    [ "$(docker image inspect --format '{{.Id}}' "$id" 2>/dev/null)" = "$id" ] \
+      || { echo "ABORT: the bound $c image $id is not present on this host; a bound apply never builds."; return 1; }
+    # --no-trunc: without it `docker ps` prints a 12-character ID that never equals a full sha256 ID.
+    docker ps -a --no-trunc --filter name=company-os-bound- --format '{{.Image}}' | grep -x -- "$id" >/dev/null \
+      || { echo "ABORT: the bound $c image $id is not anchored; nothing may start unanchored."; return 1; }
+  done
+}
+# Compose may not re-map which Dockerfile target a service builds: `prepare` enforced this before it built these
+# images, and the apply enforces it again on the config it is about to start.
+enforce_targets() {
+  local json c target svc
+  json=$(compose_config_json) || return 1
+  for c in api worker reasoner egress; do
+    svc=$(service_of "$c") || return 1
+    target=$(printf '%s\n' "$json" | python3 -I -c '
+import json, sys
+build = json.load(sys.stdin)["services"][sys.argv[1]].get("build") or {}
+if set(build) - {"context", "target", "dockerfile"} or build.get("dockerfile", "Dockerfile") != "Dockerfile":
+    sys.exit(3)
+print(build.get("target") or "")' "$svc") \
+      || { echo "the compose build section for $c cannot be read" >&2; return 1; }
+    [ "$target" = "$c" ] || { echo "compose maps $c to build target '$target', expected '$c'" >&2; return 1; }
+  done
+}
+# The one bootstrap release (§7): no pending_images and no running binding, so the expected IDs are the pins in the
+# release's own signed compose. They count only if they equal a root-written `bootstrap: true` ready record for
+# exactly this release's image inputs, and the pins are consumed once (the marker is created just before the switch).
+bootstrap_pins() {
+  local pins pins_inputs attempt
+  [ "$BOOTSTRAP" = yes ] || return 0
+  [ -f docker-compose.yml ] && [ ! -L docker-compose.yml ] \
+    || { echo "ABORT: the bootstrap release has no regular docker-compose.yml; nothing was changed."; return 1; }
+  pins=$(python3 -I - docker-compose.yml <<'PY'
+import re, sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
+lines = text.splitlines()
+start = None
+for i, line in enumerate(lines):
+    if re.match(r"^x-bound-images\s*:", line):
+        if start is not None:
+            sys.exit(3)                       # two pin blocks are never authority
+        start = i
+if start is None:
+    sys.exit(3)
+body, j = lines[start].split(":", 1)[1], start + 1
+while "}" not in body:
+    if j >= len(lines):
+        sys.exit(3)
+    body, j = body + " " + lines[j], j + 1
+body = body.strip()
+if body.count("{") != 1 or body.count("}") != 1 or not body.startswith("{") or not body.endswith("}"):
+    sys.exit(3)                               # a flow mapping only: no anchors, no block style, no comments inside
+pairs = {}
+for part in body[1:-1].split(","):
+    if not part.strip():
+        continue
+    key, sep, value = part.partition(":")
+    key, value = key.strip(), value.strip().strip("'\"")
+    if not sep or not re.fullmatch(r"[a-z0-9_]+", key) or key in pairs:
+        sys.exit(3)                           # a duplicate key silently keeps the last one: refused, not parsed
+    pairs[key] = value
+if set(pairs) != {"inputs_sha256", "api", "worker", "reasoner", "egress"}:
+    sys.exit(3)
+if not re.fullmatch(r"[0-9a-f]{64}", pairs["inputs_sha256"]):
+    sys.exit(3)
+for c in ("api", "worker", "reasoner", "egress"):
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", pairs[c]):
+        sys.exit(3)
+print(pairs["inputs_sha256"], pairs["api"], pairs["worker"], pairs["reasoner"], pairs["egress"])
+PY
+  ) || { echo "ABORT: the bootstrap release's x-bound-images pins are absent or malformed; nothing was changed."; return 1; }
+  read -r pins_inputs BOUND_API BOUND_WORKER BOUND_REASONER BOUND_EGRESS <<< "$pins"
+  inputs=$(inputs_digest "$REL/src.tgz") || { echo "ABORT: the release inputs cannot be read; nothing was changed."; return 1; }
+  [ "$inputs" = "$pins_inputs" ] \
+    || { echo "ABORT: the pins are for image inputs $pins_inputs but this release ships $inputs; nothing was changed."; return 1; }
+  attempt=$(python3 -I - "$pins_inputs" "$BOUND_API" "$BOUND_WORKER" "$BOUND_REASONER" "$BOUND_EGRESS" "$BUILDS" <<'PY'
+import json, os, re, stat, sys
+
+digest, builds = sys.argv[1], sys.argv[6]
+pins = dict(zip(("api", "worker", "reasoner", "egress"), sys.argv[2:6]))
+try:
+    directory = os.stat(builds)
+except OSError:
+    sys.exit(3)
+if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or directory.st_mode & 0o022:
+    sys.exit(3)                               # root-only, not group/world-writable: only root writes a record
+try:
+    fd = os.open(os.path.join(builds, digest + ".json"), os.O_RDONLY | os.O_NOFOLLOW)
+except OSError:
+    sys.exit(3)
+try:
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or info.st_mode & 0o022
+            or info.st_size > 1 << 20):
+        sys.exit(3)
+    raw = os.read(fd, info.st_size + 1)
+finally:
+    os.close(fd)
+try:
+    record = json.loads(raw)
+except ValueError:
+    sys.exit(3)
+if not isinstance(record, dict) or record.get("inputs_digest") != digest:
+    sys.exit(3)
+if record.get("status") != "ready" or record.get("bootstrap") is not True or record.get("images") != pins:
+    sys.exit(3)
+attempt = record.get("attempt")
+if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+    sys.exit(3)
+print(attempt)
+PY
+  ) || { echo "ABORT: the pins are not bound to a root-written ready bootstrap build record for these inputs; nothing was changed."; return 1; }
+  BUILD_MARKER=$BUILDS/$pins_inputs.$attempt.bootstrap-consumed
+  [ ! -e "$BUILD_MARKER" ] && [ ! -L "$BUILD_MARKER" ] \
+    || { echo "ABORT: these pins were already consumed once; a retry needs a new founder prepare --retry --bootstrap and a new pins release."; return 1; }
+}
+# The staged release's compose must be the one this run validated (source install just laid it down).
+bootstrap_compose_matches() {
+  [ "$BOOTSTRAP" = yes ] || return 0
+  local have want
+  have=$(sha256sum docker-compose.yml | cut -c1-64)
+  want=$(tar -xzf "$REL/src.tgz" -O docker-compose.yml | sha256sum | cut -c1-64)
+  [ "$have" = "$want" ] || { echo "ABORT: the installed docker-compose.yml is not the release's; nothing was changed."; return 1; }
+}
 
 echo "== prechecks"
 echo "alembic revision : $(q 'select version_num from alembic_version')"
@@ -673,21 +1120,47 @@ OLD_SHA=$(docker exec company-api printenv COMPANY_OS_GIT_SHA)
 [[ "$OLD_SHA" =~ ^[0-9a-f]{40}$ ]] || {
   echo "ABORT: running API has no full source SHA; cannot verify an automatic rollback."; exit 1;
 }
-docker tag "$(docker inspect company-api --format '{{.Image}}')" "company-os-api:rollback-$S"
-docker tag "$(docker inspect company-worker --format '{{.Image}}')" "company-os-worker:rollback-$S"
-# The reasoner may not exist yet (first deploy that creates it): nothing to roll back to then.
-R_OLD=$(docker inspect company-reasoner --format '{{.Image}}' 2>/dev/null || true)
+# The rollback target, read before anything changes (IMAGE_BINDING_DESIGN.md §4.1). A reasoner or egress container
+# may not exist yet on a pre-binding host; a bound release always runs all four, so there an absent one is refused.
+PREV_IMAGE_API=$(docker inspect company-api --format '{{.Image}}')
+PREV_IMAGE_WORKER=$(docker inspect company-worker --format '{{.Image}}')
+PREV_IMAGE_REASONER=$(docker inspect company-reasoner --format '{{.Image}}' 2>/dev/null || true)
+PREV_IMAGE_EGRESS=$(docker inspect company-reasoner-egress --format '{{.Image}}' 2>/dev/null || true)
+for id in "$PREV_IMAGE_API" "$PREV_IMAGE_WORKER"; do
+  [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ABORT: a running container has no image ID; cannot verify a rollback."; exit 1; }
+done
+if [ "$BOUND" = yes ]; then
+  for id in "$PREV_IMAGE_REASONER" "$PREV_IMAGE_EGRESS"; do
+    [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ABORT: a bound host must run all four services; a previous image ID is missing."; exit 1; }
+  done
+  # The ledger's running binding and production must agree before this run changes anything (the verifier's pre-step
+  # BLOCK covers the timer path; a direct apply is refused here instead of discovering it in the rollback).
+  if [[ "$B_API" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    { [ "$PREV_IMAGE_API" = "$B_API" ] && [ "$PREV_IMAGE_WORKER" = "$B_WORKER" ] \
+      && [ "$PREV_IMAGE_REASONER" = "$B_REASONER" ] && [ "$PREV_IMAGE_EGRESS" = "$B_EGRESS" ]; } \
+      || { echo "ABORT: the running images are not the ledger's bound images; production and the ledger disagree. Nothing was changed."; exit 1; }
+  fi
+fi
+R_OLD=$PREV_IMAGE_REASONER
+E_OLD=$PREV_IMAGE_EGRESS
+docker tag "$PREV_IMAGE_API" "company-os-api:rollback-$S"
+docker tag "$PREV_IMAGE_WORKER" "company-os-worker:rollback-$S"
 [ -z "$R_OLD" ] || docker tag "$R_OLD" "company-os-reasoner:rollback-$S"
-# The network boundary rolls back with the app: keep the running egress proxy's image too.
-E_OLD=$(docker inspect company-reasoner-egress --format '{{.Image}}' 2>/dev/null || true)
 [ -z "$E_OLD" ] || docker tag "$E_OLD" "company-os-egress:rollback-$S"
 # From here the pending anchors are this run's own (ANCHORED): only then may cleanup drop them. A partial
 # failure drops every pending anchor, so a later VERIFIED run can never promote a stale component's image.
 ANCHORED=1
-{ anchor_rollback api "company-os-api:rollback-$S" && anchor_rollback worker "company-os-worker:rollback-$S" \
-  && { [ -z "$R_OLD" ] || anchor_rollback reasoner "company-os-reasoner:rollback-$S"; } \
-  && { [ -z "$E_OLD" ] || anchor_rollback egress "company-os-egress:rollback-$S"; }; } \
-  || { drop_pending_anchors; echo "WARN: could not anchor the rollback images; Coolify's nightly cleanup may delete them" >&2; }
+if ! { anchor_rollback api "company-os-api:rollback-$S" && anchor_rollback worker "company-os-worker:rollback-$S" \
+       && { [ -z "$R_OLD" ] || anchor_rollback reasoner "company-os-reasoner:rollback-$S"; } \
+       && { [ -z "$E_OLD" ] || anchor_rollback egress "company-os-egress:rollback-$S"; }; }; then
+  drop_pending_anchors
+  # A bound release never switches without the previous release's images anchored (§4.3); the legacy transport keeps
+  # the old warning because its rollback tags are only a convenience.
+  if [ "$BOUND" = yes ] || [ "$BOOTSTRAP" = yes ]; then
+    abort_before_migration "could not anchor the rollback images; a bound release must keep the previous images anchored"
+  fi
+  echo "WARN: could not anchor the rollback images; Coolify's nightly cleanup may delete them" >&2
+fi
 W0=$(docker inspect company-worker --format '{{.State.StartedAt}}')
 
 # Everything a recovery needs is on disk before the first mutation; from here until a terminal phase is written,
@@ -696,6 +1169,16 @@ cp -p -- "$0" "$B/deploy-driver.sh" && chmod 0700 "$B/deploy-driver.sh"
 : > "$B/deploy.env"
 write_env S "$S"; write_env NEW_SHA "$SHA"; write_env OLD_SHA "$OLD_SHA"
 write_env R_OLD "$R_OLD"; write_env E_OLD "$E_OLD"; write_env FENCE_KEEP "$FENCE_KEEP"; write_env FENCE_BEFORE "$FENCE_BEFORE"
+write_env BOUND "$BOUND"
+write_env PREV_IMAGE_API "$PREV_IMAGE_API"; write_env PREV_IMAGE_WORKER "$PREV_IMAGE_WORKER"
+write_env PREV_IMAGE_REASONER "$PREV_IMAGE_REASONER"; write_env PREV_IMAGE_EGRESS "$PREV_IMAGE_EGRESS"
+# The signed archive supplies the standard-library checker before source replacement; the backup copy survives rollback.
+tar -xzf "$REL/src.tgz" -O app/release_identity.py > "$B/recovery-identity.py" \
+  || { echo "ABORT: the release has no recovery identity checker; nothing changed."; exit 1; }
+python3 -I "$B/recovery-identity.py" snapshot "$B" "$OLD_SHA" "$PGU" "$PGD" \
+  || { echo "ABORT: previous container/database identity is unavailable; nothing changed."; exit 1; }
+PREV_COMPOSE_TAG=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("compose_tag") or "")' "$B/recovery-identity.json")
+write_env PREV_COMPOSE_TAG "$PREV_COMPOSE_TAG"
 phase SOURCE_INSTALLING
 echo "== install source $SHA"
 progress 15 "installing source $SHA"
@@ -715,69 +1198,76 @@ chmod +x "$GATE"
 if ! check_release_permissions; then
   abort_before_migration "release file permissions are not verified"
 fi
+# The bootstrap release's expected IDs are the pins in its own compose (§7). They are read before any Compose call:
+# the four `:?` image fields make Compose itself fail without them.
+if [ "$BOOTSTRAP" = yes ]; then
+  bootstrap_compose_matches || abort_before_migration "the installed docker-compose.yml is not the release's"
+  bootstrap_pins || abort_before_migration "the bootstrap image pins are not usable"
+fi
+readonly BOUND BOOTSTRAP BOUND_API BOUND_WORKER BOUND_REASONER BOUND_EGRESS BUILD_MARKER
 # A compose main cannot parse must not reach `build`/`up`: put the old files back and stop.
-if ! docker compose config -q; then
+if ! run_compose config -q; then
   abort_before_migration "main's docker-compose.yml does not validate on this host"
 fi
-# Images come from main's compose, not the host's old one: a service main adds (the reasoner
-# egress, 2026-10-06) is missing there, and the old reasoner image was the worker's.
-# `config --images SERVICE` also lists dependencies (postgres sorted first on 2026-10-05), so
-# read each service's own image field from the resolved config.
-img() { docker compose config --format json | python3 -c "import json,sys; print(json.load(sys.stdin)['services']['$1']['image'])"; }
-API_IMG=$(img company-api); WORKER_IMG=$(img company-worker); REASONER_IMG=$(img company-reasoner); EGRESS_IMG=$(img company-reasoner-egress)
-case "$API_IMG $WORKER_IMG $REASONER_IMG $EGRESS_IMG" in
-  *company-os-api*company-os-worker*company-os-reasoner*company-os-egress*) ;;
-  *) abort_before_migration "unexpected compose images: $API_IMG / $WORKER_IMG / $REASONER_IMG / $EGRESS_IMG" ;;
-esac
-write_env API_IMG "$API_IMG"; write_env WORKER_IMG "$WORKER_IMG"; write_env REASONER_IMG "$REASONER_IMG"; write_env EGRESS_IMG "$EGRESS_IMG"
-# The images are built from a CLEAN copy of the release, never from the host tree. The host overlays the archive
-# onto /opt/company-os and keeps files a release no longer ships (and host-only data), and the Dockerfile copies
-# whole app/ and migrations/: building from the host tree would put a deleted module or a removed Alembic
-# revision into the new image. The context below is exactly the payload manifest, byte-verified, and is thrown
-# away after the build. Host-only files stay on the host and never reach an image.
-CTX="$B/build-context"
-phase BUILDING
-build_failed() {
-  local cleanup_ok=yes
-  rm -rf -- "$CTX" || cleanup_ok=no
-  abort_before_migration "build failed: $1" "$cleanup_ok"
-}
-# docker build -q prints nothing for minutes; a line every 15 s shows the deploy is alive. Returns the build's status.
-build_alive() {
-  local svc=$1 pct=$2 pid t=0
-  docker build -q --target "$TARGET" -t "$IMG" "$CTX" >/dev/null &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    sleep 1; t=$((t + 1))
-    [ $((t % 15)) -ne 0 ] || progress "$pct" "still building $svc · $((t / 60))m$((t % 60))s"
-  done
-  wait "$pid"
-}
-mkdir -m 0700 -- "$CTX" || build_failed "could not create the clean build context"
-tar --no-same-owner -xzf "$REL/src.tgz" -C "$CTX" || build_failed "could not extract the release into a clean build context"
-(cd "$CTX" && sha256sum -c --quiet "$REL/main.sha256") >/dev/null 2>&1 || build_failed "the clean build context does not match the release manifest"
-[ "$(cd "$CTX" && find . \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')" = "$(cut -c67- "$REL/main.sha256" | LC_ALL=C sort | tr '\n' ' ')" ] \
-  || build_failed "the clean build context holds files the release manifest does not list (or lacks some)"
-SVCS=(company-api company-worker company-reasoner company-reasoner-egress)
-# A held release compares against what runs now, so every one of the four must be running before anything builds:
-# a missing container would leave nothing to compare (and no previous tag to restore).
-HELD_IMAGE=()                                     # by SVCS index (no associative arrays: tests run bash 3.2)
-if [ "$HOLD_IMAGES" = yes ]; then
-  for i in "${!SVCS[@]}"; do
-    HELD_IMAGE[i]=$(docker inspect "${SVCS[i]}" --format '{{.Image}}' 2>/dev/null) || HELD_IMAGE[i]=""
-    # A stopped container still has an image; only a running one is what production runs now.
-    [ "$(docker inspect "${SVCS[i]}" --format '{{.State.Running}}' 2>/dev/null)" = true ] || HELD_IMAGE[i]=""
-    [[ "${HELD_IMAGE[i]}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-      || build_failed "a gateway-approved release needs ${SVCS[i]} running to compare its image; a founder-signed release is required"
-  done
-fi
-n=0
-for svc in "${SVCS[@]}"; do
-  # Only a plain {context: ".", target: T} build is reproduced here; any other build option would be silently
-  # dropped from a hand-run `docker build`, so it stops the deploy instead. `docker compose config` normalizes a
-  # build without a dockerfile to dockerfile: Dockerfile (compose-go loader/normalize.go), which is exactly what
-  # `docker build` reads by default, so that one value is the plain build; any other dockerfile is not.
-  TARGET=$(docker compose config --format json | python3 -c "
+if [ "$BOUND" = yes ] || [ "$BOOTSTRAP" = yes ]; then
+  # No build is reachable here: the four IDs are already built, pinned and anchored, and every Compose call below
+  # resolves the config to exactly them before it runs.
+  phase BUILDING
+  progress 20 "checking the bound images"
+  enforce_targets || abort_before_migration "the compose build target map is not the reviewed one"
+  prebind_images || abort_before_migration "the bound images are not present and anchored"
+  API_IMG=$BOUND_API WORKER_IMG=$BOUND_WORKER REASONER_IMG=$BOUND_REASONER EGRESS_IMG=$BOUND_EGRESS
+  write_env API_IMG "$API_IMG"; write_env WORKER_IMG "$WORKER_IMG"
+  write_env REASONER_IMG "$REASONER_IMG"; write_env EGRESS_IMG "$EGRESS_IMG"
+  progress 80 "bound images verified"
+else
+  # Legacy transport (an old verifier on a host with no ledger): build from a CLEAN copy of the release, never from
+  # the host tree. The host overlays the archive onto /opt/company-os and keeps files a release no longer ships (and
+  # host-only data), and the Dockerfile copies whole app/ and migrations/: building from the host tree would put a
+  # deleted module or a removed Alembic revision into the new image. The context below is exactly the payload
+  # manifest, byte-verified, and is thrown away after the build.
+  # Images come from main's compose, not the host's old one: a service main adds (the reasoner
+  # egress, 2026-10-06) is missing there, and the old reasoner image was the worker's.
+  # `config --images SERVICE` also lists dependencies (postgres sorted first on 2026-10-05), so
+  # read each service's own image field from the resolved config.
+  img() { compose_config_json | python3 -c "import json,sys; print(json.load(sys.stdin)['services']['$1']['image'])"; }
+  API_IMG=$(img company-api); WORKER_IMG=$(img company-worker); REASONER_IMG=$(img company-reasoner); EGRESS_IMG=$(img company-reasoner-egress)
+  case "$API_IMG $WORKER_IMG $REASONER_IMG $EGRESS_IMG" in
+    *company-os-api*company-os-worker*company-os-reasoner*company-os-egress*) ;;
+    *) abort_before_migration "unexpected compose images: $API_IMG / $WORKER_IMG / $REASONER_IMG / $EGRESS_IMG" ;;
+  esac
+  write_env API_IMG "$API_IMG"; write_env WORKER_IMG "$WORKER_IMG"; write_env REASONER_IMG "$REASONER_IMG"; write_env EGRESS_IMG "$EGRESS_IMG"
+  CTX="$B/build-context"
+  phase BUILDING
+  build_failed() {
+    local cleanup_ok=yes
+    rm -rf -- "$CTX" || cleanup_ok=no
+    abort_before_migration "build failed: $1" "$cleanup_ok"
+  }
+  # docker build -q prints nothing for minutes; a line every 15 s shows the deploy is alive. Returns the build's status.
+  build_alive() {
+    local svc=$1 pct=$2 pid t=0
+    docker build -q --target "$TARGET" -t "$IMG" "$CTX" >/dev/null &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 1; t=$((t + 1))
+      [ $((t % 15)) -ne 0 ] || progress "$pct" "still building $svc · $((t / 60))m$((t % 60))s"
+    done
+    wait "$pid"
+  }
+  mkdir -m 0700 -- "$CTX" || build_failed "could not create the clean build context"
+  tar --no-same-owner -xzf "$REL/src.tgz" -C "$CTX" || build_failed "could not extract the release into a clean build context"
+  (cd "$CTX" && sha256sum -c --quiet "$REL/main.sha256") >/dev/null 2>&1 || build_failed "the clean build context does not match the release manifest"
+  [ "$(cd "$CTX" && find . \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')" = "$(cut -c67- "$REL/main.sha256" | LC_ALL=C sort | tr '\n' ' ')" ] \
+    || build_failed "the clean build context holds files the release manifest does not list (or lacks some)"
+  SVCS=(company-api company-worker company-reasoner company-reasoner-egress)
+  n=0
+  for svc in "${SVCS[@]}"; do
+    # Only a plain {context: ".", target: T} build is reproduced here; any other build option would be silently
+    # dropped from a hand-run `docker build`, so it stops the deploy instead. `docker compose config` normalizes a
+    # build without a dockerfile to dockerfile: Dockerfile (compose-go loader/normalize.go), which is exactly what
+    # `docker build` reads by default, so that one value is the plain build; any other dockerfile is not.
+    TARGET=$(compose_config_json | python3 -c "
 import json, os, sys
 b = json.load(sys.stdin)['services']['$svc'].get('build') or {}
 ctx = os.path.realpath(b.get('context', ''))
@@ -786,33 +1276,23 @@ if b.get('dockerfile', 'Dockerfile') == 'Dockerfile':
 if set(b) - {'context', 'target'} or ctx != os.path.realpath('.') or not b.get('target'):
     sys.exit(3)
 print(b['target'])") || build_failed "$svc has a build configuration the clean-context build does not reproduce"
-  IMG=$(img "$svc")
-  pct=$((20 + 60 * n / ${#SVCS[@]})); n=$((n + 1))
-  progress "$pct" "building image $n/${#SVCS[@]}: $svc"
-  build_alive "$svc" "$pct" || build_failed "docker build of $svc failed"
-done
-progress 80 "images built"
-# #192 F4: a gateway (LOW) release was reviewed as a diff that never enters an image, but a cold build cache re-runs
-# apt/pip/npm and can fetch different bytes. Such a release must build exactly the images production runs now;
-# anything else waits for a founder-signed release. Checked before any tag, migration or container switch.
-if [ "$HOLD_IMAGES" = yes ]; then
-  for i in "${!SVCS[@]}"; do
-    built=$(docker image inspect --format '{{.Id}}' "$(img "${SVCS[i]}")" 2>/dev/null) || built=""
-    if [ -z "$built" ] || [ "$built" != "${HELD_IMAGE[i]}" ]; then
-      # build_failed: guarded context cleanup, then the same restore of source and tags as any failed build.
-      build_failed "a gateway-approved release would change the ${SVCS[i]} image (built ${built:-none}, running ${HELD_IMAGE[i]}); a founder-signed release is required"
-    fi
+    IMG=$(img "$svc")
+    pct=$((20 + 60 * n / ${#SVCS[@]})); n=$((n + 1))
+    progress "$pct" "building image $n/${#SVCS[@]}: $svc"
+    build_alive "$svc" "$pct" || build_failed "docker build of $svc failed"
   done
+  progress 80 "images built"
+  rm -rf -- "$CTX"
 fi
-rm -rf -- "$CTX"
 phase BUILT
+# The SHA tags are for humans (and older tooling) only; a bound release starts the IDs, never these tags.
 docker tag "$API_IMG" "company-os-api:$SHA"
 docker tag "$WORKER_IMG" "company-os-worker:$SHA"
 docker tag "$REASONER_IMG" "company-os-reasoner:$SHA"
 docker tag "$EGRESS_IMG" "company-os-egress:$SHA"
 
 REV0=$(q 'select version_num from alembic_version')
-HEADS=$(docker compose run --rm --no-deps company-api alembic heads | awk 'NF {print $1}') || {
+HEADS=$(run_compose run --rm --no-deps company-api alembic heads | awk 'NF {print $1}') || {
   abort_before_migration "could not read Alembic heads"
 }
 TARGET_REV=$(single_alembic_head "$HEADS") || {
@@ -824,10 +1304,14 @@ fi
 echo "== migrate (new image, before any container switch) from $REV0"
 progress 82 "migrating the database"
 phase MIGRATING
-if ! docker compose run --rm --no-deps company-api alembic upgrade head; then
+write_env REV0 "$REV0"; write_env TARGET_REV "$TARGET_REV"
+if [ "$REV0" != "$TARGET_REV" ]; then
+  python3 -I "$B/recovery-identity.py" migration "$B" "$REV0" "$TARGET_REV"
+  if ! run_compose run --rm --no-deps company-api alembic upgrade head; then
   # A migration can use operations whose partial schema effects are not reflected in alembic_version. Preserve a
   # blocking journal state until a human verifies the DB; do not claim a clean rollback based only on old code.
-  abort_migration_failure "Alembic upgrade failed from revision $REV0 toward $TARGET_REV"
+    abort_migration_failure "Alembic upgrade failed from revision $REV0 toward $TARGET_REV"
+  fi
 fi
 phase MIGRATED
 echo "alembic now: $(q 'select version_num from alembic_version')"
@@ -856,18 +1340,33 @@ rollback_release() {
   case "$ROLLBACK_RESULT" in
     VERIFIED) phase ROLLED_BACK_VERIFIED; echo "ROLLBACK VERIFIED: $OLD_SHA" ;;
     PARTIAL) phase ROLLED_BACK_PARTIAL
-      echo "PARTIALLY ROLLED BACK: containers verified at $OLD_SHA, but the image tags, host CLI/source files or the cron schedule could NOT be verified as restored; check image tags, /usr/local/bin/companyctl, scripts/ and $CRON_FILE against $B" >&2 ;;
+      echo "PARTIALLY ROLLED BACK: restoration of $OLD_SHA is unverified; database/container identity, image tags, host CLI/source files or the cron schedule could NOT be verified; manual recovery required; check $B" >&2 ;;
     *) phase ROLLBACK_FAILED; echo "ROLLBACK FAILED: manual recovery required; backup is $B" >&2 ;;
   esac
   exit "$status"
 }
+# The one bootstrap release is consumed exactly once, immediately before the switch (§7): these pins can never be
+# used again, even after a failed switch. A retry needs a new founder `prepare --retry --bootstrap` and new pins.
+if [ "$BOOTSTRAP" = yes ]; then
+  ( set -C; : > "$BUILD_MARKER" ) 2>/dev/null \
+    || abort_host_cli_install "these bootstrap pins were already consumed; a retry needs a new prepare --retry --bootstrap and a new pins release"
+fi
 
 echo "== switch containers"
 progress 90 "switching containers and verifying health"
-# The SHA tag (set above) is what the containers run, not the mutable :latest.
+# The SHA tag (set above) is what a legacy container runs; a bound release starts the pinned IDs.
 phase SWITCHING
 trap rollback_release ERR
-COMPANY_OS_GIT_SHA=$SHA COMPANY_OS_IMAGE_TAG=$SHA up_services
+COMPANY_OS_GIT_SHA=$SHA COMPANY_OS_IMAGE_TAG=$SHA up_services bound
+# The containers must run exactly the bound IDs: a tag that moved, a fallback to `latest`, or an older image is a
+# failed switch, and the ERR trap rolls the previous release back.
+if [ "$BOUND" = yes ] || [ "$BOOTSTRAP" = yes ]; then
+  for pair in "company-api:$BOUND_API" "company-worker:$BOUND_WORKER" \
+              "company-reasoner:$BOUND_REASONER" "company-reasoner-egress:$BOUND_EGRESS"; do
+    got=$(docker inspect "${pair%%:*}" --format '{{.Image}}')
+    [ "$got" = "${pair#*:}" ] || { echo "${pair%%:*} runs ${got:-nothing}, not the bound ${pair#*:}" >&2; false; }
+  done
+fi
 for _ in $(seq 1 30); do
   docker inspect company-api --format '{{.State.Health.Status}}' | grep -q healthy && break
   sleep 3

@@ -61,7 +61,7 @@ rollback() {
   echo "== ROLLBACK: restoring the old password and .env"
   set_role_pw "$OLD" || echo "  ALTER ROLE back FAILED: run it by hand with the value in .env.bak-rotate-$S"
   cp -p ".env.bak-rotate-$S" .env
-  docker compose up -d --no-deps --no-build company-api company-worker || echo "  compose up FAILED: check containers"
+  scripts/compose-bound.sh up -d --no-deps --no-build company-api company-worker || echo "  compose up FAILED: check containers"
   echo "  old password works: $(try_pw "$OLD" && echo PASS || echo FAIL)"
   exit 1
 }
@@ -82,7 +82,7 @@ chmod 600 .env
 echo "  role password changed, .env updated (backup .env.bak-rotate-$S)"
 
 echo "== recreate company-api + company-worker"
-docker compose up -d --no-deps --no-build company-api company-worker >/dev/null || rollback
+scripts/compose-bound.sh up -d --no-deps --no-build company-api company-worker >/dev/null || rollback
 for _ in $(seq 1 30); do
   docker inspect company-api --format '{{.State.Health.Status}}' | grep -q healthy && break; sleep 2
 done

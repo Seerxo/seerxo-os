@@ -35,8 +35,9 @@ services:
     build:
       context: .
       target: api
-    # Deploy sets COMPANY_OS_IMAGE_TAG to the release SHA: the container names the exact build.
-    image: company-os-api:${COMPANY_OS_IMAGE_TAG:-latest}
+    # Bound image (IMAGE_BINDING_DESIGN.md §4.1): the deploy passes the exact image ID it verified. Compose itself
+    # fails without it (`:?`), so no call can silently fall back to `latest` or to a tag that moved.
+    image: ${COMPANY_OS_IMAGE_API:?bound image ID required}
     container_name: company-api
     restart: unless-stopped
     depends_on:
@@ -111,7 +112,7 @@ services:
     build:
       context: .
       target: worker
-    image: company-os-worker:${COMPANY_OS_IMAGE_TAG:-latest}
+    image: ${COMPANY_OS_IMAGE_WORKER:?bound image ID required}
     container_name: company-worker
     restart: unless-stopped
     depends_on:
@@ -126,7 +127,7 @@ services:
       REASONER_URL: http://company-reasoner:8100
       # Run provenance (§9). Set at deploy: COMPANY_OS_GIT_SHA=$(git rev-parse --short HEAD)
       COMPANY_OS_GIT_SHA: ${COMPANY_OS_GIT_SHA:-}
-      WORKER_IMAGE: company-os-worker:${COMPANY_OS_IMAGE_TAG:-latest}
+      WORKER_IMAGE: ${COMPANY_OS_IMAGE_WORKER}
       # Stage C stays off until the sandbox exists and the founder enables it.
       ENABLE_AUTONOMOUS_CODE_WRITE: "false"
       # Control-plane only: one-repository fine-grained GitHub credential. Never passed
@@ -171,7 +172,7 @@ services:
     build:
       context: .
       target: reasoner
-    image: company-os-reasoner:${COMPANY_OS_IMAGE_TAG:-latest}
+    image: ${COMPANY_OS_IMAGE_REASONER:?bound image ID required}
     container_name: company-reasoner
     restart: unless-stopped
     environment:
@@ -248,7 +249,7 @@ services:
     build:
       context: .
       target: egress
-    image: company-os-egress:${COMPANY_OS_IMAGE_TAG:-latest}
+    image: ${COMPANY_OS_IMAGE_EGRESS:?bound image ID required}
     container_name: company-reasoner-egress
     restart: unless-stopped
     networks: [reasoner-net, reasoner-egress]
@@ -281,7 +282,7 @@ services:
     logging: *logging
 
   # Stage C coder egress (docs/CODER_RUNTIME.md D3). Profile-gated: a normal `up` never
-  # starts it; the founder runs `docker compose --profile stage-c up -d company-egress`.
+  # starts it; the founder runs `sudo scripts/compose-bound.sh --profile stage-c up -d company-egress`.
   company-egress:
     build:
       context: .

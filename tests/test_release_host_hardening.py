@@ -463,7 +463,11 @@ def test_enforcement_is_off_in_source_and_its_abort_restores_files_before_any_sw
     helper = REMOTE[helper_start:REMOTE.index("\n}\n", helper_start) + 3]
     assert helper.index('restore_source "$B"') < helper.index("restore_tags")
     assert helper.index("restore_tags") < helper.index("phase ABORTED_RESTORED")
-    assert REMOTE.index('tar --no-same-owner -xzf "$REL/src.tgz"') < call < REMOTE.index("docker build -q --target")
+    installed = REMOTE.index('tar --no-same-owner -xzf "$REL/src.tgz" -C /opt/company-os')
+    bound = REMOTE.index('if [ "$BOUND" = yes ] || [ "$BOOTSTRAP" = yes ]; then', call)
+    legacy_build = REMOTE.index("docker build -q --target", bound)
+    assert installed < call < bound < legacy_build
+    assert "prebind_images" in REMOTE[bound:legacy_build]
     assert call < REMOTE.index("trap rollback_release ERR")
     assert "release file permissions differ from the archive" not in REMOTE   # the old one-size-fits-all message
 

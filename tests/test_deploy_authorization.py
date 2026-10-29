@@ -465,6 +465,7 @@ def test_release_rollback_requires_every_image_tag_restored_before_a_clean_journ
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)
     (backup / "cli-files-before.sha256").write_text("fixture\n")
+    (backup / "recovery-identity.py").write_text("# recovery identity has separate adversarial tests\n")
     calls = tmp_path / "calls"
     phase_fn = next(line for line in REMOTE.splitlines() if line.startswith("phase() {"))
     clean_fn = next(line for line in REMOTE.splitlines() if line.startswith("phase_is_clean() {"))
@@ -472,6 +473,7 @@ def test_release_rollback_requires_every_image_tag_restored_before_a_clean_journ
                         remote_function("rollback_core"), remote_function("rollback_release"))) + '''
 restore_source() { return 0; }
 restore_cron() { return 0; }
+compose_restore() { return 0; }  # this unit isolates image-tag restoration, not container startup
 docker() {
   case "$1" in
     tag)
@@ -512,7 +514,24 @@ rollback_release
     assert (clean.returncode == 0) is (not failed_images)
     if failed_images:
         assert "ROLLBACK VERIFIED" not in result.stdout + result.stderr
-        assert "image tags" in result.stderr
+        assert "PARTIALLY ROLLED BACK" in result.stderr
+
+
+def test_attempted_migration_blocks_before_any_old_code_or_container_is_restored(tmp_path):
+    (tmp_path / "migration-attempted").write_text("a -> b\n")
+    touched = tmp_path / "unsafe-restore"
+    script = remote_function("rollback_core") + '''
+restore_source() { touch "$UNSAFE"; }
+up_services() { touch "$UNSAFE"; }
+B=$BACKUP
+rollback_core
+rc=$?
+printf '%s %s' "$rc" "$ROLLBACK_RESULT"
+'''
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                            env=os.environ | {"BACKUP": str(tmp_path), "UNSAFE": str(touched)})
+    assert result.stdout == "1 PARTIAL"
+    assert not touched.exists()
 
 
 def test_restore_source_propagates_failure_removing_a_new_release_file(tmp_path):
@@ -554,7 +573,7 @@ def test_the_migration_gate_applies_to_every_deploy_and_restores_files_before_ab
 
 def test_release_abort_paths_use_checked_recovery_before_a_clean_terminal_phase():
     assert 'if ! check_release_permissions; then\n  abort_before_migration ' in REMOTE
-    assert 'if ! docker compose config -q; then\n  abort_before_migration ' in REMOTE
+    assert 'if ! run_compose config -q; then\n  abort_before_migration ' in REMOTE
     assert '*) abort_before_migration "unexpected compose images:' in REMOTE
     assert 'abort_before_migration "build failed: $1" "$cleanup_ok"' in REMOTE
     assert 'abort_migration_failure "Alembic upgrade failed' in REMOTE

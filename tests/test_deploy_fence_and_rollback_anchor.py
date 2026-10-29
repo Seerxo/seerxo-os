@@ -97,33 +97,99 @@ def test_the_verified_fence_is_kept_and_everything_else_keeps_the_ack_path(overr
     assert decide(overrides, ack, ok) == (keep, rest)
 
 
-def compose_calls(tmp_path, keep, ok=True):
+# Every Compose call of a release goes through run_compose -> compose_bound -> compose_check: the resolved config
+# must name exactly the bound IDs before anything runs. The stand-in resolves `compose config` the way the real
+# Compose does, so a test can assert both the check and the calls that survive it.
+RESOLVER = '''
+import json, os
+tag = os.environ.get("COMPANY_OS_IMAGE_TAG", "latest")
+want = [("company-api", "COMPANY_OS_IMAGE_API", "company-os-api"),
+        ("company-worker", "COMPANY_OS_IMAGE_WORKER", "company-os-worker"),
+        ("company-reasoner", "COMPANY_OS_IMAGE_REASONER", "company-os-reasoner"),
+        ("company-reasoner-egress", "COMPANY_OS_IMAGE_EGRESS", "company-os-egress")]
+print(json.dumps({"services": {name: {"image": os.environ.get(var) or repo + ":" + tag}
+                               for name, var, repo in want}}))
+'''
+
+BOUND_IDS = {c: "sha256:" + h * 64 for c, h in
+             (("api", "a"), ("worker", "b"), ("reasoner", "c"), ("egress", "d"))}
+
+
+def resolver(tmp_path):
+    path = tmp_path / "resolve.py"
+    path.write_text(RESOLVER)
+    return path
+
+
+def fake_compose(calls, resolve):
+    """A docker stand-in: records every call and resolves `compose config` from the environment it is given."""
+    return f'''CALLS="{calls}"; RESOLVER="{resolve}"
+docker() {{
+  printf '%s\\n' "$*" >> "$CALLS"
+  [ "$1" = compose ] || return 0
+  case " $* " in *" config "*) python3 "$RESOLVER" ;; esac
+  return 0
+}}'''
+
+
+def compose_calls(tmp_path, keep, ok=True, bound=True):
     calls = tmp_path / "calls"
-    script = fn("up_services") + f'''FENCE_OVERLAY=/fence.yml; FENCE_KEEP={keep}
+    fns = "\n".join(fn(n) for n in ("compose_env", "compose_check", "compose_bound", "run_compose", "up_services"))
+    env = ""
+    if bound:
+        env = (f'BOUND=yes BOUND_API="{BOUND_IDS["api"]}" BOUND_WORKER="{BOUND_IDS["worker"]}" '
+               f'BOUND_REASONER="{BOUND_IDS["reasoner"]}" BOUND_EGRESS="{BOUND_IDS["egress"]}"\n')
+    script = fns + f'''FENCE_OVERLAY=/fence.yml; FENCE_KEEP={keep}
 fence_verified() {{ return {0 if ok else 1}; }}
-docker() {{ printf '%s\\n' "$*" >> "{calls}"; }}
-up_services'''
+{fake_compose(calls, resolver(tmp_path))}
+{env}up_services bound'''
     out = bash(script)
-    return out.returncode, calls.read_text().splitlines() if calls.exists() else []
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    return out.returncode, [c for c in lines if " config " not in c]
 
 
 def test_up_services_reapplies_the_fence_on_company_api_only(tmp_path):
     rc, calls = compose_calls(tmp_path, "yes")
     assert rc == 0 and calls == [
-        "compose -f docker-compose.yml -f /fence.yml up -d --no-deps --no-build company-api",
-        "compose up -d --no-deps --no-build company-worker company-reasoner-egress company-reasoner",
+        "compose -f docker-compose.yml -f /fence.yml up -d --no-deps --no-build --pull never company-api",
+        "compose up -d --no-deps --no-build --pull never company-worker company-reasoner-egress company-reasoner",
     ]
 
 
 def test_up_services_without_the_fence_is_unchanged(tmp_path):
-    rc, calls = compose_calls(tmp_path, "no")
-    assert rc == 0 and calls == [
-        "compose up -d --no-deps --no-build company-api company-worker company-reasoner-egress company-reasoner"]
+    expected = ["compose up -d --no-deps --no-build --pull never company-api company-worker "
+                "company-reasoner-egress company-reasoner"]
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    assert compose_calls(tmp_path, "no") == (0, expected)                 # bound: the four IDs on the command line
+    assert compose_calls(legacy, "no", bound=False) == (0, expected)      # tag-shaped legacy host
 
 
 def test_a_fence_changed_mid_deploy_is_never_applied(tmp_path):
     rc, calls = compose_calls(tmp_path, "yes", ok=False)
     assert rc != 0 and calls == []
+
+
+def test_a_stale_bound_image_never_starts_a_release(tmp_path):
+    # Compose resolving a service to anything but the bound ID is a hard stop: no service is recreated.
+    calls = tmp_path / "calls"
+    drift = tmp_path / "drift.py"
+    drift.write_text(RESOLVER.replace("os.environ.get(var) or ", ""))   # always the tag, whatever was bound
+    fns = "\n".join(fn(n) for n in ("compose_env", "compose_check", "compose_bound", "run_compose", "up_services"))
+    script = fns + f'''FENCE_OVERLAY=/fence.yml; FENCE_KEEP=no
+fence_verified() {{ return 0; }}
+docker() {{
+  printf '%s\\n' "$*" >> "{calls}"
+  [ "$1" = compose ] || return 0
+  case " $* " in *" config "*) python3 "{drift}" ;; esac
+  return 0
+}}
+BOUND=yes BOUND_API="{BOUND_IDS["api"]}" BOUND_WORKER="{BOUND_IDS["worker"]}" \
+BOUND_REASONER="{BOUND_IDS["reasoner"]}" BOUND_EGRESS="{BOUND_IDS["egress"]}"
+up_services bound'''
+    out = bash(script)
+    assert out.returncode != 0
+    assert [c for c in calls.read_text().splitlines() if " up " in c] == []
 
 
 @pytest.mark.parametrize("keep, env, ok", [("yes", "true", True), ("yes", "", False), ("yes", "false", False),
@@ -142,21 +208,7 @@ def test_the_switch_fails_into_rollback_when_the_fence_is_not_live():
 
 
 def test_a_rollback_without_a_live_fence_is_only_partial(tmp_path):
-    backup = tmp_path / "b"
-    backup.mkdir()
-    for name in ("host-cli.sh", "release-health-gate.sh"):
-        (backup / name).write_text("#!/bin/sh\nexit 0\n")
-        (backup / name).chmod(0o755)
-    (backup / "cli-files-before.sha256").write_text("x\n")
-    script = "\n".join((fn("up_services"), fn("fence_live"), fn("rollback_core"))) + f'''
-restore_source() {{ return 0; }}
-restore_cron() {{ return 0; }}
-fence_verified() {{ return 0; }}
-docker() {{ case "$1" in inspect) echo healthy ;; exec) echo false ;; *) return 0 ;; esac; }}
-B={backup}; S=s; OLD_SHA={"a" * 40}; API_IMG=a; WORKER_IMG=w; R_OLD=; E_OLD=; FENCE_OVERLAY=/f; FENCE_KEEP=yes
-rollback_core; echo "$ROLLBACK_RESULT"'''
-    out = bash(script)
-    assert out.stdout.strip().splitlines()[-1] == "PARTIAL"
+    assert rollback(tmp_path, before="yes", keep="yes", live="false")[0] == "PARTIAL"
 
 
 def test_rollback_images_are_anchored_under_pending_names_and_no_image_is_removed(tmp_path):
@@ -240,39 +292,69 @@ def test_the_pre_deploy_fence_state_is_recorded_apart_from_the_forward_decision(
     assert 'write_env FENCE_BEFORE "$FENCE_BEFORE"' in REMOTE and "FENCE_BEFORE" in fn("read_env")
 
 
-def rollback(tmp_path, before, keep, live):
+PREV = {c: "sha256:" + h * 64 for c, h in
+        (("api", "1"), ("worker", "2"), ("reasoner", "3"), ("egress", "4"))}
+
+
+def rollback(tmp_path, before, keep, live, verified=True):
+    """Run rollback_core against a stand-in that starts containers and reports the IDs it was given."""
     backup = tmp_path / "b"
     backup.mkdir()
     for name in ("host-cli.sh", "release-health-gate.sh"):
         (backup / name).write_text("#!/bin/sh\nexit 0\n")
         (backup / name).chmod(0o755)
     (backup / "cli-files-before.sha256").write_text("x\n")
+    (backup / "recovery-identity.py").write_text("# identity verification has its own negative tests\n")
     calls = tmp_path / "calls"
-    script = "\n".join((fn("up_services"), fn("fence_live"), fn("rollback_core"))) + f'''
+    fns = "\n".join(fn(n) for n in ("restore_env", "compose_restore", "up_services", "fence_live", "rollback_core"))
+    script = fns + f'''
 restore_source() {{ return 0; }}
 restore_cron() {{ return 0; }}
-fence_verified() {{ return 0; }}
-docker() {{ printf '%s\\n' "$*" >> "{calls}"; case "$1" in inspect) echo healthy ;; exec) echo {live} ;; *) return 0 ;; esac; }}
+fence_verified() {{ return {0 if verified else 1}; }}
+# The resolution itself has its own tests; here only which services start (and under which fence) matters.
+restore_resolve() {{
+  RESTORE_ID_API="{PREV["api"]}"; RESTORE_ID_WORKER="{PREV["worker"]}"
+  RESTORE_ID_REASONER="{PREV["reasoner"]}"; RESTORE_ID_EGRESS="{PREV["egress"]}"; return 0
+}}
+docker() {{
+  printf '%s\\n' "$*" >> "{calls}"
+  case "$1" in
+    inspect) case "$*" in
+               *'{{.Image}}'*) case "$2" in
+                 company-api) echo "$RESTORE_ID_API" ;; company-worker) echo "$RESTORE_ID_WORKER" ;;
+                 company-reasoner) echo "$RESTORE_ID_REASONER" ;;
+                 company-reasoner-egress) echo "$RESTORE_ID_EGRESS" ;; esac ;;
+               *) echo healthy ;; esac ;;
+    exec) echo {live} ;;
+  esac
+  return 0
+}}
 B={backup}; S=s; OLD_SHA={"a" * 40}; API_IMG=a; WORKER_IMG=w; R_OLD=; E_OLD=; FENCE_OVERLAY=/f
 FENCE_BEFORE={before}; FENCE_KEEP={keep}
 rollback_core; echo "$ROLLBACK_RESULT"'''
     out = bash(script)
-    fenced = any(c.startswith("compose -f docker-compose.yml -f /f up") for c in calls.read_text().splitlines())
-    return out.stdout.strip().splitlines()[-1], fenced
+    composes = [c for c in calls.read_text().splitlines() if c.startswith("compose ")]
+    fenced = any(c.startswith("compose -f docker-compose.yml -f /f up") for c in composes)
+    return out.stdout.strip().splitlines()[-1], fenced, composes
 
 
 def test_rollback_restores_the_fence_the_old_release_had_even_after_a_forward_ack(tmp_path):
     # Codex P2: an ACK that dropped the fence for the candidate also dropped it from the restored old release,
     # which still reported VERIFIED.
-    assert rollback(tmp_path, before="yes", keep="no", live="true") == ("VERIFIED", True)
+    result, fenced, composes = rollback(tmp_path, before="yes", keep="no", live="true")
+    assert (result, fenced) == ("VERIFIED", True)
+    assert composes == [
+        "compose -f docker-compose.yml -f /f up -d --no-deps --no-build --pull never company-api",
+        "compose up -d --no-deps --no-build --pull never company-worker company-reasoner-egress company-reasoner",
+    ]
 
 
 def test_rollback_that_cannot_restore_the_old_fence_is_only_partial(tmp_path):
-    assert rollback(tmp_path, before="yes", keep="no", live="false") == ("PARTIAL", True)
+    assert rollback(tmp_path, before="yes", keep="no", live="false")[:2] == ("PARTIAL", True)
 
 
 def test_rollback_never_adds_a_fence_the_old_release_did_not_have(tmp_path):
-    assert rollback(tmp_path, before="no", keep="yes", live="") == ("VERIFIED", False)
+    assert rollback(tmp_path, before="no", keep="yes", live="")[:2] == ("VERIFIED", False)
 
 
 # --------------------------------------------------------------------------- independent review of #392 (N1-N3)
@@ -323,32 +405,16 @@ def test_an_unreviewed_overlay_before_the_deploy_is_recorded_as_unverified():
 
 
 def rollback_unverified(tmp_path, before, ok):
-    backup = tmp_path / "b"
-    backup.mkdir()
-    for name in ("host-cli.sh", "release-health-gate.sh"):
-        (backup / name).write_text("#!/bin/sh\nexit 0\n")
-        (backup / name).chmod(0o755)
-    (backup / "cli-files-before.sha256").write_text("x\n")
-    calls = tmp_path / "calls"
-    script = "\n".join((fn("up_services"), fn("fence_live"), fn("rollback_core"))) + f'''
-restore_source() {{ return 0; }}
-restore_cron() {{ return 0; }}
-fence_verified() {{ return {0 if ok else 1}; }}
-docker() {{ printf '%s\\n' "$*" >> "{calls}"; case "$1" in inspect) echo healthy ;; exec) echo true ;; *) return 0 ;; esac; }}
-B={backup}; S=s; OLD_SHA={"a" * 40}; API_IMG=a; WORKER_IMG=w; R_OLD=; E_OLD=; FENCE_OVERLAY=/f
-FENCE_BEFORE={before}; FENCE_KEEP=no
-rollback_core; echo "$ROLLBACK_RESULT"'''
-    out = bash(script)
-    composes = [c for c in calls.read_text().splitlines() if c.startswith("compose")]
-    return out.stdout.strip().splitlines()[-1], composes
+    result, _, composes = rollback(tmp_path, before=before, keep="no", live="true", verified=ok)
+    return result, composes
 
 
 @pytest.mark.parametrize("before, ok", [("yes", False), ("unverified", True), ("unverified", False)])
 def test_rollback_never_strands_the_candidate_when_the_old_fence_cannot_be_verified(tmp_path, before, ok):
     # Review N2: FENCE_KEEP=yes made up_services return before any compose call, so the failed candidate kept running.
     result, composes = rollback_unverified(tmp_path, before, ok)
-    assert composes == ["compose up -d --no-deps --no-build company-api company-worker company-reasoner-egress "
-                        "company-reasoner"]                        # old release recreated from the base file
+    assert composes == ["compose up -d --no-deps --no-build --pull never company-api company-worker "
+                        "company-reasoner-egress company-reasoner"]     # old release recreated from the base file
     assert result == "PARTIAL"                                     # its old configuration is not back
 
 
@@ -400,11 +466,11 @@ def test_an_abort_after_the_backup_dir_but_before_anchoring_keeps_earlier_anchor
 def test_a_partial_anchoring_failure_drops_every_pending_anchor(tmp_path):
     # Behaviour, not text: the worker anchor fails after api anchored; every pending anchor must be gone.
     start = REMOTE.index("ANCHORED=1\n")
-    block = REMOTE[start:REMOTE.index("\n", REMOTE.index("could not anchor the rollback images"))]
+    end = REMOTE.index("\nfi\n", REMOTE.index("could not anchor the rollback images", start)) + len("\nfi\n")
     steps = ('eval "real_$(declare -f docker)"\n'
              'docker() { if [ "$1" = create ] && [ "$3" = company-os-rollback-anchor-pending-worker ]; then return 1; fi; '
              'real_docker "$@"; }\n'
-             'R_OLD=; E_OLD=\n' + block)   # S stays the fake docker's state file; it only names image tags here
+             'R_OLD=; E_OLD=\n' + REMOTE[start:end])   # S stays the fake docker's state file; it only names image tags here
     left = anchors_after(tmp_path, steps, STABLE + ["company-os-rollback-anchor-pending-egress"])
     assert left == STABLE                                     # stable kept; no pending (api's or the stale egress)
 

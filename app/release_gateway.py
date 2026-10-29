@@ -46,7 +46,10 @@ NS_RECOVERY = "seerxo-ledger-recovery"            # founder only: rebuild a lost
 NS_RECONCILE = "seerxo-ledger-reconcile"          # founder only: close a `pending` release (applied/failed/abandoned)
 NS_REBASE = "seerxo-ledger-rebase"                 # founder only: move the release chain to another repository
 NS_REVIEW_REQUEST = "seerxo-review-request"      # the gateway key: only the gateway may ask for a release review
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+# The verifier and the root-side driver are installed as one versioned bundle; both carry this integer and refuse
+# to run when they disagree (release_host.bundle_problem).
+BUNDLE_VERSION = 1
 CLOCK_SKEW_S = 300
 MAX_LIFETIME_S = 24 * 3600
 
@@ -72,6 +75,10 @@ def payload_digest(listing: str) -> str:
 # What a release ships: the same paths scripts/deploy-company-os.sh packs (PATHS), pinned equal by a test.
 DEPLOY_PATHS = ("app", "migrations", "scripts", "agents", "skills", "tests", "alembic.ini", "requirements.txt",
                 "Dockerfile", "docker-compose.yml", "docs/PERMANENT_FACTS.md")
+
+# The component -> Dockerfile target map. Compose could otherwise re-map which target a service builds without
+# changing `inputs_digest`; prepare and the bound-mode driver both refuse a compose file that differs from this.
+BUILD_TARGETS = {"api": "api", "worker": "worker", "reasoner": "reasoner", "egress": "egress"}
 
 
 def payload_listing(git_dir: Path, sha: str) -> str:
@@ -118,6 +125,26 @@ def release_archive(git_dir: Path, sha: str) -> bytes:
     if payload_digest(archive_listing(tar)) != payload_digest(payload_listing(git_dir, sha)):
         raise Refused("the release archive differs from the hashed payload (.gitattributes export rules?)")
     return tar
+
+
+def inputs_digest(tar: bytes) -> str:
+    """What an image build consumes: every non-directory release-archive member (except docker-compose.yml, which is
+    removed from the build context) with its mode and type, plus the fixed component -> Dockerfile target map. JSON,
+    so the encoding is unambiguous. `rg.inputs_digest` is embedded verbatim in the driver's PREPARE/bootstrap snippet;
+    a test asserts both copies agree on fixtures with an executable bit, a symlink and a non-ASCII path."""
+    files = []
+    with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+        for member in archive.getmembers():
+            if member.isdir() or member.name == "docker-compose.yml":
+                continue
+            if member.isfile():
+                data, kind = archive.extractfile(member).read(), "file"
+            elif member.issym():
+                data, kind = member.linkname.encode("utf-8", "surrogateescape"), "symlink"
+            else:
+                raise Refused(f"the release archive holds an unexpected entry: {member.name}")
+            files.append([member.name, member.mode & 0o777, kind, hashlib.sha256(data).hexdigest()])
+    return hashlib.sha256(canonical({"build": BUILD_TARGETS, "files": sorted(files)})).hexdigest()
 
 
 def diff_scope(state: dict) -> tuple[str, ...]:
@@ -397,7 +424,8 @@ def classify(changed_paths: list[str], policy: dict) -> str:
 # --------------------------------------------------------------------------- manifest
 
 MANIFEST_FIELDS = {"version", "repository", "branch", "sha", "parent_sha", "payload_digest", "changed_paths",
-                   "sequence", "issued_at", "expires_at", "policy_version", "migration_to", "approver", "evidence"}
+                   "sequence", "issued_at", "expires_at", "policy_version", "migration_to", "approver", "evidence",
+                   "images"}
 # Optional: a manifest that declares itself a rollback names the earlier applied release it restores (G4).
 ROLLBACK_FIELD = "rollback_to"
 
@@ -409,6 +437,8 @@ def _check_shape(m) -> None:
         raise Refused("rollback_to must be exactly 40 lowercase hex characters")
     if not _int(m["version"]) or m["version"] != MANIFEST_VERSION:
         raise Refused("unsupported manifest version")
+    if not images_ok(m["images"]):
+        raise Refused("images must name exactly the content-addressed IDs of api, worker, reasoner and egress")
     if not isinstance(m["repository"], str) or not isinstance(m["branch"], str):
         raise Refused("repository and branch must be strings")
     for key in ("sha", "parent_sha"):
@@ -583,9 +613,10 @@ def gateway_approve(manifest: dict, policy: dict, *, now: datetime, diff: str) -
 def _check_rollback(m: dict, host_facts: dict, state: dict, history) -> None:
     """G4: a declared rollback restores exactly an earlier release from the host's own trusted history. The newest
     `applied` event for `rollback_to` must record the payload digest the host just computed for this commit (same
-    shipped tree, not merely the same commit name) and that release's image and configuration identity. Bootstrap,
-    recovery and reconcile events and events recorded before payload digests were kept are not evidence. `history`
-    is a loader (read only for a rollback); without it, or with any piece missing or different, the rollback refuses."""
+    shipped tree, not merely the same commit name), the target's four bound image IDs, and the image-input digest.
+    Reconcile, bootstrap and recovery events are not rollback evidence (founder rule 2026-10-19). A schema change is
+    a forward revert, never a rollback. `history` is a loader (read only for a rollback); without it, or with any
+    piece missing or different, the rollback refuses."""
     target = m[ROLLBACK_FIELD]
     if m["approver"] != "founder":
         raise Refused("a rollback needs the founder's signature (high risk)")
@@ -602,18 +633,63 @@ def _check_rollback(m: dict, host_facts: dict, state: dict, history) -> None:
         raise Refused("rollback refused: no recorded payload digest for the target release")
     if host_facts.get("payload_digest") != recorded:
         raise Refused("rollback refused: the commit's payload differs from the target release's recorded payload")
-    images, configs = event.get("images"), event.get("configs")
-    if not (isinstance(images, dict) and set(images) == set(COMPONENTS)
-            and all(isinstance(v, str) and IMAGE_ID.fullmatch(v) for v in images.values())
-            and isinstance(configs, dict) and set(configs) == set(COMPONENTS)
-            and all(isinstance(v, str) and CONFIG_ID.fullmatch(v) for v in configs.values())):
-        raise Refused("rollback refused: no recorded image and configuration identity for the target release")
-    # Founder 2026-10-20: a VERIFIED rollback must also prove that the images running afterwards are the target's
-    # recorded images. The deploy driver rebuilds images, so their IDs cannot match; until images can be redeployed
-    # by recorded ID, every declared rollback refuses here, after all evidence checks. A founder-signed forward
-    # revert (no rollback_to) remains an ordinary HIGH release and is never shown as a verified rollback.
-    raise Refused("verified rollback is unavailable: the running images cannot yet be proven to be the target "
-                  "release's recorded images; use a founder-signed forward revert")
+    bound = event.get("bound_images")
+    if not images_ok(bound):
+        raise Refused("rollback refused: the target release recorded no bound image IDs; use a founder-signed "
+                      "forward revert")
+    if event.get("inputs_digest") is None or not digest_ok(event.get("inputs_digest")):
+        raise Refused("rollback refused: the target release recorded no image-input digest")
+    if m["images"] != bound:
+        raise Refused("rollback refused: the manifest's images differ from the target release's bound images")
+    if host_facts.get("inputs_digest") != event["inputs_digest"]:
+        raise Refused("rollback refused: the commit's image inputs differ from the target release's recorded inputs")
+    if host_facts.get("migration_heads") != host_facts.get("parent_migration_heads"):
+        raise Refused("rollback refused: the target release changes the Alembic schema; use a founder-signed "
+                      "forward revert")
+
+
+def _check_bound_presence(host_facts: dict) -> None:
+    """In every case, before `pending`: the candidate's driver speaks bound mode, each bound ID is present locally,
+    and each is held by an anchor (so Coolify's nightly cleanup cannot delete what the release will start)."""
+    if host_facts.get("driver_bound") is not True:
+        raise Refused("this release's deploy driver predates image binding: a founder install is required")
+    if host_facts.get("images_present") is not True:
+        raise Refused("a bound image is not present on this host: the release cannot start what was signed")
+    if host_facts.get("anchored_images") is not True:
+        raise Refused("a bound image is not anchored on this host: Coolify's cleanup could delete it")
+
+
+def _check_images(m: dict, host_facts: dict, state: dict) -> None:
+    """§4.1: what `images` must equal before `pending`. A gateway release may not change any image input and must
+    name exactly the running bound set (and the running driver). A founder release may name the running set when its
+    inputs are unchanged, or a ready build record for exactly these inputs."""
+    digest = host_facts.get("inputs_digest")
+    if host_facts.get("build_record_problem"):
+        raise Refused(f"BLOCKED: {host_facts['build_record_problem']}")
+    if not digest_ok(digest):
+        raise Refused("BLOCKED: the host could not compute this release's image inputs")
+    bound_images, bound_inputs = state.get("bound_images"), state.get("bound_inputs")
+    if m["approver"] == "gateway":
+        if not images_ok(bound_images) or not digest_ok(bound_inputs):
+            raise Refused("no bound release runs on this host: a founder-signed release is required")
+        if digest != bound_inputs:
+            raise Refused("this release changes an image input: a founder-signed release is required")
+        if m["images"] != bound_images:
+            raise Refused("this release names images other than the running bound release: a founder is required")
+        if host_facts.get("driver_sha256") != state.get("bound_driver_sha256"):
+            raise Refused("this release's deploy driver differs from the running bound release: a founder is required")
+        return
+    if images_ok(bound_images) and m["images"] == bound_images and digest == bound_inputs:
+        return
+    record = host_facts.get("build_record")
+    if not isinstance(record, dict):
+        raise Refused("images not prepared by this host: the founder must run prepare")
+    if record.get("status") != "ready":
+        raise Refused("images not prepared by this host: the build record is not ready")
+    if record.get("inputs_digest") != digest:
+        raise Refused("BLOCKED: the build record is for different image inputs")
+    if not images_ok(record.get("images")) or record["images"] != m["images"]:
+        raise Refused("manifest images differ from the host's build record for these inputs")
 
 
 def chain_parent(state: dict) -> str | None:
@@ -671,6 +747,9 @@ def verify_release(manifest_bytes: bytes, signature: str, *, policy: dict, found
     _check_evidence(m, policy, host_facts.get("diff"), now, state["last_sha"])
     if ROLLBACK_FIELD in m:
         _check_rollback(m, host_facts, state, history)
+    else:
+        _check_images(m, host_facts, state)
+    _check_bound_presence(host_facts)
     if m["approver"] == "gateway":
         if m["migration_to"]:
             raise Refused("gateway cannot authorize a schema migration")
@@ -762,8 +841,28 @@ def _locked(path: Path):
 # --------------------------------------------------------------------------- production identity
 
 COMPONENTS = ("api", "worker", "reasoner")
+BOUND = COMPONENTS + ("egress",)          # what the driver builds and switches; identity and statements stay three
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 CONFIG_ID = re.compile(r"[0-9a-f]{64}")
+DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def images_ok(value) -> bool:
+    """Exactly the four bound components, each a content-addressed image ID (never a tag, never an extra key)."""
+    return (isinstance(value, dict) and set(value) == set(BOUND)
+            and all(isinstance(v, str) and IMAGE_ID.fullmatch(v) for v in value.values()))
+
+
+def digest_ok(value) -> bool:
+    return isinstance(value, str) and DIGEST.fullmatch(value) is not None
+
+
+def effective_applied(history) -> list[dict]:
+    """Releases that actually put their images on production: `applied`, and reconcile `applied` (a record failure
+    after the switch). Recovery, GC retention and the gateway's running set use this; rollback targets stay
+    `applied` only (founder rule 2026-10-19)."""
+    return [e for e in history
+            if e.get("event") == "applied" or (e.get("event") == "reconcile" and e.get("outcome") == "applied")]
 
 
 def identity_problem(observed, last_sha: str, images, configs) -> str | None:
@@ -772,8 +871,9 @@ def identity_problem(observed, last_sha: str, images, configs) -> str | None:
     configuration (command, user, privileges, capabilities, mounts, network, security options; see
     release_host.security_config) and the running COMPANY_OS_GIT_SHA (consistency only). Tags and labels are never
     identity. Anything missing, malformed or different is a problem: the same image run privileged, with the Docker
-    socket mounted or as another user is not the recorded release."""
-    if not isinstance(observed, dict) or set(observed) != set(COMPONENTS):
+    socket mounted or as another user is not the recorded release. `observed` may carry egress as well; the extra key
+    is not part of the three-component identity."""
+    if not isinstance(observed, dict) or not all(name in observed for name in COMPONENTS):
         return "production identity incomplete: api, worker and reasoner must all be observed"
     if not isinstance(images, dict) or set(images) != set(COMPONENTS):
         return "no trusted image identity is recorded for the applied release"
@@ -799,6 +899,28 @@ def _observed(observed, key: str):
     if not isinstance(observed, dict) or not all(isinstance(observed.get(n), dict) for n in COMPONENTS):
         return None
     return {n: observed[n].get(key) for n in COMPONENTS}
+
+
+def _observed_bound(observed) -> dict | None:
+    """The four bound image IDs as running now, or None. Egress is compared separately from the three-component
+    identity: adding it there would change the shape of every statement (design §3)."""
+    if not isinstance(observed, dict) or not all(isinstance(observed.get(n), dict) for n in BOUND):
+        return None
+    ids = {n: observed[n].get("image") for n in BOUND}
+    return ids if images_ok(ids) else None
+
+
+def _bound_problem(observed, bound) -> str | None:
+    """Why what runs now is not the ledger's bound set (egress included), or None when there is no bound set yet."""
+    if not images_ok(bound):
+        return None
+    current = _observed_bound(observed)
+    if current is None:
+        return "production identity incomplete: the four bound services must all be observed"
+    for name in BOUND:
+        if current[name] != bound[name]:
+            return f"{name}: running image differs from the recorded bound release (changed outside the gateway?)"
+    return None
 
 
 def _identity_after_apply(observed, sha: str) -> tuple[dict, dict]:
@@ -886,7 +1008,9 @@ def release_transaction(ledger: Path, manifest_bytes: bytes, signature: str, *, 
         state = read_ledger(ledger)
         if not state.get("last_sha"):
             raise Refused("host is not bootstrapped: a founder-signed bootstrap must establish the production baseline")
-        problem = identity_problem(observe(), state["last_sha"], state.get("images"), state.get("configs")) \
+        observed = observe()
+        problem = identity_problem(observed, state["last_sha"], state.get("images"), state.get("configs")) \
+            or _bound_problem(observed, state.get("bound_images")) \
             or history_problem(state, read_history(ledger))
         if problem:
             raise Refused(f"BLOCKED: {problem}")
@@ -894,23 +1018,37 @@ def release_transaction(ledger: Path, manifest_bytes: bytes, signature: str, *, 
         m = verify_release(manifest_bytes, signature, policy=policy, founder_key=founder_key,
                            host_facts=host_facts, state=state, now=now, history=lambda: read_history(ledger))
         digest = hashlib.sha256(manifest_bytes).hexdigest()
+        driver_sha = host_facts.get("driver_sha256") if digest_ok(host_facts.get("driver_sha256")) else None
         # pending_release_dir: the one staged directory the deploy driver will accept for this transaction (B6 step 8);
         # chosen by release_host before this write, so no other upload can claim the pending SHA.
+        # pending_images: what the driver starts, by content-addressed ID, instead of rebuilding (design §5/§7).
         _write_atomic(ledger, {**state, "pending": digest, "pending_sha": m["sha"], "pending_sequence": m["sequence"],
                                "pending_policy_version": policy["version"],
                                # the verified payload, so an `applied` reconcile records it like a normal apply
                                "pending_payload_digest": m["payload_digest"],
-                               # #192 F4: the driver holds a gateway (LOW) release to the running images.
+                               "pending_images": m["images"],
+                               "pending_inputs_digest": host_facts["inputs_digest"],
+                               **({"pending_driver_sha256": driver_sha} if driver_sha else {}),
                                "pending_approver": m["approver"],
                                **({"pending_release_dir": release_dir} if release_dir else {})})
         apply(m)                                       # a failure leaves `pending`: fail closed, founder reconciles
-        images, configs = _identity_after_apply(observe(), m["sha"])   # likewise: exactly this release, or pending
+        observed = observe()
+        images, configs = _identity_after_apply(observed, m["sha"])   # likewise: exactly this release, or pending
+        bound = _observed_bound(observed)
+        if bound is None or any(bound[name] != m["images"][name] for name in BOUND):
+            # Not the signed images (a driver that ignored pending_images would land here): leave `pending`.
+            raise RuntimeError("production does not run the images this release bound after apply: the api, worker, "
+                               "reasoner and egress containers do not all carry the signed image IDs")
         min_policy = max(policy["version"], state.get("min_policy_version", 1))
         _append_history(ledger, {"event": "applied", "digest": digest, "sha": m["sha"], "sequence": m["sequence"],
-                                 "payload_digest": m["payload_digest"], "images": images, "configs": configs, "policy_version": min_policy,
-                                 "at": now.isoformat()})
+                                 "payload_digest": m["payload_digest"], "images": images, "configs": configs,
+                                 "bound_images": bound, "inputs_digest": host_facts["inputs_digest"],
+                                 **({"driver_sha256": driver_sha} if driver_sha else {}),
+                                 "policy_version": min_policy, "at": now.isoformat()})
         _write_atomic(ledger, {"last_sequence": m["sequence"], "last_sha": m["sha"], "images": images,
-                               "configs": configs,
+                               "configs": configs, "bound_images": bound,
+                               "bound_inputs": host_facts["inputs_digest"],
+                               **({"bound_driver_sha256": driver_sha} if driver_sha else {}),
                                "min_policy_version": min_policy,
                                "seen": [*state.get("seen", []), digest][-1000:]})
         return m
@@ -1033,6 +1171,18 @@ def recover(ledger: Path, statement: bytes, signature: str, *, founder_key: str,
         if moved and moved[-1].get("event") == "rebase" and moved[-1].get("sha") == st["last_sha"] \
                 and isinstance(moved[-1].get("base_sha"), str) and SHA.fullmatch(moved[-1]["base_sha"]):
             state["chain_base"] = moved[-1]["base_sha"]   # nothing applied since the rebase: keep its new chain
+        # Bound images survive a recovery only when the history's own last move put them on production and they are
+        # still what runs (design §5). Anything else leaves `bound_*` absent, so the next release is founder-only.
+        moves = [e for e in history if e.get("event") in MOVES]
+        last = moves[-1] if moves else None
+        if last in effective_applied([last] if last else []) and last.get("sha") == st["last_sha"] \
+                and images_ok(last.get("bound_images")) \
+                and all(last["bound_images"][c] == st["images"][c] for c in COMPONENTS) \
+                and digest_ok(last.get("inputs_digest")):
+            state["bound_images"] = last["bound_images"]
+            state["bound_inputs"] = last["inputs_digest"]
+            if digest_ok(last.get("driver_sha256")):
+                state["bound_driver_sha256"] = last["driver_sha256"]
         _write_atomic(ledger, state)
         return state
 
@@ -1077,19 +1227,42 @@ def reconcile(ledger: Path, statement: bytes, signature: str, *, founder_key: st
             sequence = max(state.get("last_sequence", 0), state.get("pending_sequence") or 0)
         if not _int(sequence):
             raise Refused("the pending release's sequence is unknown; use a founder recovery instead")
-        problem = identity_problem(observe(), st["release_sha"], st["images"], st["configs"])
+        observed = observe()
+        problem = identity_problem(observed, st["release_sha"], st["images"], st["configs"])
         if problem:
             raise Refused(f"production does not match the reconcile statement: {problem}")
+        bound = _observed_bound(observed)
+        if st["outcome"] == "applied":
+            pending_images = state.get("pending_images")
+            if not images_ok(pending_images):
+                raise Refused("the pending release recorded no bound image IDs: use a founder recovery instead")
+            if bound != pending_images:
+                raise Refused("production does not run the images the pending release bound: that is a recovery, "
+                              "not a reconcile")
+            bound_images, bound_inputs = bound, state.get("pending_inputs_digest")
+            bound_driver = state.get("pending_driver_sha256")
+        else:
+            bound_images, bound_inputs = state.get("bound_images"), state.get("bound_inputs")
+            bound_driver = state.get("bound_driver_sha256")
+            if images_ok(bound_images) and bound != bound_images:
+                raise Refused("production's images differ from the previously bound release: that is a recovery, "
+                              "not a reconcile")
         digest = hashlib.sha256(statement).hexdigest()
+        bound_fields = ({"bound_images": bound_images, "inputs_digest": bound_inputs,
+                         **({"driver_sha256": bound_driver} if digest_ok(bound_driver) else {})}
+                        if st["outcome"] == "applied" else {})
         _append_history(ledger, {"event": "reconcile", "outcome": st["outcome"], "digest": digest,
                                  "pending_digest": pending, "sha": st["release_sha"], "sequence": sequence,
-                                 "images": st["images"], "configs": st["configs"],
+                                 "images": st["images"], "configs": st["configs"], **bound_fields,
                                  "policy_version": min_policy, "at": now.isoformat(),
                                  **({"payload_digest": state["pending_payload_digest"]}
                                     if st["outcome"] == "applied" and state.get("pending_payload_digest") else {})})
         new = {"last_sequence": sequence, "last_sha": st["release_sha"], "images": st["images"],
                "configs": st["configs"], "min_policy_version": min_policy,
-               "seen": [*state.get("seen", []), pending, digest][-1000:]}
+               "seen": [*state.get("seen", []), pending, digest][-1000:],
+               **({"bound_images": bound_images, "bound_inputs": bound_inputs,
+                   **({"bound_driver_sha256": bound_driver} if digest_ok(bound_driver) else {})}
+                  if images_ok(bound_images) and digest_ok(bound_inputs) else {})}
         if st["outcome"] != "applied" and state.get("chain_base"):
             new["chain_base"] = state["chain_base"]      # nothing ran: the next release still continues the rebase
         _write_atomic(ledger, new)
