@@ -4,6 +4,7 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "compose-bound: run as root (sudo)" >&2; exit 1; }
 exec python3 -I - "${COMPANY_OS_RELEASE_LEDGER:-/var/lib/release-host/ledger/ledger.json}" "$@" <<'PYTHON'
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -38,6 +39,29 @@ def locked(path, shared=False):
         yield
     finally:
         os.close(fd)
+
+
+# The founder's Stage C pause fence: the one Compose overlay the running company-api keeps. The deploy driver re-applies
+# it (deploy-company-os.sh FENCE_OVERLAY/FENCE_SHA256); maintenance must too, or recreating the API from the base file
+# silently drops the kill switch. Same pin as the driver, checked against ops/ by a test.
+FENCE_OVERLAY = Path("ops/company-coder-pause.compose.yml")
+FENCE_SHA256 = "e5fa3c821ecd7f4da58b24275fb65592cd2d62072b679cfdddd6504bdd88e3fa"
+
+
+def api_fence_live():
+    out = subprocess.run(["docker", "inspect", "--type", "container", "--format",
+                          "{{range .Config.Env}}{{println .}}{{end}}", "company-api"], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise ValueError("cannot read company-api, so whether its pause fence is live is unknown")
+    return "CODER_PAUSE_FENCE_ENABLED=true" in out.stdout.splitlines()
+
+
+def fence_overlay_verified():
+    for path, kind in ((FENCE_OVERLAY.parent, stat.S_ISDIR), (FENCE_OVERLAY, stat.S_ISREG)):
+        info = path.lstat()   # lstat: a symlink is neither, so it is refused
+        if not kind(info.st_mode) or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            return False
+    return hashlib.sha256(FENCE_OVERLAY.read_bytes()).hexdigest() == FENCE_SHA256
 
 
 try:
@@ -106,6 +130,16 @@ try:
         # Pin selection even when .env contains Compose control variables; service interpolation still reads .env.
         env |= {"COMPOSE_PROFILES": "", "COMPOSE_ENV_FILES": ""}
         compose = ["docker", "compose", "--env-file", ".env", "-f", "docker-compose.yml", *profiles]
+        fence = args[0] in ("up", "config") and api_fence_live()
+        if fence:
+            try:
+                verified = fence_overlay_verified()
+            except OSError:
+                verified = False
+            if not verified:
+                raise ValueError("the pause fence is live but its overlay is missing, changed or writable; refusing to "
+                                 "recreate company-api without it")
+            compose += ["-f", str(FENCE_OVERLAY)]
         if pilot:
             compose += ["-f", str(override)]
         config = json.loads(subprocess.check_output([*compose, "config", "--format", "json"], env=env))
@@ -114,6 +148,11 @@ try:
             if (services.get(name) or {}).get("image") != images[c]:
                 raise ValueError("the effective Compose configuration differs from the bound images")
         result = subprocess.run([*compose, *args], env=env)
+        if result.returncode == 0 and fence and args[0] == "up":
+            live = subprocess.run(["docker", "exec", "company-api", "printenv", "CODER_PAUSE_FENCE_ENABLED"],
+                                  capture_output=True, text=True)
+            if live.stdout.strip() != "true":
+                raise ValueError("the pause fence is not live on company-api after up; restore it before anything else")
         sys.exit(result.returncode)
 except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as error:
     print("compose-bound: " + (str(error) if isinstance(error, ValueError) else "evidence unavailable"), file=sys.stderr)

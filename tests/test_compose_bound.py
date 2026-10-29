@@ -13,6 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+FENCE = ROOT / "ops/company-coder-pause.compose.yml"
 PILOT = {"services": {"company-worker": {"environment": {"ENABLE_AUTONOMOUS_CODE_WRITE": "true"}}}}
 
 
@@ -29,6 +30,16 @@ def maintenance():
         docker.write_text(f"#!{sys.executable}\n" + '''import json, os, sys, time
 from pathlib import Path
 root = Path(os.environ['MAINTENANCE_TEST'])
+if sys.argv[1] in ('inspect', 'exec'):   # reads of the running company-api; logged apart from Compose calls
+    with (root/'reads').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')
+    fence = (root/'api-fence').read_text().strip() if (root/'api-fence').exists() else ''
+    if (root/'api-missing').exists(): sys.exit(1)
+    if sys.argv[1] == 'inspect':
+        print('PATH=/usr/bin' + (f'\\nCODER_PAUSE_FENCE_ENABLED={fence}' if fence else ''))
+    else:
+        live = (root/'api-fence-after').read_text().strip() if (root/'api-fence-after').exists() else fence
+        print(live)
+    sys.exit(0)
 with (root/'calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')
 if 'config' in sys.argv:
     names = ('company-api','company-worker','company-reasoner','company-reasoner-egress')
@@ -37,6 +48,9 @@ if 'config' in sys.argv:
                 for n,c in zip(names,components)}
     files = [sys.argv[i+1] for i, a in enumerate(sys.argv) if a == '-f']
     for extra in files[1:]:          # JSON is YAML: each later file merges per service, environment per key
+        if extra.endswith('company-coder-pause.compose.yml'):   # the reviewed YAML overlay: the API's fence only
+            services['company-api']['environment']['CODER_PAUSE_FENCE_ENABLED'] = 'true'
+            continue
         for name, svc in json.loads(Path(extra).read_text()).get('services', {}).items():
             merged = services.setdefault(name, {})
             for key, value in svc.items():
@@ -60,6 +74,9 @@ if 'up' in sys.argv:
         script = root / "compose-bound.sh"
         script.write_text((ROOT / "scripts/compose-bound.sh").read_text().replace(
             'Path("/root/stage-c-pilot.compose.yml")', f'Path({str(override)!r})'))
+        (root / "ops").mkdir(mode=0o755)
+        (root / "ops/company-coder-pause.compose.yml").write_bytes(FENCE.read_bytes())
+        (root / "ops/company-coder-pause.compose.yml").chmod(0o644)
         for name in ("docker-compose.yml", ".env"):     # the host's working copy; compose-bound runs from it
             (root / name).write_text("{}\n" if name.endswith(".yml") else "POSTGRES_DB=company\n")
             (root / name).chmod(0o644)
@@ -213,3 +230,65 @@ def test_arming_refuses_a_compose_file_or_env_another_user_could_write(maintenan
     result = command(env, "--stage-c-pilot", "up", "-d", "--no-deps", "company-worker")
     assert result.returncode != 0 and "untrusted" in result.stderr
     assert not (root / "calls").exists()
+
+
+def _pinned(text):
+    return next(line.split("=", 1)[1].strip().strip('"') for line in text.splitlines()
+                if line.strip().startswith(("FENCE_SHA256=", "FENCE_SHA256 =")))
+
+
+def test_the_fence_pin_matches_the_reviewed_overlay_and_the_deploy_driver():
+    import hashlib
+    sha = hashlib.sha256(FENCE.read_bytes()).hexdigest()
+    assert _pinned((ROOT / "scripts/compose-bound.sh").read_text()) == sha
+    assert _pinned((ROOT / "scripts/deploy-company-os.sh").read_text()) == sha
+
+
+def test_a_live_pause_fence_is_kept_when_maintenance_recreates_the_api(maintenance):
+    """The running API carries the founder's pause fence (ops/company-coder-pause.compose.yml). Recreating it from the
+    base file alone (e.g. rotate-postgres-password: up company-api company-worker) silently dropped the kill switch."""
+    root, env = maintenance
+    (root / "api-fence").write_text("true")
+    result = command(env, "up", "-d", "--no-deps", "--no-build", "company-api", "company-worker")
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+    for call in calls:
+        assert call[call.index("-f", call.index("docker-compose.yml")) + 1] == "ops/company-coder-pause.compose.yml"
+
+
+def test_without_a_live_fence_the_overlay_is_not_added(maintenance):
+    root, env = maintenance
+    assert command(env, "up", "-d", "--no-deps", "--no-build", "company-api").returncode == 0
+    assert all("ops/company-coder-pause.compose.yml" not in json.loads(line)
+               for line in (root / "calls").read_text().splitlines())
+
+
+@pytest.mark.parametrize("damage", ["edited", "writable", "missing"])
+def test_a_live_fence_with_an_unverified_overlay_is_refused_before_compose(maintenance, damage):
+    root, env = maintenance
+    (root / "api-fence").write_text("true")
+    overlay = root / "ops/company-coder-pause.compose.yml"
+    if damage == "edited":
+        overlay.write_text(overlay.read_text() + "\n# changed\n")
+    elif damage == "writable":
+        overlay.chmod(0o666)
+    else:
+        overlay.unlink()
+    result = command(env, "up", "-d", "--no-deps", "--no-build", "company-api")
+    assert result.returncode != 0 and "pause fence" in result.stderr
+    assert not (root / "calls").exists()
+
+
+def test_an_unreadable_api_refuses_rather_than_guessing_the_fence(maintenance):
+    root, env = maintenance
+    (root / "api-missing").touch()
+    assert command(env, "up", "-d", "--no-deps", "--no-build", "company-worker").returncode != 0
+    assert not (root / "calls").exists()
+
+
+def test_a_fence_that_is_not_live_after_up_fails_the_command(maintenance):
+    root, env = maintenance
+    (root / "api-fence").write_text("true")
+    (root / "api-fence-after").write_text("")
+    result = command(env, "up", "-d", "--no-deps", "--no-build", "company-api")
+    assert result.returncode != 0 and "pause fence" in result.stderr
