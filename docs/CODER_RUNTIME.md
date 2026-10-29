@@ -262,8 +262,28 @@ Offline checks have no PostgreSQL URL and skip the disposable-DB concurrency tes
 the existing GitHub CI runs those as required checks before READY_TO_MERGE.
 
 `ENABLE_AUTONOMOUS_CODE_WRITE` is still hard-coded false in compose. After host acceptance,
-an explicitly approved compose override may set it true for one attended pilot; changing
+an explicitly approved compose override may set it true for one bounded pilot; changing
 `.env` alone cannot enable it. Guardian remains `enabled: false`.
+
+The supported arming path is `scripts/compose-bound.sh --stage-c-pilot up -d --no-deps company-worker`,
+run as root from `/opt/company-os`, only after founder approval and acceptance for the exact deployed SHA.
+Before arming, the founder creates `/root/stage-c-pilot.compose.yml` as a regular root-owned file, with no
+group/other write permission, containing exactly this JSON (also valid YAML):
+
+```json
+{"services":{"company-worker":{"environment":{"ENABLE_AUTONOMOUS_CODE_WRITE":"true"}}}}
+```
+
+No other service, image, credential, command or setting is allowed in that file. The helper checks the same
+four ledger-bound images it executes, holds the install/build locks, and prevents builds/pulls. It refuses
+`COMPOSE_FILE`, `COMPOSE_PROFILES` and `COMPOSE_ENV_FILES` environment overrides; use its explicit `--profile`
+option for ordinary maintenance. The pilot flag accepts only the exact worker-only command above.
+Before T0, record the unchanged worker SHA/image, fresh readiness, authorization scope/expiry/run budget,
+zero competing eligible writes, and the event-log baseline. A workflow approval/re-run, task correction,
+permission change or manual recovery during T0–T1 is human intervention, never unattended success.
+At abort/completion, revoke the standing authorization, drain/stop new work, then use the ordinary
+`scripts/compose-bound.sh up -d --no-deps company-worker` to restore the hard-coded OFF flag and verify it.
+Arming and disarming recreate the worker and require their own explicit founder authorization.
 
 Every worker tick tracks already-published Stage C tasks, including when writes are OFF.
 It calls `stage_c_ci.ingest` (same PR, at most two CI repairs, normal daily/retry gates),

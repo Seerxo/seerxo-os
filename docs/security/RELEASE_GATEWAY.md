@@ -374,9 +374,13 @@ provided. A schema-neutral release skips Alembic upgrade entirely.
 Release acceptance still requires a real disposable Docker/PostgreSQL recovery drill for the exact candidate
 and installed image-store behavior. The fake-host acceptance suite proves control flow; it is not this drill.
 
-The hosted CI engine rehearsal (`tests/test_release_recovery_docker.py`) executes the production prepare and
-restore helpers with four disposable test images, verifies real image/configuration restoration and service
-health, and restores the PostgreSQL dump into a separate disposable database. It also refuses schema drift and
-attempted migration. It runs only on ephemeral hosted runners, with no host mounts or public ports. This proves
-the engine mechanisms; it does not exercise the production application's provider health checks, install a
-release, or replace the final candidate-image and production-host acceptance.
+The hosted CI engine rehearsal (`tests/test_release_recovery_docker.py`) executes the production prepare,
+forward Compose switch, rollback handler/core, source/cron restore and interrupted-journal recovery paths with
+four disposable test images. It injects partial Compose and cron-install failures, verifies all four previous
+image/configuration identities and schema, and restores the PostgreSQL dump into a separate disposable database.
+It also refuses schema drift and attempted migration. Nested switch/cron failures explicitly invoke rollback;
+Bash's top-level ERR trap alone does not inherit into those functions.
+The drill runs only on ephemeral hosted runners, with no host mounts or public ports. Provider health and host
+CLI installation are explicit fixtures: it does not execute the whole signed host apply transaction, the
+production application's health checks, or a production release. A passing exact-candidate hosted run is required;
+the test's existence does not replace candidate-image and production-host acceptance.

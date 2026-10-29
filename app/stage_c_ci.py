@@ -12,7 +12,8 @@ read from GitHub (`gh_facts`); `ingest` decides one step:
 
 Only CI for the exact commit the control plane published counts (evidence `commit` from
 `publish()`): a PR head that moved means someone else pushed, and nothing is concluded.
-Pending, cancelled or incomplete results leave the stage unchanged; unknown is never success.
+Pending or incomplete results leave the stage unchanged; finished runs needing human action
+wait only a bounded time before blocking. Unknown is never success.
 Merging stays the founder's. A merge is recorded only as the founder's act, from evidence:
 GitHub's merged_by is `founder_login`, the PR is not a draft, it merged into the tracked
 branch, and its head is the published commit. Anything else (another login, a bot, a merge
@@ -38,8 +39,8 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 # A fork PR's workflow run that waits for the founder's "Approve and run workflows" has not run: it is pending, never a
 # failure (B-15, 2026-10-23: PR #432 was sent back to repair and its merge then refused as MERGE_UNVERIFIED).
 AWAITING_APPROVAL = "action_required"
-# Finished without a result: not the code's fault, so never a repair. A re-run may still arrive, so it waits, but only
-# for ENDED_GRACE after the task reached CI; then it blocks for the founder instead of hanging an unattended task forever.
+# Finished without a result or awaiting approval: never a repair. It waits only for ENDED_GRACE after the task reached
+# CI, then blocks for the founder instead of hanging an unattended task forever.
 # (The required workflows have no path filter or job condition, so none of these is a legitimate "nothing to test".)
 ENDED_WITHOUT_RESULT = {"cancelled", "skipped", "neutral", "stale"}
 ENDED_GRACE = timedelta(hours=6)
@@ -376,15 +377,21 @@ def ingest(db: Session, task: models.Task, facts: dict, max_repairs: int = MAX_R
     failed += [context for context in required_statuses
                if statuses.get(context) in STATUS_FAILED and context not in failed]
     awaiting = [c["name"] for c in checks if c.get("status") == "completed" and c.get("conclusion") == AWAITING_APPROVAL]
-    if awaiting and not failed:
-        return {"outcome": "WAITING", "reason": "workflow approval required: " + ", ".join(awaiting)}
     ended = {c["name"]: c["conclusion"] for c in checks
              if c.get("status") == "completed" and c.get("conclusion") in ENDED_WITHOUT_RESULT}
-    if ended and not failed:
-        why = "CI ended without a result: " + ", ".join(f"{n} {c}" for n, c in ended.items())
+    if (awaiting or ended) and not failed:
         entered = next((_timestamp(h.get("at")) for h in reversed((task.context or {}).get("improvement", {})
                                                                   .get("history", [])) if h.get("stage") == "CI"), None)
-        if entered is not None and datetime.now(timezone.utc) - entered < ENDED_GRACE:
+        within_grace = entered is not None and timedelta(0) <= datetime.now(timezone.utc) - entered < ENDED_GRACE
+    if awaiting and not failed:
+        why = "workflow approval required: " + ", ".join(awaiting)
+        if within_grace:
+            return {"outcome": "WAITING", "reason": why}
+        _block(db, task, why, {**base, "workflow_approval_required": awaiting})
+        return {"outcome": "BLOCKED", "workflow_approval_required": awaiting}
+    if ended and not failed:
+        why = "CI ended without a result: " + ", ".join(f"{n} {c}" for n, c in ended.items())
+        if within_grace:
             return {"outcome": "WAITING", "reason": f"{why}; re-run it before {(entered + ENDED_GRACE).isoformat()}"}
         _block(db, task, why, {**base, "ended_without_result": ended})
         return {"outcome": "BLOCKED", "ended_without_result": list(ended)}

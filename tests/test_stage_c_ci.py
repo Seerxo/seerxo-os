@@ -195,6 +195,51 @@ def test_a_fork_run_awaiting_workflow_approval_waits_and_is_never_a_repair():
     assert out["outcome"] == "REPAIR" and out["failed"] == [REQUIRED[0]]
 
 
+@pytest.mark.parametrize("timestamp", ["expired", "missing", "invalid", "future"])
+@pytest.mark.parametrize("conclusion", ["action_required", "cancelled"])
+def test_a_human_dependent_ci_result_needs_an_unexpired_recorded_deadline(timestamp, conclusion):
+    db, t = _task()
+    check = {"name": "test", "status": "completed", "conclusion": conclusion}
+    assert _ingest(db, t, facts(check))["outcome"] == "WAITING"
+    imp = deepcopy(t.context["improvement"])
+    if timestamp == "missing":
+        imp["history"] = [h for h in imp["history"] if h["stage"] != "CI"]
+    else:
+        at = (datetime.now(timezone.utc) - stage_c_ci.ENDED_GRACE - timedelta(minutes=1)).isoformat()
+        if timestamp == "invalid":
+            at = "unreadable"
+        elif timestamp == "future":
+            at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        imp["history"] = [h | {"at": at} if h["stage"] == "CI" else h for h in imp["history"]]
+    t.context = {**t.context, "improvement": imp}
+
+    out = _ingest(db, t, facts(check))
+
+    assert out["outcome"] == "BLOCKED"
+    assert t.status == enums.TaskStatus.BLOCKED and stage(t) == "CI"
+    assert stage_c_ci.repairs_used(t) == 0
+    event = db.scalar(select(models.AuditLog).where(models.AuditLog.action == "improvement.blocked"))
+    key = "workflow_approval_required" if conclusion == "action_required" else "ended_without_result"
+    assert event.after[key]
+    assert _ingest(db, t, facts(OK))["outcome"] == "SKIPPED"  # founder owns the blocked task
+
+
+def test_a_republished_repair_gets_its_own_ci_wait_deadline():
+    db, t = _task()
+    _ingest(db, t, facts(PENDING))
+    imp = deepcopy(t.context["improvement"])
+    old = (datetime.now(timezone.utc) - stage_c_ci.ENDED_GRACE - timedelta(minutes=1)).isoformat()
+    imp["history"] = [h | {"at": old} if h["stage"] == "CI" else h for h in imp["history"]]
+    t.context = {**t.context, "improvement": imp}
+    assert _ingest(db, t, facts(BAD))["outcome"] == "REPAIR"
+    for s in ("TESTING", "INDEPENDENT_REVIEW", "PR_OPEN"):
+        stage_c.advance(db, t, s, "stage-c-runner", {"commit": SHA, "pr": "https://github.com/o/r/pull/81"})
+    awaiting = {"name": "test", "status": "completed", "conclusion": "action_required"}
+
+    assert _ingest(db, t, facts(awaiting))["outcome"] == "WAITING"
+    assert t.status != enums.TaskStatus.BLOCKED and stage_c_ci.repairs_used(t) == 1
+
+
 @pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "neutral", "stale"])
 def test_a_run_that_ended_without_a_result_waits_a_bounded_time_then_blocks(conclusion):
     """A required run that finished cancelled/skipped/neutral/stale proves nothing. A re-run may still come, so it
