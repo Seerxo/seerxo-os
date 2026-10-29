@@ -70,6 +70,50 @@ def test_no_named_metric_is_measured_as_not_measurable():
     assert stage_c_verify.step(db, t, ok, now=T0)["outcome"] == "NOT_MEASURABLE" and stage(t) == "MEASURED"
 
 
+def _for_goal(db, t, baseline="100", target="200", window=""):
+    goal = models.Goal(title="views", metric="views", baseline=baseline, target=target,
+                       metric_selector={**SEL, "window": window})
+    db.add(goal)
+    db.flush()
+    t.goal_id = goal.id
+    return goal
+
+
+@pytest.mark.parametrize("baseline, target, later, outcome", [("100", "200", 150, "IMPROVED"),
+                                                             ("100", "50", 150, "NOT_IMPROVED")])
+def test_a_goal_task_without_a_named_metric_is_measured_on_the_goal_metric(baseline, target, later, outcome):
+    """G9: no code sets improvement.measure, so every goal-driven change ended NOT_MEASURABLE. The goal's own
+    selector and direction are used, recorded as measure_source "goal" (goal-wide, not this task's proven effect)."""
+    db, t, unit = _merged()
+    goal = _for_goal(db, t, baseline, target)
+    _observe(db, unit, 100, T0 - timedelta(hours=1))
+    ok = {"main_ci": "success", "live_contains_merge": True}
+    assert stage_c_verify.step(db, t, ok, now=T0)["outcome"] == "VERIFIED"
+    ev = t.context["improvement"]["history"][-1]["evidence"]
+    assert ev["baseline"]["value"] == 100
+    assert ev["measure"] == {"selector": {**SEL, "window": ""}, "direction": "up" if target == "200" else "down",
+                             "window_hours": 24, "measure_source": "goal", "goal_id": goal.id}
+    goal.target = "1"   # the recorded measure is judged, not one re-derived from a goal edited meanwhile
+    _observe(db, unit, later, T0 + timedelta(hours=26))
+    assert stage_c_verify.step(db, t, ok, now=T0 + timedelta(hours=27))["outcome"] == outcome
+
+
+@pytest.mark.parametrize("window, hours", [("7d", 168), ("6h", 24), ("", 24)])
+def test_a_goal_measure_waits_at_least_the_series_own_window(window, hours):
+    db, t, _ = _merged()
+    _for_goal(db, t, window=window)
+    assert stage_c_verify._goal_measure(db, t)["window_hours"] == hours
+
+
+@pytest.mark.parametrize("goal", [dict(baseline="x"), dict(target="100"), dict(window="weekly")])
+def test_an_unevaluable_goal_or_unknown_window_stays_not_measurable(goal):
+    db, t, _ = _merged()
+    _for_goal(db, t, **goal)
+    ok = {"main_ci": "success", "live_contains_merge": True}
+    assert stage_c_verify.step(db, t, ok, now=T0)["outcome"] == "VERIFIED"
+    assert stage_c_verify.step(db, t, ok, now=T0)["outcome"] == "NOT_MEASURABLE"
+
+
 @pytest.mark.parametrize("direction, later, outcome", [("up", 150, "IMPROVED"), ("up", 90, "NOT_IMPROVED"),
                                                        ("down", 90, "IMPROVED")])
 def test_a_named_metric_is_judged_on_the_first_reading_after_the_window(direction, later, outcome):
