@@ -756,6 +756,61 @@ def test_first_bound_bootstrap_recovers_old_tag_shaped_compose_and_exact_configu
     assert journal["compose_tag"] == "latest"
 
 
+def _legacy_bootstrap_candidate(host):
+    """The legacy host has a tag-shaped applied compose; the candidate supplies only literal pins."""
+    import gzip
+    from app import release_gateway as rg
+
+    v1 = running(host, release_v1(**{"docker-compose.yml": ("x-test-legacy-tags: true\nservices: {}\n", 0o644)}))
+    candidate = release_v2()
+    ids = host.prepare(candidate)
+    payload = host.sandboxed(candidate).write(host.parent / "inputs-for-bootstrap")
+    digest = rg.inputs_digest(gzip.decompress((payload / "src.tgz").read_bytes()))
+    record = {"status": "ready", "inputs_digest": digest, "bootstrap": True, "images": ids, "attempt": 1}
+    pins = {"inputs_sha256": digest, **ids}
+    compose = "x-bound-images: {" + ", ".join(k + ": '" + v + "'" for k, v in pins.items()) + "}\nservices: {}\n"
+    return v1, Release(V2, candidate.files | {"docker-compose.yml": (compose, 0o644)}), ids, digest, record
+
+
+def test_legacy_host_state_applies_the_pins_only_bootstrap_without_rebuilding(host):
+    import hashlib
+
+    v1, candidate, ids, digest, record = _legacy_bootstrap_candidate(host)
+    host.builds.mkdir(parents=True, exist_ok=True)
+    (host.builds / (digest + ".json")).write_text(json.dumps(record))
+    with (host.opt / ".env").open("a") as env_file:
+        env_file.write("COMPANY_OS_IMAGE_TAG=latest\nCOMPANY_OS_IMAGE_API=company-os-api:latest\n"
+                       "COMPANY_OS_IMAGE_WORKER=company-os-worker:latest\n"
+                       "COMPANY_OS_IMAGE_REASONER=company-os-reasoner:latest\n"
+                       "COMPANY_OS_IMAGE_EGRESS=company-os-egress:latest\n")
+    bootstrapped(host, pending(V2, next_dir(host, V2)))
+
+    result = host.deploy(candidate, staged=True, automatic="true",
+                         ACK_COMPOSE=hashlib.sha256(v1.files["docker-compose.yml"][0]).hexdigest()[:12])
+
+    assert result.returncode == 0 and "RELEASE VERIFIED: " + V2 in result.stdout, result.stdout
+    assert running_binding(host) == ids
+    assert not re.search(r"^build ", host.log.read_text(), re.M)
+
+
+def test_legacy_host_refuses_bootstrap_pins_not_matching_the_ready_build_record(host):
+    import hashlib
+
+    v1, candidate, _, digest, record = _legacy_bootstrap_candidate(host)
+    record["images"] = dict(record["images"], api="sha256:" + "f" * 64)
+    host.builds.mkdir(parents=True, exist_ok=True)
+    (host.builds / (digest + ".json")).write_text(json.dumps(record))
+    before = snapshot(host)
+    bootstrapped(host, pending(V2, next_dir(host, V2)))
+
+    result = host.deploy(candidate, staged=True, automatic="true",
+                         ACK_COMPOSE=hashlib.sha256(v1.files["docker-compose.yml"][0]).hexdigest()[:12])
+
+    assert result.returncode != 0 and "not bound to a root-written ready bootstrap build record" in result.stdout
+    assert {name: container[0] for name, container in host.containers().items()} == before[1]
+    assert not re.search(r"^build ", host.log.read_text(), re.M)
+
+
 def test_dotenv_cannot_replace_bound_image_authority(host):
     gateway_host(host)
     v2 = release_v2()
