@@ -6,7 +6,9 @@ driver's rollback-<S> images (its coolify.managed label check never works), so a
 had no images to go back to.
 """
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -102,12 +104,12 @@ def test_the_verified_fence_is_kept_and_everything_else_keeps_the_ack_path(overr
 # Compose does, so a test can assert both the check and the calls that survive it.
 RESOLVER = '''
 import json, os
-tag = os.environ.get("COMPANY_OS_IMAGE_TAG", "latest")
+tag = os.environ.get("COMPANY_OS_IMAGE_TAG", "")
 want = [("company-api", "COMPANY_OS_IMAGE_API", "company-os-api"),
         ("company-worker", "COMPANY_OS_IMAGE_WORKER", "company-os-worker"),
         ("company-reasoner", "COMPANY_OS_IMAGE_REASONER", "company-os-reasoner"),
         ("company-reasoner-egress", "COMPANY_OS_IMAGE_EGRESS", "company-os-egress")]
-print(json.dumps({"services": {name: {"image": os.environ.get(var) or repo + ":" + tag}
+print(json.dumps({"services": {name: {"image": os.environ.get(var) or (repo + ":" + tag if tag else None)}
                                for name, var, repo in want}}))
 '''
 
@@ -137,7 +139,11 @@ def compose_calls(tmp_path, keep, ok=True, bound=True):
     fns = "\n".join(fn(n) for n in ("compose_env", "compose_check", "compose_bound", "run_compose", "up_services"))
     env = ""
     if bound:
-        env = (f'BOUND=yes BOUND_API="{BOUND_IDS["api"]}" BOUND_WORKER="{BOUND_IDS["worker"]}" '
+        # Simulate hostile .env values: compose_env must replace them with the verified IDs.
+        env = (f'COMPANY_OS_IMAGE_TAG=latest COMPANY_OS_IMAGE_API=company-os-api:latest '
+               f'COMPANY_OS_IMAGE_WORKER=company-os-worker:latest '
+               f'COMPANY_OS_IMAGE_REASONER=company-os-reasoner:latest COMPANY_OS_IMAGE_EGRESS=company-os-egress:latest '
+               f'BOUND=yes BOUND_API="{BOUND_IDS["api"]}" BOUND_WORKER="{BOUND_IDS["worker"]}" '
                f'BOUND_REASONER="{BOUND_IDS["reasoner"]}" BOUND_EGRESS="{BOUND_IDS["egress"]}"\n')
     script = fns + f'''FENCE_OVERLAY=/fence.yml; FENCE_KEEP={keep}
 fence_verified() {{ return {0 if ok else 1}; }}
@@ -162,7 +168,61 @@ def test_up_services_without_the_fence_is_unchanged(tmp_path):
     legacy = tmp_path / "legacy"
     legacy.mkdir()
     assert compose_calls(tmp_path, "no") == (0, expected)                 # bound: the four IDs on the command line
-    assert compose_calls(legacy, "no", bound=False) == (0, expected)      # tag-shaped legacy host
+    assert compose_calls(legacy, "no", bound=False) == (0, expected)      # pre-ledger, tag-shaped legacy host
+
+
+def test_m_bootstrap_compose_resolves_only_its_literal_signed_pins(tmp_path):
+    if shutil.which("docker-compose"):
+        command = ["docker-compose"]
+    elif shutil.which("docker"):
+        command = ["docker", "compose"]
+    else:
+        pytest.skip("Docker Compose CLI unavailable")
+    ids = {name: "sha256:" + letter * 64 for name, letter in
+           (("api", "a"), ("worker", "b"), ("reasoner", "c"), ("egress", "d"))}
+    compose = tmp_path / "pins-only.yml"
+    compose.write_text("x-bound-images: {inputs_sha256: '" + "f" * 64 + "', " +
+                       ", ".join(f"{name}: '{image}'" for name, image in ids.items()) + "}\nservices:\n" +
+                       "  company-api: {image: '" + ids["api"] + "'}\n" +
+                       "  company-worker:\n    image: '" + ids["worker"] + "'\n    environment:\n      WORKER_IMAGE: '" + ids["worker"] + "'\n" +
+                       "  company-reasoner: {image: '" + ids["reasoner"] + "'}\n" +
+                       "  company-reasoner-egress: {image: '" + ids["egress"] + "'}\n")
+    (tmp_path / ".env").write_text("COMPANY_OS_IMAGE_TAG=latest\n" +
+                                   "\n".join(f"COMPANY_OS_IMAGE_{name.upper()}=company-os-{name}:latest"
+                                             for name in ids) + "\n")
+    env = {k: v for k, v in os.environ.items() if k not in {
+        "COMPANY_OS_IMAGE_API", "COMPANY_OS_IMAGE_WORKER", "COMPANY_OS_IMAGE_REASONER", "COMPANY_OS_IMAGE_EGRESS"}}
+    env |= {"SHA": "latest", "COMPANY_OS_IMAGE_TAG": "latest",
+                        "COMPANY_OS_IMAGE_API": "company-os-api:latest",
+                        "COMPANY_OS_IMAGE_WORKER": "company-os-worker:latest",
+                        "COMPANY_OS_IMAGE_REASONER": "company-os-reasoner:latest",
+                        "COMPANY_OS_IMAGE_EGRESS": "company-os-egress:latest"}
+    result = subprocess.run(command + ["--project-directory", str(tmp_path), "-f", str(compose),
+                                       "config", "--format", "json"],
+                            cwd=ROOT, env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+    expected = {"company-api": ids["api"], "company-worker": ids["worker"],
+                "company-reasoner": ids["reasoner"], "company-reasoner-egress": ids["egress"]}
+    assert {name: services[name]["image"] for name in expected} == expected
+    assert services["company-worker"]["environment"]["WORKER_IMAGE"] == ids["worker"]
+
+
+def test_main_compose_rejects_unbound_images_even_when_sha_is_latest():
+    if shutil.which("docker-compose"):
+        command = ["docker-compose"]
+    elif shutil.which("docker"):
+        command = ["docker", "compose"]
+    else:
+        pytest.skip("Docker Compose CLI unavailable")
+    env = {k: v for k, v in os.environ.items() if k not in {
+        "COMPANY_OS_IMAGE_API", "COMPANY_OS_IMAGE_WORKER", "COMPANY_OS_IMAGE_REASONER", "COMPANY_OS_IMAGE_EGRESS"}}
+    env |= {"SHA": "latest", "COMPANY_OS_IMAGE_TAG": "latest",
+                        "POSTGRES_PASSWORD": "test-only", "CLOUDFLARE_TUNNEL_TOKEN": "test-only"}
+    result = subprocess.run(command + ["-f", str(ROOT / "docker-compose.yml"), "config", "--format", "json"],
+                            cwd=ROOT, env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "bound image ID required" in result.stderr
 
 
 def test_a_fence_changed_mid_deploy_is_never_applied(tmp_path):
