@@ -14,9 +14,10 @@ write no SSH material and invoke no deploy driver. A successful dispatch release
   it grants no production migration authority.
 - `ci-gate` still checks every required workflow and any configured trusted-publisher statuses
   for the exact commit. Missing, pending, failed, spoofed or other-commit evidence refuses readiness.
-- These manual jobs still name the legacy self-hosted runner. Keep the workflow disabled during
-  [B6 cutover](../security/LEGACY_DEPLOY_CUTOVER.md), before retiring that runner. This source change
-  does not disable the workflow, revoke a key, delete GitHub secrets, or remove runner registrations.
+- These manual jobs still name a self-hosted runner. Their live enablement and removal are private
+  release operations; this public source file does not prove host or runner state. Complete the
+  separately authorized cutover before changing those registrations. A source change does not
+  disable a workflow, revoke a key, delete GitHub secrets, or remove runner registrations.
 - Production releases use the root-owned installed `release_host` outside the deploy payload.
   It checks the signed policy, manifest, independent review, payload, production identity and ledger
   before applying. HIGH changes and migrations require the founder's signature. See
