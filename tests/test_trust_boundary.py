@@ -108,6 +108,17 @@ def test_backend_database_is_disposable_loopback_and_bounded():
     assert '"$GITHUB_ENV"' in wait["run"]
 
 
+def test_real_release_recovery_runs_on_pr_and_main_ci():
+    _, workflow, triggers = load(ROOT / ".github/workflows/python-tests.yml")
+    assert triggers == {"pull_request": {"branches": ["main"]}, "push": {"branches": ["main"]}}
+    job = workflow["jobs"]["python-tests"]
+    rehearsal = next((step for step in job["steps"]
+                      if step.get("run") == "python -u -m pytest -q -s tests/test_release_recovery_docker.py"), None)
+    assert rehearsal is not None
+    assert "if" not in rehearsal
+    assert rehearsal["env"]["SEERXO_REAL_RECOVERY"] == "1"
+
+
 def test_ci_has_no_provider_action_dependency():
     assert not (ROOT / ".github/actionlint.yaml").exists(), "custom runner labels are no longer needed"
     for path in WORKFLOWS:
