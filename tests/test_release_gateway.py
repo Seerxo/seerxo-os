@@ -1173,6 +1173,8 @@ def test_a_rollback_needs_the_founder_and_the_reviewer(keys, policy):
     ("not a previously applied release", lambda: [applied_event(event="reconcile", outcome="applied")]),
     ("payload differs", lambda: [applied_event(payload_digest="e" * 64)]),                  # same name, other tree
     ("no recorded payload", lambda: [{k: v for k, v in applied_event().items() if k != "payload_digest"}]),
+    ("container configuration differs", lambda: [{k: v for k, v in applied_event().items() if k != "configs"}]),
+    ("container configuration differs", lambda: [applied_event(configs={**configs(), "api": "f" * 64})]),
     ("no bound image", lambda: [{k: v for k, v in applied_event().items() if k != "bound_images"}]),
     ("no bound image", lambda: [applied_event(bound_images={"api": bound(OTHER)["api"]})]),
     ("no bound image", lambda: [applied_event(bound_images={c: "company-os-api:latest" for c in rg.BOUND})]),
