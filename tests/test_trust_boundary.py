@@ -110,11 +110,12 @@ def test_backend_database_is_disposable_loopback_and_bounded():
 
 def test_real_release_recovery_runs_on_pr_and_main_ci():
     _, workflow, triggers = load(ROOT / ".github/workflows/python-tests.yml")
-    assert set(triggers) == {"pull_request", "push"}
+    assert triggers == {"pull_request": {"branches": ["main"]}, "push": {"branches": ["main"]}}
     job = workflow["jobs"]["python-tests"]
     rehearsal = next((step for step in job["steps"]
                       if step.get("run") == "python -u -m pytest -q -s tests/test_release_recovery_docker.py"), None)
     assert rehearsal is not None
+    assert "if" not in rehearsal
     assert rehearsal["env"]["SEERXO_REAL_RECOVERY"] == "1"
 
 
