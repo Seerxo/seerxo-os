@@ -1,22 +1,17 @@
-# PERMANENT FACTS
+# Permanent facts
 
-Settled facts about your organisation that agents must not re-ask or re-decide. The Founder Desk shows
-this file in its Memory view (`GET /desk/memory`), and it is part of the release payload.
+This file contains only stable, founder-confirmed facts. Binding rules live in the
+[constitution](../CLAUDE.md) and [Git workflow](GIT_WORKFLOW.md). Dated or mutable
+execution state belongs in [`operations/ACTIVE_WORK.md`](operations/ACTIVE_WORK.md);
+founder decisions and their status belong in [`operations/DECISIONS.md`](operations/DECISIONS.md).
+Never store secrets, credentials, personal data, pending CI, mutable SHAs, or unverified
+production claims here.
 
-Replace the examples below with your own. Never put a secret, an address or personal data here:
-record *which* provider or service is used, not how to reach it.
+## FACT-01 · Repository responsibilities
 
-## FACT-01 · Payments provider
-
-- **Fact:** subscriptions are billed through one payment provider.
-- **Consequence for agents:** read revenue only from that provider's metrics collector; never estimate it.
-
-## FACT-02 · Deploy platform
-
-- **Fact:** server-side applications are deployed by one platform on one host.
-- **Consequence for agents:** a production change goes through the release gateway; agents never deploy.
-
-## FACT-03 · Alerting channel
-
-- **Fact:** alerts go to one chat channel; empty credentials disable delivery but events are still recorded.
-- **Consequence for agents:** do not add a second alerting path without approval.
+- **Fact:** `Seerxo/seerxo-os` is the primary repository for normal Seerxo OS development
+  and CI. `Seerxo/os` retains release and migration responsibilities until the signed
+  production cutover is verified.
+- **Consequence for agents:** do not move routine engineering back to the previous private
+  self-hosted CI path. Source migration does not establish production migration. See
+  [DEC-001](operations/DECISIONS.md#dec-001-public-repository-is-the-development-path).

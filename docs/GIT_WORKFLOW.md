@@ -1,7 +1,14 @@
-# GIT WORKFLOW — SEZ Engineering Standard v1.0
+# GIT WORKFLOW — Seerxo OS
 
-Trunk-based development with one permanent branch. The repository is private and stays
-on the free GitHub plan: no GitHub Pro, no branch-protection rules, no GitFlow, no `develop`.
+This is the canonical Git and pull request policy for routine development in the public
+[`Seerxo/seerxo-os`](https://github.com/Seerxo/seerxo-os) repository. The private
+[`Seerxo/os`](https://github.com/Seerxo/os) repository retains release and migration
+responsibilities until the signed production cutover is verified. A source migration or
+merged PR does not prove production migration. See [permanent facts](PERMANENT_FACTS.md)
+and [founder decisions](operations/DECISIONS.md).
+
+Routine development and CI stay on the public repository. Do not restore the previous
+private self-hosted CI as the normal engineering path.
 
 ## 1. Branches
 
@@ -22,9 +29,24 @@ on the free GitHub plan: no GitHub Pro, no branch-protection rules, no GitFlow, 
 - Every code change goes through a PR. Direct pushes to `main` are prohibited.
 - **PR title** is a Conventional Commit subject. It is checked by `check_branch_policy.py title`.
 - **PR size:** prefer under ~400 changed lines. Split larger work into a sequence of PRs.
+- **Batch related small work:** finish related implementation and local checks, then open
+  one focused, independently reviewable PR. Related documentation corrections, fixes in
+  one component, test corrections, and supporting refactors belong together. One small fix
+  does not automatically justify one PR. Separate urgent security fixes, confirmed
+  production blockers, independent risk, or work too large for safe review. Do not combine
+  unrelated high-risk changes to reduce PR count.
 - **Review:** an independent reviewer that is not the author. Agents never approve their own work (§45).
   The reviewer result is recorded; a model result alone is not an approval.
 - A PR states what changed, the exact tests run, and what remains blocked.
+- Refresh checks on the exact current head. A prior successful run does not validate a
+  changed head.
+
+## 4A. Branch updates
+
+- Do not use GitHub's **Update branch** just because a branch is behind `main`.
+- If the branch is mergeable and repository rules allow it, leave it unchanged.
+- If an update is required, use the authorized workflow and preserve independent review.
+  A changed head invalidates earlier exact-head CI evidence; rerun required checks.
 
 ## 4. CI gates
 
@@ -59,8 +81,8 @@ on the free GitHub plan: no GitHub Pro, no branch-protection rules, no GitFlow, 
 
 - Merging to `main` does **not** deploy. Production deploys are a separate, founder-approved step
   (`scripts/deploy-company-os.sh`, §72–74). Deploy evidence is the deployed API and worker SHA.
-- Auto-merge and automatic deployment are **disabled** and stay disabled unless the founder
-  authorizes a specific, tightly scoped policy.
+- Do not enable auto-merge or automatic deployment unless the founder approves a specific,
+  tightly scoped policy. A passing CI run or merged PR is not a production deployment.
 
 ## 7. Model-driven and Stage C work
 
