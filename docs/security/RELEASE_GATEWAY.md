@@ -319,7 +319,9 @@ read the ledger or report; now 0640 with the directory's group (regression test 
   exist (a `bootstrap`, `recovery` or `reconcile` event is not evidence); that event's recorded `payload_digest`
   must equal the payload digest the host computed for the new commit (the shipped tree, DEPLOY_PATHS, is the same,
   not merely the commit name); and that event must record a well-formed image ID and configuration digest for api,
-  worker and reasoner. Any missing, malformed or different piece, or an unreadable history, refuses. Releases
+  worker and reasoner. The target's configuration digests must also equal the currently recorded production identity;
+  otherwise the release refuses and requires a founder-signed forward revert. Any missing, malformed or different
+  piece, or an unreadable history, refuses. Releases
   applied before payload digests were recorded and the bootstrap baseline cannot be rollback targets. A rollback
   also requires the target's recorded four-component `bound_images` and `inputs_digest` (including file modes and
   symlink targets), exact image equality, and no schema-head change. A target from before image binding refuses;

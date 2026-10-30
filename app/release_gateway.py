@@ -613,7 +613,8 @@ def gateway_approve(manifest: dict, policy: dict, *, now: datetime, diff: str) -
 def _check_rollback(m: dict, host_facts: dict, state: dict, history) -> None:
     """G4: a declared rollback restores exactly an earlier release from the host's own trusted history. The newest
     `applied` event for `rollback_to` must record the payload digest the host just computed for this commit (same
-    shipped tree, not merely the same commit name), the target's four bound image IDs, and the image-input digest.
+    shipped tree, not merely the same commit name), the target's four bound image IDs, image-input digest, and
+    configuration identity matching the currently recorded production release.
     Reconcile, bootstrap and recovery events are not rollback evidence (founder rule 2026-10-19). A schema change is
     a forward revert, never a rollback. `history` is a loader (read only for a rollback); without it, or with any
     piece missing or different, the rollback refuses."""
@@ -643,6 +644,9 @@ def _check_rollback(m: dict, host_facts: dict, state: dict, history) -> None:
         raise Refused("rollback refused: the manifest's images differ from the target release's bound images")
     if host_facts.get("inputs_digest") != event["inputs_digest"]:
         raise Refused("rollback refused: the commit's image inputs differ from the target release's recorded inputs")
+    if event.get("configs") != state.get("configs"):
+        raise Refused("rollback refused: target release's container configuration differs from the currently recorded "
+                      "production identity; use a founder-signed forward revert")
     if host_facts.get("migration_heads") != host_facts.get("parent_migration_heads"):
         raise Refused("rollback refused: the target release changes the Alembic schema; use a founder-signed "
                       "forward revert")
