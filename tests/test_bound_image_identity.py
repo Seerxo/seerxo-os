@@ -30,9 +30,9 @@ DUMMIES = {"POSTGRES_PASSWORD": "test-dummy", "CLOUDFLARE_TUNNEL_TOKEN": "test-d
 
 def compose_binary():
     if shutil.which("docker") and subprocess.run(["docker", "compose", "version"], capture_output=True).returncode == 0:
-        return "docker compose"
+        return "command docker compose"
     if shutil.which("docker-compose"):
-        return "docker-compose"
+        return "command docker-compose"
     return None
 
 

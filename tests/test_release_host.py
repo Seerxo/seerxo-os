@@ -565,6 +565,7 @@ def test_installed_bundle_driver_is_used_while_candidate_driver_is_only_shipped(
         "docker-compose.yml": "services: {}\n",
     })
     hw.push()
+    sh(tmp_path, "git", "-C", str(hw.hcfg.clone), "fetch", "-q", "origin")
     out = tmp_path / "legacy-bridge"
     out.mkdir()
 
@@ -586,6 +587,7 @@ def test_the_actual_installed_legacy_builder_stages_the_candidate_bootstrap_driv
     candidate = (Path(__file__).parents[1] / "scripts" / "deploy-company-os.sh").read_text()
     sha = hw.commit("bootstrap candidate", **{"scripts/deploy-company-os.sh": candidate})
     hw.push()
+    sh(tmp_path, "git", "-C", str(hw.hcfg.clone), "fetch", "-q", "origin")
     out = tmp_path / "actual-legacy-builder"
     out.mkdir()
 

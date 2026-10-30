@@ -785,6 +785,7 @@ def test_legacy_host_state_applies_the_pins_only_bootstrap_without_rebuilding(ho
                        "COMPANY_OS_IMAGE_EGRESS=company-os-egress:latest\n")
     bootstrapped(host, pending(V2, next_dir(host, V2)))
 
+    host.log.write_text("")  # Only apply is forbidden to build; the authorized prepare above must build.
     result = host.deploy(candidate, staged=True, automatic="true",
                          ACK_COMPOSE=hashlib.sha256(v1.files["docker-compose.yml"][0]).hexdigest()[:12])
 
