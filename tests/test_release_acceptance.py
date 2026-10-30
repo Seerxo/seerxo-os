@@ -794,13 +794,15 @@ def test_legacy_host_state_applies_the_pins_only_bootstrap_without_rebuilding(ho
     assert not re.search(r"^build ", host.log.read_text(), re.M)
 
 
-def test_legacy_host_refuses_bootstrap_pins_not_matching_the_ready_build_record(host):
+@pytest.mark.parametrize("record_present", [False, True])
+def test_legacy_host_refuses_bootstrap_pins_not_matching_the_ready_build_record(host, record_present):
     import hashlib
 
     v1, candidate, _, digest, record = _legacy_bootstrap_candidate(host)
     record["images"] = dict(record["images"], api="sha256:" + "f" * 64)
     host.builds.mkdir(parents=True, exist_ok=True)
-    (host.builds / (digest + ".json")).write_text(json.dumps(record))
+    if record_present:
+        (host.builds / (digest + ".json")).write_text(json.dumps(record))
     before = snapshot(host)
     bootstrapped(host, pending(V2, next_dir(host, V2)))
 
