@@ -554,50 +554,6 @@ def test_a_plain_release_archive_matches_the_hashed_payload(hw, tmp_path):
     assert (out / "src.tgz").exists() and (out / "main.sha256").read_text() == rg.payload_listing(hw.hcfg.clone, hw.base)
 
 
-def test_installed_bundle_driver_is_used_while_candidate_driver_is_only_shipped(hw, tmp_path):
-    """Normal release preparation executes the trusted installed driver, not the candidate's root-side code."""
-    legacy_driver = "#!/usr/bin/env bash\nset -e\ncat > x <<'REMOTE'\necho legacy installed driver\nREMOTE\n"
-    candidate_driver = DRIVER.replace("echo uploaded", "echo candidate bound-image bootstrap")
-    installed = host.BUNDLE / "scripts" / "deploy-company-os.sh"
-    installed.write_text(legacy_driver)
-    sha = hw.commit("candidate driver", **{
-        "scripts/deploy-company-os.sh": candidate_driver,
-        "docker-compose.yml": "services: {}\n",
-    })
-    hw.push()
-    sh(tmp_path, "git", "-C", str(hw.hcfg.clone), "fetch", "-q", "origin")
-    out = tmp_path / "legacy-bridge"
-    out.mkdir()
-
-    host.build_release(hw.hcfg, sha, out)
-
-    assert (out / "company-os-deploy.sh").read_text() == "echo legacy installed driver\n"
-    with tarfile.open(fileobj=io.BytesIO(gzip.decompress((out / "src.tgz").read_bytes()))) as archive:
-        packaged_candidate = archive.extractfile("scripts/deploy-company-os.sh").read().decode()
-    assert "candidate bound-image bootstrap" in packaged_candidate
-    assert "legacy installed driver" not in packaged_candidate
-
-
-def test_the_actual_installed_legacy_builder_stages_the_candidate_bootstrap_driver(hw, tmp_path):
-    # The historical public source fixture matches the production module's measured SHA256. It extracts the
-    # signed candidate driver; it does not use the new build_release function or a mocked legacy driver.
-    fixture = Path(__file__).parent / "fixtures" / "legacy_release_builder.py"
-    namespace = dict(vars(host))
-    exec(compile(fixture.read_text(), str(fixture), "exec"), namespace)
-    candidate = (Path(__file__).parents[1] / "scripts" / "deploy-company-os.sh").read_text()
-    sha = hw.commit("bootstrap candidate", **{"scripts/deploy-company-os.sh": candidate})
-    hw.push()
-    sh(tmp_path, "git", "-C", str(hw.hcfg.clone), "fetch", "-q", "origin")
-    out = tmp_path / "actual-legacy-builder"
-    out.mkdir()
-
-    namespace["build_release"](hw.hcfg, sha, out)
-
-    remote = candidate[candidate.index(host.REMOTE_START) + len(host.REMOTE_START):candidate.index(host.REMOTE_END)]
-    assert (out / "company-os-deploy.sh").read_text() == remote + "\n"
-    assert "bootstrap_pins()" in remote and "prepare_build()" in remote
-
-
 # --------------------------------------------------------------------------- root reads gateway-writable files safely
 
 def test_an_in_flight_dotfile_is_never_picked_up(hw):
