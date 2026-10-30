@@ -107,10 +107,20 @@ try:
     # These are the maintenance operations used by the wizard and password rotation; custom config files are refused.
     if not args or args[0] not in ("up", "rm", "config", "ps"):
         raise ValueError("supported commands: [--profile NAME] up|rm|config|ps; custom global options are refused")
+    options, targets = [], []
     if args[0] == "up":
         if any(a == "--build" or a.startswith("--pull") for a in args[1:]):
             raise ValueError("maintenance cannot build or select a pull policy")
-        args = ["up", "--no-build", "--pull", "never", *args[1:]]
+        rest = iter(args[1:])
+        for a in rest:      # split `up` options (with their values) from the service names
+            if a.startswith("-"):
+                options.append(a)
+                if a in ("-t", "--timeout", "--scale", "--wait-timeout", "--exit-code-from", "--attach", "--no-attach"):
+                    options.append(next(rest, ""))
+            else:
+                targets.append(a)
+        options = ["--no-build", "--pull", "never", *options]
+        args = ["up", *options, *targets]
     with ExitStack() as stack:
         stack.enter_context(locked(ledger.parent.parent / "install.lock", shared=True))
         stack.enter_context(locked(ledger.parent.parent / "builds" / ".lock"))
@@ -142,19 +152,32 @@ try:
             if not verified:
                 raise ValueError("the pause fence is live but its overlay is missing, changed or writable; refusing to "
                                  "recreate company-api without it")
-            compose += ["-f", str(FENCE_OVERLAY)]
+        # The overlay goes on company-api only, in its own call, as the deploy driver does: Compose labels every
+        # container it creates with its config files, and the driver accepts the fence overlay on company-api alone.
+        fenced = [*compose, "-f", str(FENCE_OVERLAY)]
+        api_up = fence and args[0] == "up" and "company-api" in targets
+        if fence and args[0] == "up" and not targets:
+            raise ValueError("the pause fence is live: name the services to recreate so company-api is handled apart")
         if pilot:
             compose += ["-f", str(override)]
         config = json.loads(subprocess.check_output([*compose, "config", "--format", "json"], env=env))
         services = config.get("services") or {}
-        if fence and ((services.get("company-api") or {}).get("environment") or {}).get(
-                "CODER_PAUSE_FENCE_ENABLED") != "true":
-            raise ValueError("the effective Compose configuration would start company-api without its pause fence")
+        if api_up:
+            api = (json.loads(subprocess.check_output([*fenced, "config", "--format", "json"], env=env))
+                   .get("services") or {}).get("company-api") or {}
+            if (api.get("environment") or {}).get("CODER_PAUSE_FENCE_ENABLED") != "true" or api.get("image") != images["api"]:
+                raise ValueError("the effective Compose configuration would start company-api without its pause fence")
         for c, name in zip(components, ("company-api", "company-worker", "company-reasoner", "company-reasoner-egress")):
             if (services.get(name) or {}).get("image") != images[c]:
                 raise ValueError("the effective Compose configuration differs from the bound images")
-        result = subprocess.run([*compose, *args], env=env)
-        if result.returncode == 0 and fence and args[0] == "up":
+        if not api_up:
+            result = subprocess.run([*compose, *args], env=env)
+        else:
+            others = [t for t in targets if t != "company-api"]
+            result = subprocess.run([*compose, "up", *options, *others], env=env) if others else None
+            if result is None or result.returncode == 0:
+                result = subprocess.run([*fenced, "up", *options, "company-api"], env=env)
+        if result.returncode == 0 and api_up:
             live = subprocess.run(["docker", "exec", "company-api", "printenv", "CODER_PAUSE_FENCE_ENABLED"],
                                   capture_output=True, text=True)
             if live.stdout.strip() != "true":

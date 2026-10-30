@@ -150,8 +150,8 @@ def test_the_pilot_override_arms_code_write_and_changes_nothing_else(maintenance
     assert result.returncode == 0, result.stderr
     calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
     override = env["COMPANY_OS_STAGE_C_PILOT_OVERRIDE"]
-    assert calls[-1][:10] == ["compose", "--env-file", ".env", "-f", "docker-compose.yml",
-                              "-f", "ops/company-coder-pause.compose.yml", "-f", override, "up"]
+    # worker only: no fence overlay on it (Compose would label the worker with it and the deploy driver would abort)
+    assert calls[-1][:8] == ["compose", "--env-file", ".env", "-f", "docker-compose.yml", "-f", override, "up"]
     assert calls[-1][calls[-1].index("--pull") + 1] == "never"
 
 
@@ -249,15 +249,36 @@ def test_the_fence_pin_matches_the_reviewed_overlay_and_the_deploy_driver():
 
 def test_a_live_pause_fence_is_kept_when_maintenance_recreates_the_api(maintenance):
     """The running API carries the founder's pause fence (ops/company-coder-pause.compose.yml). Recreating it from the
-    base file alone (e.g. rotate-postgres-password: up company-api company-worker) silently dropped the kill switch."""
+    base file alone (e.g. rotate-postgres-password: up company-api company-worker) silently dropped the kill switch.
+    Like the deploy driver, the API is recreated in its own call with the overlay; the others without it."""
     root, env = maintenance
     (root / "api-fence").write_text("true")
     result = command(env, "up", "-d", "--no-deps", "--no-build", "company-api", "company-worker")
     assert result.returncode == 0, result.stderr
-    calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
-    for call in calls:
-        assert call[call.index("-f", call.index("docker-compose.yml")) + 1] == "ops/company-coder-pause.compose.yml"
+    ups = [c for c in (json.loads(line) for line in (root / "calls").read_text().splitlines()) if "up" in c]
+    assert [c[-1] for c in ups] == ["company-worker", "company-api"]
+    assert "ops/company-coder-pause.compose.yml" not in ups[0]
+    assert ups[1][ups[1].index("-f", ups[1].index("docker-compose.yml")) + 1] == "ops/company-coder-pause.compose.yml"
 
+
+@pytest.mark.parametrize("target", ["company-worker", "company-reasoner-egress"])
+def test_other_services_are_never_labelled_with_the_api_fence(maintenance, target):
+    """Pilot review F1: a worker created with the fence overlay carries it in its compose label, and the deploy
+    driver (which exempts it on company-api only) would then abort the next automatic release."""
+    root, env = maintenance
+    (root / "api-fence").write_text("true")
+    assert command(env, "up", "-d", "--no-deps", "--no-build", target).returncode == 0
+    assert all("ops/company-coder-pause.compose.yml" not in json.loads(line)
+               for line in (root / "calls").read_text().splitlines())
+
+
+def test_with_a_live_fence_up_must_name_its_services(maintenance):
+    root, env = maintenance
+    (root / "api-fence").write_text("true")
+    result = command(env, "up", "-d", "--no-deps", "--no-build")
+    assert result.returncode != 0 and "name the services" in result.stderr
+    assert not (root / "calls").exists() or all("up" not in json.loads(line)
+                                                 for line in (root / "calls").read_text().splitlines())
 
 def test_without_a_live_fence_the_overlay_is_not_added(maintenance):
     root, env = maintenance
