@@ -1,0 +1,99 @@
+# OSV-Scanner: known vulnerabilities in the Python (requirements*.txt) and Founder Desk npm
+# (desk/package-lock.json) dependencies, on a GitHub-hosted runner (ubuntu-24.04). Runs when a dependency file changes and weekly
+# (new advisories appear for unchanged dependencies). PRs report newly introduced findings against
+# their exact base; push/scheduled/manual scans report the full baseline. Advisory: a red check is not a required gate in
+# agents/repository_guardian.yaml. No secrets, read-only token, no SARIF upload (Code Scanning is not on
+# this plan).
+name: dependency-scan
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["requirements*.txt", "desk/package.json", "desk/package-lock.json", .github/workflows/dependency-scan.yml]
+  push:
+    branches: [main]
+    paths: ["requirements*.txt", "desk/package.json", "desk/package-lock.json", .github/workflows/dependency-scan.yml]
+  schedule:
+    - cron: "17 4 * * 1"  # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-scan-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  osv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Clear previous scan evidence
+        run: rm -f "$RUNNER_TEMP/osv-old.json" "$RUNNER_TEMP/osv-new.json" "$RUNNER_TEMP/osv-results.sarif"
+      - name: Checkout PR base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git checkout --detach "$BASE_SHA"
+      - name: Scan PR base
+        if: github.event_name == 'pull_request'
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        continue-on-error: true  # findings exit 1; completion is checked before the reporter compares them
+        with:
+          scan-args: |-
+            --format=json
+            --output=/github/runner_temp/osv-old.json
+            --recursive
+            ./
+      - name: Checkout scan head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: git checkout --detach "$HEAD_SHA"
+      - name: Scan head
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=/github/runner_temp/osv-new.json
+            --recursive
+            ./
+      - name: Require completed scans
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          names = ["new", "old"] if os.environ["EVENT_NAME"] == "pull_request" else ["new"]
+          for name in names:
+              path = Path(os.environ["RUNNER_TEMP"]) / f"osv-{name}.json"
+              data = json.loads(path.read_text())
+              if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                  raise SystemExit(f"Incomplete OSV scan: {path.name}")
+          PY
+      - name: Report vulnerabilities
+        uses: google/osv-scanner-action/osv-reporter-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        with:
+          scan-args: |-
+            --new=/github/runner_temp/osv-new.json
+            ${{ github.event_name == 'pull_request' && '--old=/github/runner_temp/osv-old.json' || '' }}
+            --output=/github/runner_temp/osv-results.sarif
+            --gh-annotations=true
+            --fail-on-vuln=true
+      - name: Preserve scan evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: osv-results
+          path: |
+            ${{ runner.temp }}/osv-*.json
+            ${{ runner.temp }}/osv-results.sarif
+          retention-days: 5
+          if-no-files-found: error
