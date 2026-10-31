@@ -311,23 +311,11 @@ read the ledger or report; now 0640 with the directory's group (regression test 
   descends from the applied release (normally a revert) and goes through the full path, reviewer APPROVE of its exact
   diff plus the founder's signature whenever it touches shipped code (every shipped path is HIGH, P2-7). Pointing
   production at an older tree directly is refused for every signer (`commit does not descend`), and there is no
-  emergency bypass and no automatic rollback. A release that declares itself a rollback (founder rule, 2026-10-19)
-  carries the optional manifest field `rollback_to` (40-hex SHA of the earlier release it restores) and is verified
-  on the host, after every check above, against its own trusted history (`<ledger>.history`, read under the ledger
-  lock): it must be founder-signed (`gateway_approve` and the host both refuse a gateway-signed rollback, whatever
-  its paths); `rollback_to` must not be the release already running; the newest `applied` event for that SHA must
-  exist (a `bootstrap`, `recovery` or `reconcile` event is not evidence); that event's recorded `payload_digest`
-  must equal the payload digest the host computed for the new commit (the shipped tree, DEPLOY_PATHS, is the same,
-  not merely the commit name); and that event must record a well-formed image ID and configuration digest for api,
-  worker and reasoner. The target's configuration digests must also equal the currently recorded production identity;
-  otherwise the release refuses and requires a founder-signed forward revert. Any missing, malformed or different
-  piece, or an unreadable history, refuses. Releases
-  applied before payload digests were recorded and the bootstrap baseline cannot be rollback targets. A rollback
-  also requires the target's recorded four-component `bound_images` and `inputs_digest` (including file modes and
-  symlink targets), exact image equality, and no schema-head change. A target from before image binding refuses;
-  it cannot be made verifiable by rebuilding. A revert that does
-  not declare `rollback_to` is an ordinary forward release judged by the reviewer and the founder on its exact diff,
-  and is never reported as a verified rollback.
+  emergency bypass and no automatic rollback. A release that declares itself a rollback (optional manifest field
+  `rollback_to`) is refused for every signer (2026-10-31): configuration identity includes each release's
+  COMPANY_OS_GIT_SHA, so no earlier release's recorded configuration can equal production and a history check could
+  only refuse every real rollback. Recovery is the forward revert above; a failed deploy keeps the driver's own
+  automatic restore of the previous images.
 
 
 ## Image binding and recovery
@@ -389,19 +377,9 @@ the test's existence does not replace candidate-image and production-host accept
 
 ## Upgrading a v1 host (no binding-capable verifier yet)
 
-A host whose installed verifier predates image binding writes pending releases without images, and this driver then
-needs `x-bound-images` pins in the release's compose, which the public tree does not carry: the driver ABORTs and
-nothing changes. The binding-capable bundle cannot arrive through such a release, and `install-release-bundle.py`
-installs only an already-applied SHA. The one supported way out keeps every control:
-
-1. The founder signs a bootstrap-exception statement (namespace `seerxo-bootstrap-exception`) that binds the bundle's
-   full source SHA, the installer's original and patched sha256 (exactly one check removed: "last_sha == SHA"), the
-   bundle manifest, the ledger and history sha256, the host id and an expiry.
-2. Root verifies that signature against the policy's founder key and re-checks every bound fact on the host, fences
-   both timers, keeps a hash-anchored backup, installs with the bundle's own installer and runs the new verifier's
-   identity and history checks. Nothing is deployed; the ledger is unchanged; rollback is allowed only while the
-   ledger and history are byte-identical to the anchor.
-3. Only then: policy, rebase and the next release, each with its own founder signature and independent review.
-
-Declared rollbacks (`rollback_to`) are disabled (see `_check_rollback`): restore an earlier release with a
-founder-signed forward revert.
+A host whose installed verifier predates image binding writes pending releases without images. Such a host applies a
+release in bootstrap mode, whose expected image IDs are the `x-bound-images` pins in the release's own compose,
+checked against a root-written `bootstrap: true` ready record (`prepare --founder --bootstrap`); after that release is
+applied, `install-release-bundle.py install <applied SHA>` installs its bundle. Without pins the driver ABORTs and
+nothing changes. (The 2026-10-31 public cutover instead used a one-time founder-signed exception; it is not a
+supported procedure.)

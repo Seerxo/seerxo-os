@@ -927,7 +927,7 @@ for c in ("api", "worker", "reasoner", "egress"):
         sys.exit(3)
 print(pairs["inputs_sha256"], pairs["api"], pairs["worker"], pairs["reasoner"], pairs["egress"])
 PY
-  ) || { echo "ABORT: the bootstrap release's x-bound-images pins are absent or malformed; nothing was changed. A host still on a pre-binding (v1) verifier cannot apply a pin-less release: the founder first installs the binding-capable verifier bundle with a founder-signed bootstrap exception (docs/security/RELEASE_GATEWAY.md, 'Upgrading a v1 host'), after which pending releases carry their bound images."; return 1; }
+  ) || { echo "ABORT: the bootstrap release's x-bound-images pins are absent or malformed; nothing was changed."; return 1; }
   read -r pins_inputs BOUND_API BOUND_WORKER BOUND_REASONER BOUND_EGRESS <<< "$pins"
   inputs=$(inputs_digest "$REL/src.tgz") || { echo "ABORT: the release inputs cannot be read; nothing was changed."; return 1; }
   [ "$inputs" = "$pins_inputs" ] \

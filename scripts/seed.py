@@ -20,14 +20,10 @@ from app.db import SessionLocal
 SEEDED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def upsert(db, model, key, **fields):
-    obj = db.execute(select(model).where(model.key == key)).scalar_one_or_none()
-    if obj is None:
-        obj = model(key=key, **fields)
-        db.add(obj)
-    else:
-        for k, v in fields.items():
-            setattr(obj, k, v)
+def insert(db, model, key, **fields):
+    # Insert only: `key` is unique, so a row another writer added meanwhile makes the commit fail; nothing is updated.
+    obj = model(key=key, **fields)
+    db.add(obj)
     db.flush()
     return obj
 
@@ -48,24 +44,24 @@ def run(argv: list[str]) -> int:
                   file=sys.stderr)
             return 1
         # ---------------------------------------------------------- business units
-        saas = upsert(db, models.BusinessUnit, "demo-saas",
+        saas = insert(db, models.BusinessUnit, "demo-saas",
             name="Demo SaaS",
             description="A fictional subscription product used to demonstrate goals and metrics.",
             status=enums.BusinessUnitStatus.ACTIVE, priority=enums.Priority.P1,
             revenue_model="subscription (example)")
-        upsert(db, models.BusinessUnit, "demo-content",
+        insert(db, models.BusinessUnit, "demo-content",
             name="Demo content channel",
             description="A fictional content channel that is not started yet.",
             status=enums.BusinessUnitStatus.BACKLOG, priority=enums.Priority.P3)
 
         # ---------------------------------------------------------- projects
-        upsert(db, models.Project, "demo-api",
+        insert(db, models.Project, "demo-api",
             business_unit_id=saas.id, name="Demo API",
             status=enums.ProjectStatus.ACTIVE, priority=enums.Priority.P1,
             repository="example-org/demo-api",
             objective="A stable, measurable service.",
             current_phase="example")
-        upsert(db, models.Project, "company-os",
+        insert(db, models.Project, "company-os",
             name="Company OS", status=enums.ProjectStatus.ACTIVE, priority=enums.Priority.P1,
             repository="example-org/company-os",
             objective="Company state survives an LLM or session restart.",
@@ -75,7 +71,7 @@ def run(argv: list[str]) -> int:
         def svc(key, **kw):
             kw.setdefault("server", "example-host")
             kw.setdefault("last_verified", SEEDED_AT)
-            return upsert(db, models.Service, key, **kw)
+            return insert(db, models.Service, key, **kw)
 
         svc("demo-api", name="Demo API", purpose="Example HTTP service", business_unit_id=saas.id,
             health_url="https://api.example.invalid/health")

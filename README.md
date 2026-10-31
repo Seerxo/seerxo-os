@@ -160,7 +160,7 @@ pip install -r requirements.txt
 export DATABASE_URL="postgresql+psycopg://company:dev-only@127.0.0.1:55432/company"
 export ENVIRONMENT=development
 alembic upgrade head
-python -m scripts.seed
+python -m scripts.seed --fresh-install
 
 # 4. Run the API
 uvicorn app.main:app --host 127.0.0.1 --port 8000
