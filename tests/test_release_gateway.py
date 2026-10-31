@@ -1149,11 +1149,20 @@ def rollback(keys, policy, history, signer="founder", images=None, host=None, **
                              history=history)
 
 
-def test_a_declared_rollback_with_full_evidence_is_accepted(keys, policy):
-    # The target's own applied record names the four bound IDs, its image-input digest and its payload; what runs
-    # now is that release, and this commit is a schema-neutral change to it, so the rollback is exactly provable.
+def test_a_declared_rollback_is_disabled_even_with_full_evidence(keys, policy):
+    # The target's own applied record names the four bound IDs, its image-input digest and its payload, and it is
+    # founder-signed and reviewed: still refused, because configuration identity can never match (next test).
     events = [applied_event(), applied_event(PARENT, payload_digest="e" * 64)]
-    assert rollback(keys, policy, lambda: events)["sha"] == SHA
+    refused("declared rollback is disabled", rollback, keys, policy, lambda: events)
+    refused("declared rollback is disabled", rollback, keys, policy, None)
+
+
+def test_configuration_identity_differs_for_every_release(keys, policy):
+    # Why: the environment digest includes COMPANY_OS_GIT_SHA, which the driver sets per release, so the same
+    # container configuration from two releases never has the same identity.
+    from app.release_identity import security_config
+    info = lambda sha: {"Config": {"Env": ["A=1", f"COMPANY_OS_GIT_SHA={sha}"]}, "HostConfig": {}}
+    assert security_config(info("aaaaaaa")) != security_config(info("bbbbbbb"))
 
 
 def test_a_rollback_needs_the_founder_and_the_reviewer(keys, policy):
@@ -1165,51 +1174,8 @@ def test_a_rollback_needs_the_founder_and_the_reviewer(keys, policy):
     refused("does not approve", rollback, keys, policy, lambda: [applied_event()], evidence=evidence)
 
 
-@pytest.mark.parametrize("why,history", [
-    ("not a previously applied release", lambda: []),
-    ("not a previously applied release", lambda: [applied_event(PARENT)]),
-    ("not a previously applied release", lambda: [applied_event(event="bootstrap")]),       # baseline, not applied
-    ("not a previously applied release", lambda: [applied_event(event="reconcile")]),
-    ("not a previously applied release", lambda: [applied_event(event="reconcile", outcome="applied")]),
-    ("payload differs", lambda: [applied_event(payload_digest="e" * 64)]),                  # same name, other tree
-    ("no recorded payload", lambda: [{k: v for k, v in applied_event().items() if k != "payload_digest"}]),
-    ("container configuration differs", lambda: [{k: v for k, v in applied_event().items() if k != "configs"}]),
-    ("container configuration differs", lambda: [applied_event(configs={**configs(), "api": "f" * 64})]),
-    ("no bound image", lambda: [{k: v for k, v in applied_event().items() if k != "bound_images"}]),
-    ("no bound image", lambda: [applied_event(bound_images={"api": bound(OTHER)["api"]})]),
-    ("no bound image", lambda: [applied_event(bound_images={c: "company-os-api:latest" for c in rg.BOUND})]),
-    ("no image-input digest", lambda: [{k: v for k, v in applied_event().items() if k != "inputs_digest"}]),
-    ("no image-input digest", lambda: [applied_event(inputs_digest="x")]),
-    ("history is unavailable", None),
-])
-def test_a_rollback_without_matching_trusted_evidence_is_refused(keys, policy, why, history):
-    refused(why, rollback, keys, policy, history)
-
-
-def test_a_rollback_needs_exactly_the_targets_images_inputs_and_schema(keys, policy):
-    refused("images differ from the target release", rollback, keys, policy, lambda: [applied_event()],
-            images=bound(PARENT))
-    refused("image inputs differ", rollback, keys, policy, lambda: [applied_event()],
-            host=facts(inputs_digest="1" * 64))
-    refused("changes the Alembic schema", rollback, keys, policy, lambda: [applied_event()],
-            host=facts(migration_heads={"def456abc123"}))
-
-
-def test_a_rollback_uses_the_latest_applied_record_of_its_target(keys, policy):
-    # The same commit name applied twice: the newest record is the evidence, an older matching one is not enough.
-    events = [applied_event(), applied_event(payload_digest="e" * 64)]
-    refused("payload differs", rollback, keys, policy, lambda: events)
-
-
-def test_a_malformed_or_current_rollback_target_is_refused(keys, policy):
+def test_a_malformed_rollback_target_is_refused(keys, policy):
     refused("rollback_to", rollback, keys, policy, lambda: [applied_event()], rollback_to="main")
-    refused("already running", rollback, keys, policy, lambda: [applied_event(PARENT)], rollback_to=PARENT)
-
-
-def test_an_unreadable_history_refuses_a_rollback(keys, policy):
-    def broken():
-        raise rg.Refused("release history is unreadable; the founder must restore it")
-    refused("history is unreadable", rollback, keys, policy, broken)
 
 
 def test_an_applied_release_records_its_bound_images_for_later_rollbacks(keys, tmp_path):

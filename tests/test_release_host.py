@@ -554,6 +554,50 @@ def test_a_plain_release_archive_matches_the_hashed_payload(hw, tmp_path):
     assert (out / "src.tgz").exists() and (out / "main.sha256").read_text() == rg.payload_listing(hw.hcfg.clone, hw.base)
 
 
+def test_installed_bundle_driver_is_used_while_candidate_driver_is_only_shipped(hw, tmp_path):
+    """Normal release preparation executes the trusted installed driver, not the candidate's root-side code."""
+    legacy_driver = "#!/usr/bin/env bash\nset -e\ncat > x <<'REMOTE'\necho legacy installed driver\nREMOTE\n"
+    candidate_driver = DRIVER.replace("echo uploaded", "echo candidate bound-image bootstrap")
+    installed = host.BUNDLE / "scripts" / "deploy-company-os.sh"
+    installed.write_text(legacy_driver)
+    sha = hw.commit("candidate driver", **{
+        "scripts/deploy-company-os.sh": candidate_driver,
+        "docker-compose.yml": "services: {}\n",
+    })
+    hw.push()
+    sh(tmp_path, "git", "-C", str(hw.hcfg.clone), "fetch", "-q", "origin")
+    out = tmp_path / "legacy-bridge"
+    out.mkdir()
+
+    host.build_release(hw.hcfg, sha, out)
+
+    assert (out / "company-os-deploy.sh").read_text() == "echo legacy installed driver\n"
+    with tarfile.open(fileobj=io.BytesIO(gzip.decompress((out / "src.tgz").read_bytes()))) as archive:
+        packaged_candidate = archive.extractfile("scripts/deploy-company-os.sh").read().decode()
+    assert "candidate bound-image bootstrap" in packaged_candidate
+    assert "legacy installed driver" not in packaged_candidate
+
+
+def test_the_actual_installed_legacy_builder_stages_the_candidate_bootstrap_driver(hw, tmp_path):
+    # The historical public source fixture matches the production module's measured SHA256. It extracts the
+    # signed candidate driver; it does not use the new build_release function or a mocked legacy driver.
+    fixture = Path(__file__).parent / "fixtures" / "legacy_release_builder.py"
+    namespace = dict(vars(host))
+    exec(compile(fixture.read_text(), str(fixture), "exec"), namespace)
+    candidate = (Path(__file__).parents[1] / "scripts" / "deploy-company-os.sh").read_text()
+    sha = hw.commit("bootstrap candidate", **{"scripts/deploy-company-os.sh": candidate})
+    hw.push()
+    sh(tmp_path, "git", "-C", str(hw.hcfg.clone), "fetch", "-q", "origin")
+    out = tmp_path / "actual-legacy-builder"
+    out.mkdir()
+
+    namespace["build_release"](hw.hcfg, sha, out)
+
+    remote = candidate[candidate.index(host.REMOTE_START) + len(host.REMOTE_START):candidate.index(host.REMOTE_END)]
+    assert (out / "company-os-deploy.sh").read_text() == remote + "\n"
+    assert "bootstrap_pins()" in remote and "prepare_build()" in remote
+
+
 # --------------------------------------------------------------------------- root reads gateway-writable files safely
 
 def test_an_in_flight_dotfile_is_never_picked_up(hw):
@@ -986,7 +1030,7 @@ def _founder_release(hw, message, files, name):
     return sha
 
 
-def test_a_declared_rollback_must_equal_a_release_in_the_trusted_history(hw):
+def test_a_declared_rollback_is_refused_and_the_same_revert_ships_as_a_forward_release(hw):
     good = _founder_release(hw, "good", {"app/main.py": "x = 2\n"}, "good")
     bad = _founder_release(hw, "bad", {"app/main.py": "x = 666\n"}, "bad")
     sh(hw.work, "git", "revert", "--no-edit", bad)
@@ -996,36 +1040,16 @@ def test_a_declared_rollback_must_equal_a_release_in_the_trusted_history(hw):
     draft = _draft(hw)
     assert draft["sha"] == revert and draft["payload_digest"] == rg.payload_digest(rg.payload_listing(hw.work, good))
 
-    # A target that was never applied through the gateway (the bootstrap-era base) is not trusted evidence.
-    _founder_inbox(hw, {**draft, "rollback_to": hw.base}, name="base")
+    # Founder-signed, reviewed, exact payload of an applied release: a declared rollback is still refused.
+    _founder_inbox(hw, {**draft, "rollback_to": good}, name="declared")
     out = step(hw)
-    assert out["outcome"] == "REJECTED" and "not a previously applied release" in out["reason"] and len(hw.runs) == 2
+    assert out["outcome"] == "REJECTED" and "declared rollback is disabled" in out["reason"] and len(hw.runs) == 2
 
-    # The gateway can never sign a rollback, even one whose evidence matches.
-    _founder_inbox(hw, {**draft, "rollback_to": good, "approver": "gateway"}, signer="gateway", name="gw")
-    out = step(hw)
-    assert out["outcome"] == "REJECTED" and "rollback needs the founder" in out["reason"]
-
-    # Missing evidence: the target's recorded payload digest is gone from the history.
-    path = rg.history_path(hw.hcfg.ledger)
-    original = path.read_bytes()
-    events = rg.read_history(hw.hcfg.ledger)
-    path.write_bytes(b"".join(rg.canonical({k: v for k, v in e.items() if not (e["sha"] == good and k ==
-                                                                               "payload_digest")}) + b"\n"
-                              for e in events))
-    _founder_inbox(hw, {**draft, "rollback_to": good}, name="nodigest")
-    out = step(hw)
-    assert out["outcome"] == "REJECTED" and "no recorded payload" in out["reason"] and len(hw.runs) == 2
-    path.write_bytes(original)
-
-    # Founder-signed, reviewer APPROVE, target applied before and the revert ships exactly its payload: the
-    # recorded image identity (four IDs) and image inputs now let the host prove the rollback and apply it.
-    _founder_inbox(hw, {**draft, "rollback_to": good}, name="ok")
+    # The recovery path: the same revert without rollback_to is the next founder-signed release.
+    _founder_inbox(hw, draft, name="forward")
     out = step(hw)
     assert out == {"outcome": "APPLIED", "sha": revert, "sequence": draft["sequence"], "approver": "founder"}, out
-    ledger = json.loads(hw.hcfg.ledger.read_text())
-    assert ledger["last_sha"] == revert and ledger["bound_images"] == draft["images"]
-    assert ledger["bound_inputs"] == hw.inputs_of(revert)
+    assert hw.prod.running["api"]["image"] == bound_for_inputs(hw.inputs_of(good))["api"]
 
 
 def test_a_revert_can_also_arrive_as_an_ordinary_forward_release(hw):
@@ -1042,20 +1066,6 @@ def test_a_revert_can_also_arrive_as_an_ordinary_forward_release(hw):
     out = step(hw)
     assert out["outcome"] == "APPLIED" and out["sha"] == revert and out["approver"] == "founder", out
     assert hw.prod.running["api"]["image"] == bound_for_inputs(hw.inputs_of(good))["api"]
-
-
-def test_a_declared_rollback_whose_tree_differs_from_the_target_is_refused(hw):
-    good = _founder_release(hw, "good", {"app/main.py": "x = 2\n"}, "good")
-    _founder_release(hw, "bad", {"app/main.py": "x = 666\n"}, "bad")
-    # Same intent, other content: "back to good" but with one more shipped change. Same commit name, other tree.
-    impostor = hw.commit("revert bad", **{"app/main.py": "x = 2\n", "app/extra.py": "y = 2\n"})
-    hw.push()
-    assert hw.tick()["outcome"] == "FOUNDER_REQUIRED"
-    draft = _draft(hw)
-    assert draft["sha"] == impostor
-    _founder_inbox(hw, {**draft, "rollback_to": good}, name="impostor")
-    out = step(hw)
-    assert out["outcome"] == "REJECTED" and "payload differs" in out["reason"] and len(hw.runs) == 2
 
 
 SET_LIKE_KEYS = ["Binds", "CapAdd", "CapDrop", "DeviceCgroupRules", "DeviceRequests", "Devices", "Dns",

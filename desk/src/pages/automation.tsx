@@ -116,7 +116,7 @@ export function AutomationPage() {
   return <>
     <PageHeader title="Automation" description="What runs by itself, and the one switch that stops it."><KillSwitch /></PageHeader>
     <FigureStrip label="Automation at a glance" items={[
-      { label: "On schedule", value: `${count("success")} of ${loops.length}`, sub: "loops with fresh evidence" },
+      { label: "On schedule", value: `${count("success") + count("info")} of ${loops.length}`, sub: "loops with fresh evidence" },
       { label: "Need attention", value: String(count("warning") + count("danger")), tone: count("danger") ? "danger" : count("warning") ? "warning" : undefined,
         sub: count("warning") + count("danger") ? "late, failing or unproven" : "nothing late" },
       { label: "No evidence", value: String(count("neutral")), sub: "not reported yet, never assumed healthy" },
@@ -135,9 +135,7 @@ export function AutomationPage() {
             { head: "Last evidence", className: "num text-sm", cell: l => <span title={l.last ? when(l.last) : undefined}>{l.last ? `${ago(l.last)} ago` : <Muted>—</Muted>}</span> },
           ]}
           aside={{ head: "State", cell: l => l.state }} />
-        // Only proven-healthy loops fold: "info" (a reconciler run in progress, or completed with per-goal outcome
-        // unknown) is not health and stays in view (#188).
-        const fine = loops.filter(l => l.tone === "success"), watch = loops.filter(l => !fine.includes(l))
+        const fine = loops.filter(l => l.tone === "success" || l.tone === "info"), watch = loops.filter(l => !fine.includes(l))
         return <div className="grid min-w-0 gap-3">
           {watch.length > 0 ? table(watch, "Loops needing attention") : <p className="text-sm text-muted-foreground">Every loop is on schedule.</p>}
           {fine.length > 0 && <Expandable summary={<span className="text-[13px]"><span className="font-medium">{fine.length} {fine.length === 1 ? "loop" : "loops"} on schedule</span>
@@ -209,7 +207,7 @@ function Intervention({ loops }: { loops: { name: string; tone: Tone }[] }) {
     { key: "blocked", title: "Blocked tasks", meta: "cannot continue on their own", n: blocked, tone: "danger", go: () => go("tasks", "attention") },
     { key: "approval", title: "Waiting for your approval", meta: "approval records and tasks stopped for a decision", n: awaiting, tone: "warning", go: () => go("approvals") },
     { key: "providers", title: "Providers cooling down", meta: cooling.length ? cooling.join(", ") : "quota or rate limit", n: cooling.length, tone: "warning", go: () => go("agents") },
-    { key: "loops", title: "Loops late or failing", meta: late.length ? late.map(l => l.name).join(", ") : "none late or failing", n: late.length, tone: "warning", go: () => go("automation") },
+    { key: "loops", title: "Loops late or failing", meta: late.length ? late.map(l => l.name).join(", ") : "every loop on schedule", n: late.length, tone: "warning", go: () => go("automation") },
   ]
   return (
     <Panel title="Needs intervention" description="What will not resolve by itself">

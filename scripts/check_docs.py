@@ -6,7 +6,10 @@ invalid roadmap statuses, and DONE milestones without a PR or commit in their Ev
 Warnings (exit 0): stale HANDOFF date or stale CURRENT_STATE snapshot. Staleness is time-based,
 so it is reported, never asserted in tests.
 
-Usage: python3 scripts/check_docs.py [--repo PATH]
+Every document in LINK_DOCS is required. --public-profile (the published repository) allows exactly the internal
+handoff set in PRIVATE_DOCS to be absent; anything else missing is still an error.
+
+Usage: python3 scripts/check_docs.py [--repo PATH] [--public-profile]
 """
 from __future__ import annotations
 
@@ -16,7 +19,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-LINK_DOCS = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "START_HERE.md", "CLAUDE.md", "docs/GIT_WORKFLOW.md", "docs/HANDOFF.md", "docs/DEVELOPMENT_PLAN.md", "docs/HANDOFF_HISTORY.md", "docs/AUTONOMY_ROADMAP.md"]  # a document that is absent is skipped (the internal handoff set is not published)
+LINK_DOCS = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "START_HERE.md", "CLAUDE.md", "docs/GIT_WORKFLOW.md", "docs/HANDOFF.md", "docs/DEVELOPMENT_PLAN.md", "docs/HANDOFF_HISTORY.md", "docs/AUTONOMY_ROADMAP.md"]
+PRIVATE_DOCS = {"docs/HANDOFF.md", "docs/DEVELOPMENT_PLAN.md", "docs/HANDOFF_HISTORY.md", "docs/AUTONOMY_ROADMAP.md"}
 HANDOFF_FIELDS = ["Last updated", "Main SHA", "Deployed API SHA", "Live state", "Tests run", "Blocked", "Next executable step"]
 STATUSES = {"NOT_STARTED", "IN_PROGRESS", "IMPLEMENTED", "BLOCKED", "DONE"}
 REPO_PATH = re.compile(r"`((?:docs|scripts|app|tests|agents|skills|migrations|desk|api)/[A-Za-z0-9_./-]+)`")
@@ -99,12 +103,14 @@ def check_snapshot(repo: Path) -> list[str]:
     return []
 
 
-def run(repo: Path) -> tuple[list[str], list[str]]:
+def run(repo: Path, public_profile: bool = False) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     for rel in LINK_DOCS:
         if (repo / rel).exists():
             errors += check_links(repo, rel)
+        elif not (public_profile and rel in PRIVATE_DOCS):
+            errors.append(f"{rel}: required document is missing")
     if (repo / "docs/HANDOFF.md").exists():
         handoff_errors, handoff_warnings = check_handoff(repo)
         errors += handoff_errors
@@ -118,8 +124,9 @@ def run(repo: Path) -> tuple[list[str], list[str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--public-profile", action="store_true", help="allow only PRIVATE_DOCS to be absent")
     args = parser.parse_args()
-    errors, warnings = run(args.repo)
+    errors, warnings = run(args.repo, args.public_profile)
     for w in warnings:
         print(f"WARN  {w}")
     for e in errors:

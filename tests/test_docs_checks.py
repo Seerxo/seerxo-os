@@ -31,7 +31,8 @@ PLAN_OK = """# PLAN
 def _repo(tmp_path: Path, plan: str = PLAN_OK, handoff: str = HANDOFF_OK) -> Path:
     (tmp_path / "docs").mkdir()
     (tmp_path / "START_HERE.md").write_text("[plan](docs/DEVELOPMENT_PLAN.md)\n")
-    (tmp_path / "CLAUDE.md").write_text("ok\n")
+    for name in ("CLAUDE.md", "README.md", "CONTRIBUTING.md", "SECURITY.md"):
+        (tmp_path / name).write_text("ok\n")
     (tmp_path / "docs/HANDOFF.md").write_text(handoff)
     (tmp_path / "docs/HANDOFF_HISTORY.md").write_text("history\n")
     (tmp_path / "docs/GIT_WORKFLOW.md").write_text("workflow\n")
@@ -41,8 +42,23 @@ def _repo(tmp_path: Path, plan: str = PLAN_OK, handoff: str = HANDOFF_OK) -> Pat
 
 
 def test_repository_docs_pass_checks():
-    errors, _ = check_docs.run(REPO)
+    errors, _ = check_docs.run(REPO, public_profile=True)
     assert errors == []
+
+
+def test_a_missing_required_document_is_an_error_by_default(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / "docs/HANDOFF_HISTORY.md").unlink()
+    errors, _ = check_docs.run(repo)
+    assert "docs/HANDOFF_HISTORY.md: required document is missing" in errors
+    assert check_docs.run(repo, public_profile=True)[0] == []
+
+
+def test_the_public_profile_exempts_only_the_private_handoff_set(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / "SECURITY.md").unlink()
+    errors, _ = check_docs.run(repo, public_profile=True)
+    assert "SECURITY.md: required document is missing" in errors
 
 
 def test_clean_fixture_has_no_errors(tmp_path):
