@@ -611,45 +611,17 @@ def gateway_approve(manifest: dict, policy: dict, *, now: datetime, diff: str) -
 # --------------------------------------------------------------------------- host verifier
 
 def _check_rollback(m: dict, host_facts: dict, state: dict, history) -> None:
-    """G4: a declared rollback restores exactly an earlier release from the host's own trusted history. The newest
-    `applied` event for `rollback_to` must record the payload digest the host just computed for this commit (same
-    shipped tree, not merely the same commit name), the target's four bound image IDs, image-input digest, and
-    configuration identity matching the currently recorded production release.
-    Reconcile, bootstrap and recovery events are not rollback evidence (founder rule 2026-10-19). A schema change is
-    a forward revert, never a rollback. `history` is a loader (read only for a rollback); without it, or with any
-    piece missing or different, the rollback refuses."""
-    target = m[ROLLBACK_FIELD]
+    """G4: a declared rollback (`rollback_to`) is DISABLED. Container configuration identity (release_identity.
+    security_config) includes the environment digest, and the environment carries the release's own
+    COMPANY_OS_GIT_SHA, so no earlier release's recorded configuration can ever equal what runs now: a check could
+    only refuse every real rollback, or be weakened. An earlier release is restored with a founder-signed forward
+    revert instead: a new commit whose tree is that release's, reviewed and released like any other (the host proves
+    nothing about history for it; it is simply the next release). Failed deploys keep the driver's own automatic
+    restore of the previous images."""
     if m["approver"] != "founder":
         raise Refused("a rollback needs the founder's signature (high risk)")
-    if target == state.get("last_sha"):
-        raise Refused("rollback target is the release already running")
-    if history is None:
-        raise Refused("rollback refused: the trusted release history is unavailable")
-    events = [e for e in history() if e.get("event") == "applied" and e.get("sha") == target]
-    if not events:
-        raise Refused(f"rollback target {target} is not a previously applied release in the trusted history")
-    event = events[-1]
-    recorded = event.get("payload_digest")
-    if not isinstance(recorded, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded):
-        raise Refused("rollback refused: no recorded payload digest for the target release")
-    if host_facts.get("payload_digest") != recorded:
-        raise Refused("rollback refused: the commit's payload differs from the target release's recorded payload")
-    bound = event.get("bound_images")
-    if not images_ok(bound):
-        raise Refused("rollback refused: the target release recorded no bound image IDs; use a founder-signed "
-                      "forward revert")
-    if event.get("inputs_digest") is None or not digest_ok(event.get("inputs_digest")):
-        raise Refused("rollback refused: the target release recorded no image-input digest")
-    if m["images"] != bound:
-        raise Refused("rollback refused: the manifest's images differ from the target release's bound images")
-    if host_facts.get("inputs_digest") != event["inputs_digest"]:
-        raise Refused("rollback refused: the commit's image inputs differ from the target release's recorded inputs")
-    if event.get("configs") != state.get("configs"):
-        raise Refused("rollback refused: target release's container configuration differs from the currently recorded "
-                      "production identity; use a founder-signed forward revert")
-    if host_facts.get("migration_heads") != host_facts.get("parent_migration_heads"):
-        raise Refused("rollback refused: the target release changes the Alembic schema; use a founder-signed "
-                      "forward revert")
+    raise Refused("declared rollback is disabled: configuration identity includes each release's COMPANY_OS_GIT_SHA, "
+                  "so no earlier release can match production; use a founder-signed forward revert")
 
 
 def _check_bound_presence(host_facts: dict) -> None:

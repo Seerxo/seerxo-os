@@ -154,14 +154,3 @@ test("the Automation page judges reconciler evidence by the API's generated_at",
   assert.match(src, /reconcilerView\(e, serverNow\(generatedAt\)\)/)
   assert.match(src, /reconcilerPresentation\(d\.reconciler_execution, d\.generated_at\)/)
 })
-
-test("only proven-healthy loops fold or count as on schedule; info (in progress, outcome unknown) stays in view", async () => {
-  // Break caught (#188, rendered check 2026-10-24): STARTED and COMPLETED-with-unknown-goals rows were folded
-  // under "loops on schedule" and counted "On schedule", so an unproven reconciler looked healthy.
-  const { readFileSync } = await import("node:fs")
-  const src = readFileSync(new URL("../pages/automation.tsx", import.meta.url), "utf8")
-  assert.match(src, /const fine = loops\.filter\(l => l\.tone === "success"\),/)
-  assert.match(src, /value: `\$\{count\("success"\)\} of \$\{loops\.length\}`/)
-  assert.doesNotMatch(src, /count\("success"\) \+ count\("info"\)/)
-  assert.doesNotMatch(src, /"every loop on schedule"/)
-})

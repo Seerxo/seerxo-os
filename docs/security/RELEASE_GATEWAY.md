@@ -386,3 +386,22 @@ The drill runs only on ephemeral hosted runners, with no host mounts or public p
 CLI installation are explicit fixtures: it does not execute the whole signed host apply transaction, the
 production application's health checks, or a production release. A passing exact-candidate hosted run is required;
 the test's existence does not replace candidate-image and production-host acceptance.
+
+## Upgrading a v1 host (no binding-capable verifier yet)
+
+A host whose installed verifier predates image binding writes pending releases without images, and this driver then
+needs `x-bound-images` pins in the release's compose, which the public tree does not carry: the driver ABORTs and
+nothing changes. The binding-capable bundle cannot arrive through such a release, and `install-release-bundle.py`
+installs only an already-applied SHA. The one supported way out keeps every control:
+
+1. The founder signs a bootstrap-exception statement (namespace `seerxo-bootstrap-exception`) that binds the bundle's
+   full source SHA, the installer's original and patched sha256 (exactly one check removed: "last_sha == SHA"), the
+   bundle manifest, the ledger and history sha256, the host id and an expiry.
+2. Root verifies that signature against the policy's founder key and re-checks every bound fact on the host, fences
+   both timers, keeps a hash-anchored backup, installs with the bundle's own installer and runs the new verifier's
+   identity and history checks. Nothing is deployed; the ledger is unchanged; rollback is allowed only while the
+   ledger and history are byte-identical to the anchor.
+3. Only then: policy, rebase and the next release, each with its own founder signature and independent review.
+
+Declared rollbacks (`rollback_to`) are disabled (see `_check_rollback`): restore an earlier release with a
+founder-signed forward revert.

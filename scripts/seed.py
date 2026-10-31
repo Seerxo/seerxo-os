@@ -3,13 +3,16 @@
 
 It lets a new installation show something in the Founder Desk and gives the agents a goal-bearing
 project to reason about. Everything here is a placeholder: edit it, or replace it with your own
-organisation. Idempotent: re-running updates rows by key rather than duplicating them.
+organisation. It runs only with an explicit --fresh-install flag and only on an empty database: on a
+database that already holds business units, projects or services it changes nothing (it would otherwise
+overwrite real rows that share a key, such as company-os).
 
-    docker exec company-api python -m scripts.seed
+    docker exec company-api python -m scripts.seed --fresh-install
 """
+import sys
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app import enums, models
 from app.db import SessionLocal
@@ -29,9 +32,21 @@ def upsert(db, model, key, **fields):
     return obj
 
 
-def run() -> None:
+def existing_rows(db) -> int:
+    return sum(db.execute(select(func.count()).select_from(m)).scalar_one()
+               for m in (models.BusinessUnit, models.Project, models.Service))
+
+
+def run(argv: list[str]) -> int:
+    if argv != ["--fresh-install"]:
+        print("refused: seed only a fresh install, with --fresh-install", file=sys.stderr)
+        return 2
     db = SessionLocal()
     try:
+        if existing_rows(db):
+            print("refused: the database already has business units, projects or services; nothing changed",
+                  file=sys.stderr)
+            return 1
         # ---------------------------------------------------------- business units
         saas = upsert(db, models.BusinessUnit, "demo-saas",
             name="Demo SaaS",
@@ -68,9 +83,10 @@ def run() -> None:
 
         db.commit()
         print("seeded the example organisation")
+        return 0
     finally:
         db.close()
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(run(sys.argv[1:]))
