@@ -434,8 +434,7 @@ def deploy_acknowledgements(manifest: dict, facts: dict) -> str:
 
 def build_release(cfg: Config, sha: str, directory: Path) -> None:
     """The staged transport's three files, from the host clone at exactly `sha` (same commands as the driver).
-    The root-side driver comes from the installed bundle, never the candidate tree. Only the explicit founder
-    `prepare --bootstrap` operation may execute staged code; applying a release always uses the installed bundle."""
+    After install the root-side driver comes from the installed bundle, never from the candidate's tree."""
     try:
         tar = rg.release_archive(cfg.clone, sha)      # checked in host_facts already; again here, after pending
     except rg.Refused as error:

@@ -133,10 +133,8 @@ compose_env() {   # $1..$4 = api worker reasoner egress references; rest = compo
     docker compose "$@"
   )
 }
-compose_check() {   # $1..$4 references, then the call's -f files: its resolved config must name exactly these four
-  local api=$1 worker=$2 reasoner=$3 egress=$4
-  shift 4
-  compose_env "$api" "$worker" "$reasoner" "$egress" "$@" config --format json | python3 -c '
+compose_check() {   # the resolved config must name exactly these four references, or nothing runs
+  compose_env "$1" "$2" "$3" "$4" config --format json | python3 -c '
 import json, sys
 want = {"company-api": sys.argv[1], "company-worker": sys.argv[2],
         "company-reasoner": sys.argv[3], "company-reasoner-egress": sys.argv[4]}
@@ -146,24 +144,16 @@ for name, image in want.items():
     if got != image:
         print(f"resolved {name} image is {got!r}, expected {image!r}", file=sys.stderr)
         sys.exit(3)
-' "$api" "$worker" "$reasoner" "$egress"
+' "$1" "$2" "$3" "$4"
 }
 compose_bound() {   # $1..$4 references; optional "--"; then the compose arguments
-  local api=$1 worker=$2 reasoner=$3 egress=$4 arg
-  local files=()
+  local api=$1 worker=$2 reasoner=$3 egress=$4
   shift 4
   [ "${1:-}" != -- ] || shift
-  # Check exactly the files the call uses; a late file option must not bypass the check.
-  while [ "${1:-}" = -f ] && [ $# -ge 2 ]; do files+=(-f "$2"); shift 2; done
-  for arg in "$@"; do
-    case "$arg" in -f|-f?*|--file|--file=*)
-      echo "compose: compose files must lead the call, where the image check sees them" >&2; return 1 ;;
-    esac
-  done
-  compose_check "$api" "$worker" "$reasoner" "$egress" ${files[@]+"${files[@]}"} || return 1
-  compose_env "$api" "$worker" "$reasoner" "$egress" ${files[@]+"${files[@]}"} "$@"
+  compose_check "$api" "$worker" "$reasoner" "$egress" || return 1
+  compose_env "$api" "$worker" "$reasoner" "$egress" "$@"
 }
-run_compose() {   # signed releases use verified IDs; only the pre-ledger legacy transport reaches plain Compose
+run_compose() {   # every Compose call of this run: pinned IDs when it has them, else the tag-shaped legacy file
   if [ "${BOUND:-no}" = yes ] || [ "${BOOTSTRAP:-no}" = yes ]; then
     compose_bound "$BOUND_API" "$BOUND_WORKER" "$BOUND_REASONER" "$BOUND_EGRESS" -- "$@"
   else
