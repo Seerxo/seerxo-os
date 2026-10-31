@@ -11,9 +11,9 @@ record supersession only after founder confirmation. Mutable execution state bel
 - **Decision maker:** Founder
 - **Scope:** Normal Seerxo OS engineering and CI; private release/migration responsibilities
 - **Decision:** `Seerxo/seerxo-os` is the primary path for normal engineering and CI. Do not
-  return routine development CI to the previous private self-hosted setup. `Seerxo/os`
-  retains release and migration responsibilities until signed production cutover evidence
-  verifies the transition.
+  return routine development CI to the previous private self-hosted setup. Since the
+  signed production cutover (ledger rebase, policy v4, 2026-10-31) `Seerxo/os` is archived and
+  holds no release or migration role.
 - **Rationale:** Private self-hosted CI caused serious performance and queueing problems;
   public development CI was the deliberate solution.
 - **Evidence:** [Public PR #29](https://github.com/Seerxo/seerxo-os/pull/29) merged

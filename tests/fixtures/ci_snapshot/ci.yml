@@ -1,0 +1,129 @@
+# PR and main tests run in the workflows named by agents/repository_guardian.yaml (Python/PostgreSQL and frontend).
+# This workflow runs only when the founder starts it, on a GitHub-hosted runner.
+# It no longer deploys (B6 source cut-over, docs/security/LEGACY_DEPLOY_CUTOVER.md): the SSH deploy job and every use of the
+# deploy secrets are gone from this workflow. Production changes only through app/release_host.py on the host, which
+# applies a manifest it verified itself. What remains is a read-only readiness check for one exact main commit:
+# founder dispatch (deploy-authorization), configured CI evidence (ci-gate) and PR provenance. A passing run
+# releases nothing.
+# GitHub-hosted runners are free for public repositories.
+name: ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact 40-character main commit to check (readiness only; never deploys)"
+        required: true
+        type: string
+      allow_migration_to:
+        description: "Advisory Alembic revision (12 hex), format checked only; this workflow never migrates"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: read
+
+concurrency:
+  # One group per PR (a new push supersedes the old run); one per main commit, never
+  # cancelled, so each merged commit keeps its own result.
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('deploy-{0}', inputs.sha)) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci-gate:
+    # This readiness job never re-runs the suite: it proves the configured required CI workflows
+    # and any configured trusted-publisher statuses passed on this main commit. It runs only after the
+    # founder authorization and uses main's own gate
+    # code (no ref), so no unauthorized commit's code ever runs here.
+    needs: [deploy-authorization]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require configured CI success on the checked commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          runs="$RUNNER_TEMP/ci-gate-runs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$DEPLOY_SHA&event=push&branch=main&per_page=100" \
+            --jq '{total_count, workflow_runs: [.workflow_runs[] | {id, path, head_sha, head_branch, event, status, conclusion, run_number, run_attempt}]}' \
+            > "$runs"
+          status_count=$(python3 -c 'import yaml; contexts = yaml.safe_load(open("agents/repository_guardian.yaml"))["required_statuses"]; assert isinstance(contexts, list); print(len(contexts))')
+          if [ "$status_count" != 0 ]; then
+            gh api "repos/$GITHUB_REPOSITORY/commits/$DEPLOY_SHA/statuses?per_page=100" \
+              | python3 scripts/ci-status-gate.py --sha "$DEPLOY_SHA" --runs "$runs"
+          else
+            python3 scripts/ci-status-gate.py --sha "$DEPLOY_SHA" --runs "$runs" < /dev/null
+          fi
+
+  deploy-authorization:
+    # The readiness scripts are the workflow's own ref, and only main's is trusted:
+    # a dispatch from any other ref is skipped, and so is everything that needs this job.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require the founder, one exact commit on main, and a well-formed migration authorization
+        env:
+          FOUNDER_LOGIN: semihbugrasezer
+          DEPLOY_SHA: ${{ inputs.sha }}
+          ALLOW_MIGRATION_TO: ${{ inputs.allow_migration_to }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          on_main=no
+          if [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] && git merge-base --is-ancestor "$DEPLOY_SHA" origin/main; then on_main=yes; fi
+          if [ "$DEPLOY_SHA" != "$GITHUB_SHA" ]; then
+            echo "DEPLOY REFUSED: only the dispatched main tip ($GITHUB_SHA) can be deployed; got $DEPLOY_SHA. Re-dispatch from the current main, or roll back through a new commit or an attended deploy."
+            exit 1
+          fi
+          python scripts/deploy-authorization.py --actor "$ACTOR" --triggering-actor "$TRIGGERING_ACTOR" \
+            --founder "$FOUNDER_LOGIN" --sha "$DEPLOY_SHA" --allow-migration-to "$ALLOW_MIGRATION_TO" --sha-on-main "$on_main"
+
+  deploy-provenance:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [ci-gate, deploy-authorization]
+    runs-on: ubuntu-24.04
+    outputs:
+      allowed: ${{ steps.provenance.outputs.allowed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - id: provenance
+        name: Require founder-merged PR provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOUNDER_LOGIN: semihbugrasezer
+          DEPLOY_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          facts=$(mktemp)
+          printf '[' > "$facts"
+          first=true
+          while read -r number; do
+            [ -n "$number" ] || continue
+            $first || printf ',' >> "$facts"
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$number" >> "$facts"
+            first=false
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$DEPLOY_SHA/pulls" --jq '.[].number')
+          printf ']\n' >> "$facts"
+          if python scripts/deploy-provenance.py --sha "$DEPLOY_SHA" --founder "$FOUNDER_LOGIN" < "$facts"; then
+            echo 'allowed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'allowed=false' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi

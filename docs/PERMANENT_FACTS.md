@@ -9,9 +9,10 @@ production claims here.
 
 ## FACT-01 · Repository responsibilities
 
-- **Fact:** `Seerxo/seerxo-os` is the primary repository for normal Seerxo OS development
-  and CI. `Seerxo/os` retains release and migration responsibilities until the signed
-  production cutover is verified.
+- **Fact:** `Seerxo/seerxo-os` is the only active repository: development, CI and the
+  production release chain (founder-signed ledger rebase, policy v4 naming
+  `seerxo/seerxo-os`, 2026-10-31). `Seerxo/os` is archived and read-only; it has no release,
+  migration or CI role.
 - **Consequence for agents:** do not move routine engineering back to the previous private
   self-hosted CI path. Source migration does not establish production migration. See
   [DEC-001](operations/DECISIONS.md#dec-001-public-repository-is-the-development-path).

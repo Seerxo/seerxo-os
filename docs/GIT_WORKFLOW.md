@@ -2,8 +2,8 @@
 
 This is the canonical Git and pull request policy for routine development in the public
 [`Seerxo/seerxo-os`](https://github.com/Seerxo/seerxo-os) repository. The private
-[`Seerxo/os`](https://github.com/Seerxo/os) repository retains release and migration
-responsibilities until the signed production cutover is verified. A source migration or
+[`Seerxo/os`](https://github.com/Seerxo/os) repository is archived and read-only; since the
+signed production cutover (2026-10-31) it has no release or migration role. A source migration or
 merged PR does not prove production migration. See [permanent facts](PERMANENT_FACTS.md)
 and [founder decisions](operations/DECISIONS.md).
 
